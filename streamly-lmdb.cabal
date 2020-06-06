@@ -1,0 +1,77 @@
+cabal-version: 1.12
+
+-- This file has been generated from package.yaml by hpack version 0.33.0.
+--
+-- see: https://github.com/sol/hpack
+--
+-- hash: e2bedffa2753d722ed5d6ce5e1227e2b1834e269f51a46592b5cc13b326b0e84
+
+name:           streamly-lmdb
+version:        0.0.1
+synopsis:       Stream data to or from LMDB databases using the streamly library.
+description:    Please see the README on GitHub at <https://github.com/shlok/streamly-lmdb#readme>
+category:       Database, Streaming, Streamly
+homepage:       https://github.com/shlok/streamly-lmdb#readme
+bug-reports:    https://github.com/shlok/streamly-lmdb/issues
+author:         Shlok Datye
+maintainer:     shlok@quant.is
+copyright:      2020 Shlok Datye
+license:        BSD3
+license-file:   LICENSE
+build-type:     Simple
+extra-source-files:
+    README.md
+    ChangeLog.md
+
+source-repository head
+  type: git
+  location: https://github.com/shlok/streamly-lmdb
+
+library
+  exposed-modules:
+      Streamly.External.LMDB
+      Streamly.External.LMDB.Internal
+      Streamly.External.LMDB.Internal.Foreign
+  other-modules:
+      Paths_streamly_lmdb
+  hs-source-dirs:
+      src
+  ghc-options: -Wall
+  c-sources:
+      src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.c
+  extra-libraries:
+      lmdb
+  build-depends:
+      async
+    , base >=4.7 && <5
+    , bytestring
+    , containers
+    , streamly
+    , vector
+  default-language: Haskell2010
+
+test-suite streamly-lmdb-test
+  type: exitcode-stdio-1.0
+  main-is: TestSuite.hs
+  other-modules:
+      Streamly.External.LMDB.Tests
+      Paths_streamly_lmdb
+  hs-source-dirs:
+      test
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  extra-libraries:
+      lmdb
+  build-depends:
+      QuickCheck
+    , async
+    , base >=4.7 && <5
+    , bytestring
+    , containers
+    , directory
+    , streamly
+    , streamly-lmdb
+    , tasty
+    , tasty-quickcheck
+    , temporary
+    , vector
+  default-language: Haskell2010

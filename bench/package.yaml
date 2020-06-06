@@ -1,0 +1,34 @@
+name: bench
+version: 0.1.0.0
+
+dependencies:
+- array
+- base >= 4.7 && < 5
+- bytestring
+- cereal
+- containers
+- directory
+- inline-c
+- statistics
+- streamly
+- streamly-lmdb
+- text
+- turtle
+- vector
+
+ghc-options:
+- -Wall
+- -O2
+- -threaded
+- -rtsopts
+- -with-rtsopts=-N
+
+executables:
+  bench:
+    main: bench.hs
+
+  bench-lmdb-plain:
+    main: bench-lmdb-plain.hs
+
+  bench-lmdb-streamly:
+    main: bench-lmdb-streamly.hs

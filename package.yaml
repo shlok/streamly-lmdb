@@ -1,0 +1,50 @@
+name:                streamly-lmdb
+version:             0.0.1
+github:              "shlok/streamly-lmdb"
+license:             BSD3
+author:              "Shlok Datye"
+maintainer:          "shlok@quant.is"
+copyright:           "2020 Shlok Datye"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+synopsis:            Stream data to or from LMDB databases using the streamly library.
+category:            Database, Streaming, Streamly
+
+description:         Please see the README on GitHub at <https://github.com/shlok/streamly-lmdb#readme>
+
+dependencies:
+- async
+- base >= 4.7 && < 5
+- bytestring
+- containers
+- streamly
+- vector
+
+ghc-options:
+- -Wall
+
+extra-libraries:
+- lmdb
+
+library:
+  source-dirs: src
+  c-sources: src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.c
+
+tests:
+  streamly-lmdb-test:
+    main:                TestSuite.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - directory
+    - QuickCheck
+    - streamly-lmdb
+    - tasty
+    - tasty-quickcheck
+    - temporary
