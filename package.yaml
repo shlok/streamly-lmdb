@@ -1,9 +1,9 @@
 name:                streamly-lmdb
-version:             0.0.1
+version:             0.0.1.0
 github:              "shlok/streamly-lmdb"
 license:             BSD3
 author:              "Shlok Datye"
-maintainer:          "shlok@quant.is"
+maintainer:          "sd-haskell@quant.is"
 copyright:           "2020 Shlok Datye"
 
 extra-source-files:
@@ -16,12 +16,10 @@ category:            Database, Streaming, Streamly
 description:         Please see the README on GitHub at <https://github.com/shlok/streamly-lmdb#readme>
 
 dependencies:
-- async
+- async >= 2.2 && < 2.3
 - base >= 4.7 && < 5
-- bytestring
-- containers
-- streamly
-- vector
+- bytestring >= 0.10 && < 0.11
+- streamly >= 0.7 && < 0.8
 
 ghc-options:
 - -Wall

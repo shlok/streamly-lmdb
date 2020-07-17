@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 3c880f986d5fa668b5e786f21fd9fc9c135797affc71b01ffa8a9aec56e49fbe
+-- hash: ab9c88a781073bd6650a512b7a83caafc97ef3783a3c6b92dcc28792b5c38e94
 
 name:           bench
 version:        0.1.0.0
@@ -16,18 +16,12 @@ executable bench
       Paths_bench
   ghc-options: -Wall -O2 -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      array
-    , base >=4.7 && <5
+      base >=4.7 && <5
     , bytestring
-    , cereal
-    , containers
     , directory
-    , inline-c
-    , statistics
     , streamly
     , streamly-lmdb
     , text
-    , turtle
     , vector
   default-language: Haskell2010
 
@@ -37,18 +31,12 @@ executable bench-lmdb-plain
       Paths_bench
   ghc-options: -Wall -O2 -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      array
-    , base >=4.7 && <5
+      base >=4.7 && <5
     , bytestring
-    , cereal
-    , containers
     , directory
-    , inline-c
-    , statistics
     , streamly
     , streamly-lmdb
     , text
-    , turtle
     , vector
   default-language: Haskell2010
 
@@ -58,17 +46,11 @@ executable bench-lmdb-streamly
       Paths_bench
   ghc-options: -Wall -O2 -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      array
-    , base >=4.7 && <5
+      base >=4.7 && <5
     , bytestring
-    , cereal
-    , containers
     , directory
-    , inline-c
-    , statistics
     , streamly
     , streamly-lmdb
     , text
-    , turtle
     , vector
   default-language: Haskell2010

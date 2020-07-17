@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns, QuasiQuotes, ScopedTypeVariables, TemplateHaskell, TypeApplications #-}
+{-# LANGUAGE BangPatterns, ScopedTypeVariables #-}
 
 import Control.Monad (forM_, when)
 import Foreign (Ptr, alloca, callocBytes, free, malloc, nullPtr, peek)
@@ -10,11 +10,6 @@ import Streamly.External.LMDB.Internal.Foreign (MDB_env, MDB_txn, MDB_cursor_op_
 import System.Directory (createDirectory, doesPathExist)
 import System.Environment (getArgs)
 import System.Exit (exitSuccess)
-
-import qualified Language.C.Inline as C
-
-C.include "<stdio.h>"
-C.include "<stdlib.h>"
 
 main :: IO Int
 main = do
