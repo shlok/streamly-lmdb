@@ -1,5 +1,5 @@
 name:                streamly-lmdb
-version:             0.0.1.0
+version:             0.0.1
 github:              "shlok/streamly-lmdb"
 license:             BSD3
 author:              "Shlok Datye"
@@ -16,10 +16,10 @@ category:            Database, Streaming, Streamly
 description:         Please see the README on GitHub at <https://github.com/shlok/streamly-lmdb#readme>
 
 dependencies:
-- async >= 2.2 && < 2.3
+- async >= 2.2.2 && < 2.3
 - base >= 4.7 && < 5
-- bytestring >= 0.10 && < 0.11
-- streamly >= 0.7 && < 0.8
+- bytestring >= 0.10.10.0 && < 0.11
+- streamly >= 0.7.2 && < 0.8
 
 ghc-options:
 - -Wall
@@ -40,9 +40,9 @@ tests:
     - -rtsopts
     - -with-rtsopts=-N
     dependencies:
-    - directory
-    - QuickCheck
-    - streamly-lmdb
-    - tasty
-    - tasty-quickcheck
-    - temporary
+    - directory >= 1.3.6.0 && < 1.4
+    - QuickCheck >= 2.13.2 && < 2.14
+    - streamly-lmdb == 0.0.1
+    - tasty >= 1.2.3 && < 1.3
+    - tasty-quickcheck >= 0.10.1.1 && < 0.11
+    - temporary >= 1.3 && < 1.4

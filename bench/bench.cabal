@@ -4,10 +4,10 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: ab9c88a781073bd6650a512b7a83caafc97ef3783a3c6b92dcc28792b5c38e94
+-- hash: 722603ac3e4a962728b790842c7643602cc229a7ab0f958eacb21c7a38cb5451
 
 name:           bench
-version:        0.1.0.0
+version:        0.0.1
 build-type:     Simple
 
 executable bench
@@ -19,9 +19,11 @@ executable bench
       base >=4.7 && <5
     , bytestring
     , directory
+    , statistics
     , streamly
     , streamly-lmdb
     , text
+    , turtle
     , vector
   default-language: Haskell2010
 
@@ -34,9 +36,11 @@ executable bench-lmdb-plain
       base >=4.7 && <5
     , bytestring
     , directory
+    , statistics
     , streamly
     , streamly-lmdb
     , text
+    , turtle
     , vector
   default-language: Haskell2010
 
@@ -49,8 +53,10 @@ executable bench-lmdb-streamly
       base >=4.7 && <5
     , bytestring
     , directory
+    , statistics
     , streamly
     , streamly-lmdb
     , text
+    , turtle
     , vector
   default-language: Haskell2010
