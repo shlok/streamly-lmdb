@@ -1,0 +1,8 @@
+cradle:
+  stack:
+    - path: ./bench
+      component: "bench:exe:bench"
+    - path: ./bench
+      component: "bench:exe:bench-lmdb-plain"
+    - path: ./bench
+      component: "bench:exe:bench-lmdb-streamly"
