@@ -2,14 +2,12 @@
 
 module Main where
 
-import Control.Monad (forM, forM_, replicateM, replicateM_, unless, when)
+import Control.Monad (forM, forM_)
 import Data.List (intercalate)
-import Data.Maybe (fromJust, maybe)
 import Statistics.Sample (mean, stdDev)
 import Turtle
 import qualified Data.Text as T
 import qualified Data.Vector as V
-import qualified System.IO as IO
 
 data Platform = PlatformLinux | PlatformMacOS deriving (Eq)
 
