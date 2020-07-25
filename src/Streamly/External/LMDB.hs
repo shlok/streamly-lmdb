@@ -34,7 +34,7 @@ module Streamly.External.LMDB
     defaultWriteOptions,
     writeLMDB) where
 
-import Control.Concurrent (isCurrentThreadBound)
+import Control.Concurrent (isCurrentThreadBound, myThreadId)
 import Control.Concurrent.Async (asyncBound, wait)
 import Control.Exception (Exception, catch, tryJust, mask_, throw)
 import Control.Monad (guard, when)
@@ -226,7 +226,17 @@ writeLMDB :: (MonadIO m) => Database ReadWrite -> WriteOptions -> Fold m (ByteSt
 writeLMDB (Database penv dbi) options =
     let txnSize = max 1 (writeTransactionSize options)
         flags = combineOptions $ [mdb_nooverwrite | noOverwrite options] ++ [mdb_append | writeAppend options]
-    in Fold (\(currChunkSz, mtxn) (k, v) -> do
+    in Fold (\(threadId, iter, currChunkSz, mtxn) (k, v) -> do
+        -- In the first few iterations, ascertain that we are still on the same (bound) thread.
+        iter' <- liftIO $
+            if iter < 3 then do
+                threadId' <- myThreadId
+                when (threadId' /= threadId) $
+                    (throw $ ExceptionString "Error: writeLMDB veered off the original bound thread")
+                return $ iter + 1
+            else
+                return iter
+
         currChunkSz' <- liftIO $
             if currChunkSz >= txnSize then do
                 let (_, ref) = fromJust mtxn
@@ -248,15 +258,19 @@ writeLMDB (Database penv dbi) options =
             catch (mdb_put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags)
                 (\(e :: LMDB_Error) -> runIORefFinalizer ref >> throw e)
 
-        return (currChunkSz' + 1, Just (ptxn, ref)))
+        return (threadId, iter', currChunkSz' + 1, Just (ptxn, ref)))
     (do
         isBound <- liftIO isCurrentThreadBound
+        threadId <- liftIO $ myThreadId
         if isBound then
-            return (0, Nothing)
+            return (threadId, 0 :: Int, 0, Nothing)
         else
             throw $ ExceptionString "Error: writeLMDB should be executed on a bound thread")
     -- This final part is incompatible with scans.
-    (\(_, mtxn) -> liftIO $
+    (\(threadId, _, _, mtxn) -> liftIO $ do
+        threadId' <- myThreadId
+        when (threadId' /= threadId) $
+            (throw $ ExceptionString "Error: writeLMDB veered off the original bound thread at the end")
         case mtxn of
             Nothing -> return ()
             Just (_, ref) -> runIORefFinalizer ref)
