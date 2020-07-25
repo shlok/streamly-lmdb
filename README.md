@@ -1,5 +1,8 @@
 # streamly-lmdb
 
+[![Hackage](https://img.shields.io/hackage/v/streamly-lmdb.svg?style=flat)](https://hackage.haskell.org/package/streamly-lmdb)
+[![Build Status](https://travis-ci.org/shlok/streamly-lmdb.svg?branch=master)](https://travis-ci.org/shlok/streamly-lmdb)
+
 Stream data to or from LMDB databases using the Haskell [streamly](https://hackage.haskell.org/package/streamly) library.
 
 ## Requirements
@@ -52,9 +55,9 @@ main = do
 
 ## Benchmarks
 
-See `bench/README.md`. Summary (with rough figures from our machine<sup id="a1">[1](#fn1)</sup>):
+See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup>):
 
 * **Reading.** For reading a fully cached LMDB database, this library (when `unsafeReadLMDB` is used instead of `readLMDB`) has a 10 ns/pair overhead compared to plain Haskell `IO` code, which has another 10 ns/pair overhead compared to C. (The first two being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.) We deduce that if your total workload per pair takes longer than 20 ns, your bottleneck will not be your usage of this library as opposed to C.
 * **Writing**. Writing with plain Haskell `IO` code and with this library is, respectively, 10% and 20% slower than writing with C. We have not dug further into these differences because this write performance is currently good enough for our purposes.
 
-<sup id="fn1">1</sup> [Linode](https://linode.com); Debian 10, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM. [↩](#a1)
+<sup>†</sup> [Linode](https://linode.com); Debian 10, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM.
