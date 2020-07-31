@@ -30,6 +30,8 @@ extra-libraries:
 library:
   source-dirs: src
   c-sources: src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.c
+  install-includes: src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.h
+  include-dirs: src/Streamly/External/LMDB/Internal
 
 tests:
   streamly-lmdb-test:
