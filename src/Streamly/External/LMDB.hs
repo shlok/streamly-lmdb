@@ -13,6 +13,7 @@ module Streamly.External.LMDB
     Mode,
     ReadWrite,
     ReadOnly,
+    OverwriteOptions(..),
     WriteOptions(..),
 
     -- ** Environment and database
@@ -37,15 +38,16 @@ module Streamly.External.LMDB
 import Control.Concurrent (isCurrentThreadBound, myThreadId)
 import Control.Concurrent.Async (asyncBound, wait)
 import Control.Exception (Exception, catch, tryJust, mask_, throw)
-import Control.Monad (guard, when)
+import Control.Monad (guard, unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString, packCStringLen)
-import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
+import Data.ByteString.Unsafe (unsafePackCStringLen, unsafeUseAsCStringLen)
 import Data.Maybe (fromJust)
 import Data.Void (Void)
-import Foreign (Ptr, free, malloc, nullPtr, peek)
+import Foreign (Ptr, alloca, free, malloc, nullPtr, peek)
 import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
+import Foreign.Marshal.Utils (with)
 import Streamly.Internal.Data.Fold (Fold (Fold))
 import Streamly.Internal.Data.Stream.StreamD (newFinalizedIORef, runIORefFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
@@ -197,15 +199,17 @@ unsafeReadLMDB (Database penv dbi) kmap vmap =
                 return (pcurs, pk, pv, ref)
             return (op, pcurs, pk, pv, ref))
 
+data OverwriteOptions = OverwriteAllow | OverwriteAllowSame | OverwriteDisallow deriving (Eq)
+
 data WriteOptions = WriteOptions
     { writeTransactionSize :: !Int
-    , noOverwrite :: !Bool
+    , overwriteOptions :: !OverwriteOptions
     , writeAppend :: !Bool }
 
 defaultWriteOptions :: WriteOptions
 defaultWriteOptions = WriteOptions
     { writeTransactionSize = 1
-    , noOverwrite = False
+    , overwriteOptions = OverwriteAllow
     , writeAppend = False }
 
 
@@ -225,7 +229,10 @@ instance Exception ExceptionString
 writeLMDB :: (MonadIO m) => Database ReadWrite -> WriteOptions -> Fold m (ByteString, ByteString) ()
 writeLMDB (Database penv dbi) options =
     let txnSize = max 1 (writeTransactionSize options)
-        flags = combineOptions $ [mdb_nooverwrite | noOverwrite options] ++ [mdb_append | writeAppend options]
+        overwriteOpt = overwriteOptions options
+        flags = combineOptions $
+                    [mdb_nooverwrite | overwriteOpt `elem` [OverwriteAllowSame, OverwriteDisallow]]
+                    ++ [mdb_append | writeAppend options]
     in Fold (\(threadId, iter, currChunkSz, mtxn) (k, v) -> do
         -- In the first few iterations, ascertain that we are still on the same (bound) thread.
         iter' <- liftIO $
@@ -256,8 +263,21 @@ writeLMDB (Database penv dbi) options =
 
         liftIO $ unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
             catch (mdb_put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags)
-                (\(e :: LMDB_Error) -> runIORefFinalizer ref >> throw e)
-
+                (\(e :: LMDB_Error) -> do
+                    -- Discard error if OverwriteAllowSame was specified and the error from LMDB
+                    -- was due to the exact same key-value pair already existing in the database.
+                    ok <- with (MDB_val (fromIntegral kl) kp) $ \pk ->
+                            alloca $ \pv -> do
+                                rc <- c_mdb_get ptxn dbi pk pv
+                                if rc == 0 then do
+                                    v' <- peek pv
+                                    vbs <-  unsafePackCStringLen (mv_data v', fromIntegral $ mv_size v')
+                                    return $ overwriteOpt == OverwriteAllowSame
+                                            && e_code e == Right MDB_KEYEXIST
+                                            && vbs == v
+                                else
+                                    return False
+                    unless ok $ runIORefFinalizer ref >> throw e)
         return (threadId, iter', currChunkSz' + 1, Just (ptxn, ref)))
     (do
         isBound <- liftIO isCurrentThreadBound

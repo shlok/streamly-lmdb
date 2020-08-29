@@ -79,6 +79,9 @@ foreign import ccall unsafe "lmdb.h mdb_cursor_get"
 foreign import ccall unsafe "lmdb.h mdb_cursor_close"
     c_mdb_cursor_close :: Ptr MDB_cursor -> IO ()
 
+foreign import ccall unsafe "lmdb.h mdb_get"
+    c_mdb_get :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
 foreign import ccall unsafe "lmdb.h mdb_put"
     c_mdb_put :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> CUInt -> IO CInt
 
@@ -116,7 +119,7 @@ data MDB_ErrCode
     | MDB_BAD_TXN
     | MDB_BAD_VALSIZE
     | MDB_BAD_DBI
-    deriving (Show)
+    deriving (Eq, Show)
 
 {-# INLINE errCodes #-}
 errCodes :: [(MDB_ErrCode, Int)]
