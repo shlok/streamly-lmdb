@@ -95,7 +95,7 @@ testWriteLMDB res = testProperty "writeLMDB" . monadicIO $ do
 testWriteLMDB_2 :: IO (Database ReadWrite) -> TestTree
 testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
     db <- run res
-    keyValuePairs <- arbitraryKeyValuePairs
+    keyValuePairs <- arbitraryKeyValuePairs'
     run $ clearDatabase db
 
     chunkSz <- pick arbitrary
@@ -106,9 +106,7 @@ testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
     e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
     exceptionAsExpected <-
         case e of
-            Left _ ->
-                -- This is somewhat rare but will be encountered for enough number of tests (e.g., 1000 instead of 100).
-                return $ hasDuplicateKeys keyValuePairs
+            Left _ -> return $ hasDuplicateKeys keyValuePairs
             Right _ -> return . not $ hasDuplicateKeys keyValuePairs
 
     let keyValuePairsInDb = sort . prefixBeforeDuplicate  $ keyValuePairs
