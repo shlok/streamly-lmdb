@@ -20,7 +20,7 @@ Install LMDB on your system:
 module Main where
 
 import Streamly.External.LMDB
-    (Limits (mapSize), WriteOptions (chunkSize), defaultLimits,
+    (Limits (mapSize), WriteOptions (writeTransactionSize), defaultLimits,
     defaultWriteOptions, getDatabase, openEnvironment, readLMDB,
     tebibyte, writeLMDB)
 import qualified Streamly.Prelude as S
@@ -38,7 +38,7 @@ main = do
     db <- getDatabase env Nothing
 
     -- Stream key-value pairs into the database.
-    let fold' = writeLMDB db defaultWriteOptions { chunkSize = 1 }
+    let fold' = writeLMDB db defaultWriteOptions { writeTransactionSize = 1 }
     let writeStream = S.fromList [("baz", "a"), ("foo", "b"), ("bar", "c")]
     _ <- S.fold fold' writeStream
 
