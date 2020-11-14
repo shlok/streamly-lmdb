@@ -21,8 +21,8 @@ module Main where
 
 import Streamly.External.LMDB
     (Limits (mapSize), WriteOptions (writeTransactionSize), defaultLimits,
-    defaultWriteOptions, getDatabase, openEnvironment, readLMDB,
-    tebibyte, writeLMDB)
+    defaultReadOptions, defaultWriteOptions, getDatabase, openEnvironment,
+    readLMDB, tebibyte, writeLMDB)
 import qualified Streamly.Prelude as S
 
 main :: IO ()
@@ -48,7 +48,7 @@ main = do
     --     ("bar","c")
     --     ("baz","a")
     --     ("foo","b")
-    let unfold' = readLMDB db
+    let unfold' = readLMDB db defaultReadOptions
     let readStream = S.unfold unfold' undefined
     S.mapM_ print readStream
 ```

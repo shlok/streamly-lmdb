@@ -82,7 +82,7 @@ dispatch ["read-cursor", path] = do
     db <- getDatabase env Nothing
     let fold' = Fold (\(!key,!value,!total,!pair) (kl, vl) ->
             return (key + kl, value + vl, total + kl + vl, pair + 1)) (return (0, 0, 0, 0 :: Int)) return
-    (k,v,t,p) <- Streamly.Internal.Data.Unfold.fold (unsafeReadLMDB db (return . snd) (return . snd)) fold' undefined
+    (k,v,t,p) <- Streamly.Internal.Data.Unfold.fold (unsafeReadLMDB db defaultReadOptions (return . snd) (return . snd)) fold' undefined
     putStrLn $ "Key byte count:   " ++ show k
     putStrLn $ "Value byte count: " ++ show v
     putStrLn $ "Total byte count: " ++ show t
@@ -94,7 +94,7 @@ dispatch ["read-cursor-safe", path] = do
     db <- getDatabase env Nothing
     let fold' = Fold (\(!key,!value,!total,!pair) (b1, b2) ->
             return (key + B.length b1, value + B.length b2, total + B.length b1 + B.length b2, pair + 1)) (return (0, 0, 0, 0 :: Int)) return
-    (k,v,t,p) <- Streamly.Internal.Data.Unfold.fold (readLMDB db) fold' undefined
+    (k,v,t,p) <- Streamly.Internal.Data.Unfold.fold (readLMDB db defaultReadOptions) fold' undefined
     putStrLn $ "Key byte count:   " ++ show k
     putStrLn $ "Value byte count: " ++ show v
     putStrLn $ "Total byte count: " ++ show t

@@ -13,6 +13,8 @@ module Streamly.External.LMDB
     Mode,
     ReadWrite,
     ReadOnly,
+    ReadDirection(..),
+    ReadOptions(..),
     OverwriteOptions(..),
     WriteOptions(..),
 
@@ -28,6 +30,7 @@ module Streamly.External.LMDB
     clearDatabase,
 
     -- ** Reading
+    defaultReadOptions,
     readLMDB,
     unsafeReadLMDB,
 
@@ -48,6 +51,7 @@ import Foreign (Ptr, alloca, free, malloc, nullPtr, peek)
 import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
 import Foreign.Marshal.Utils (with)
+import Foreign.Storable (poke)
 import Streamly.Internal.Data.Fold (Fold (Fold))
 import Streamly.Internal.Data.Stream.StreamD (newFinalizedIORef, runIORefFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
@@ -147,7 +151,21 @@ clearDatabase (Database penv dbi) = asyncBound (do
     mdb_clear ptxn dbi
     mdb_txn_commit ptxn) >>= wait
 
--- | Creates an unfold with which we can stream all key-value pairs from the given database in increasing key order.
+-- | Direction of key iteration.
+data ReadDirection = Forward | Backward deriving (Show)
+
+data ReadOptions = ReadOptions
+    { readDirection :: !ReadDirection
+    -- | If 'Nothing', a forward [backward] iteration starts at the beginning [end] of the database.
+    -- Otherwise, it starts at the first key that is greater [less] than or equal to the 'Just' key.
+    , readStart     :: !(Maybe ByteString) } deriving (Show)
+
+defaultReadOptions :: ReadOptions
+defaultReadOptions = ReadOptions
+    { readDirection = Forward
+    , readStart = Nothing }
+
+-- | Creates an unfold with which we can stream key-value pairs from the given database.
 --
 -- A read transaction is kept open for the duration of the unfold; one should therefore
 -- bear in mind LMDB's [caveats regarding long-lived transactions](https://git.io/JJZE6).
@@ -155,10 +173,10 @@ clearDatabase (Database penv dbi) = asyncBound (do
 -- If you don’t want the overhead of intermediate 'ByteString's (on your
 -- way to your eventual data structures), use 'unsafeReadLMDB' instead.
 {-# INLINE readLMDB #-}
-readLMDB :: (MonadIO m, Mode mode) => Database mode -> Unfold m Void (ByteString, ByteString)
-readLMDB db = unsafeReadLMDB db packCStringLen packCStringLen
+readLMDB :: (MonadIO m, Mode mode) => Database mode -> ReadOptions -> Unfold m Void (ByteString, ByteString)
+readLMDB db ropts = unsafeReadLMDB db ropts packCStringLen packCStringLen
 
--- | Creates an unfold with which we can stream all key-value pairs from the given database in increasing key order.
+-- | Creates an unfold with which we can stream key-value pairs from the given database.
 --
 -- A read transaction is kept open for the duration of the unfold; one should therefore
 -- bear in mind LMDB's [caveats regarding long-lived transactions](https://git.io/JJZE6).
@@ -168,20 +186,50 @@ readLMDB db = unsafeReadLMDB db packCStringLen packCStringLen
 -- transform the 'CStringLen's to your desired data structures is to use 'Data.ByteString.Unsafe.unsafePackCStringLen'.
 {-# INLINE unsafeReadLMDB #-}
 unsafeReadLMDB :: (MonadIO m, Mode mode)
-               => Database mode -> (CStringLen -> IO k) -> (CStringLen -> IO v) -> Unfold m Void (k, v)
-unsafeReadLMDB (Database penv dbi) kmap vmap =
-    flip supply mdb_first $ Unfold
+               => Database mode
+               -> ReadOptions
+               -> (CStringLen -> IO k)
+               -> (CStringLen -> IO v)
+               -> Unfold m Void (k, v)
+unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
+    let (firstOp, subsequentOp) = case (readDirection ropts, readStart ropts) of
+            (Forward, Nothing) -> (mdb_first, mdb_next)
+            (Forward, Just _) -> (mdb_set_range, mdb_next)
+            (Backward, Nothing) -> (mdb_last, mdb_prev)
+            (Backward, Just _) ->  (mdb_set_range, mdb_prev)
+    in flip supply firstOp $ Unfold
         (\(op, pcurs, pk, pv, ref) -> do
-            found <- liftIO $ c_mdb_cursor_get pcurs pk pv op >>= \rc ->
+            rc <- liftIO $
+                if op == mdb_set_range && subsequentOp == mdb_prev then do
+                    -- Reverse MDB_SET_RANGE.
+                    kfst' <- peek pk
+                    kfst <- packCStringLen (mv_data kfst', fromIntegral $ mv_size kfst')
+                    rc <- c_mdb_cursor_get pcurs pk pv op
+                    if rc /= 0 && rc == mdb_notfound then
+                        c_mdb_cursor_get pcurs pk pv mdb_last
+                    else if rc == 0 then do
+                        k' <- peek pk
+                        k <- unsafePackCStringLen (mv_data k', fromIntegral $ mv_size k')
+                        if k /= kfst then
+                            c_mdb_cursor_get pcurs pk pv mdb_prev
+                        else
+                            return rc
+                    else
+                        return rc
+                else
+                    c_mdb_cursor_get pcurs pk pv op
+
+            found <- liftIO $
                 if rc /= 0 && rc /= mdb_notfound then do
                     runIORefFinalizer ref
                     throwLMDBErrNum "mdb_cursor_get" rc
                 else
                     return $ rc /= mdb_notfound
+
             if found then do
                 !k <- liftIO $ (\x -> kmap (mv_data x, fromIntegral $ mv_size x)) =<< peek pk
                 !v <- liftIO $ (\x -> vmap (mv_data x, fromIntegral $ mv_size x)) =<< peek pv
-                return $ Yield (k, v) (mdb_next, pcurs, pk, pv, ref)
+                return $ Yield (k, v) (subsequentOp, pcurs, pk, pv, ref)
             else do
                 runIORefFinalizer ref
                 return Stop)
@@ -191,6 +239,12 @@ unsafeReadLMDB (Database penv dbi) kmap vmap =
                 pcurs <- liftIO $ mdb_cursor_open ptxn dbi
                 pk <- liftIO malloc
                 pv <- liftIO malloc
+
+                _ <- case readStart ropts of
+                    Nothing -> return ()
+                    Just k -> unsafeUseAsCStringLen k $ \(kp, kl) ->
+                        poke pk (MDB_val (fromIntegral kl) kp)
+
                 ref <- liftIO . newFinalizedIORef $ do
                     free pv >> free pk
                     c_mdb_cursor_close pcurs

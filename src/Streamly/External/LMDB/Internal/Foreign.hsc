@@ -188,8 +188,17 @@ combineOptions = foldr (.|.) 0
 mdb_first :: MDB_cursor_op_t
 mdb_first = #const MDB_FIRST
 
+mdb_last :: MDB_cursor_op_t
+mdb_last = #const MDB_LAST
+
 mdb_next :: MDB_cursor_op_t
 mdb_next = #const MDB_NEXT
+
+mdb_prev :: MDB_cursor_op_t
+mdb_prev = #const MDB_PREV
+
+mdb_set_range :: MDB_cursor_op_t
+mdb_set_range = #const MDB_SET_RANGE
 
 mdb_env_create :: IO (Ptr MDB_env)
 mdb_env_create = do
