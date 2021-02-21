@@ -151,8 +151,8 @@ arbitraryKeyValuePairs' :: PropertyM IO [(ByteString, ByteString)]
 arbitraryKeyValuePairs' = do
     arb <- arbitraryKeyValuePairs
     b <- pick arbitrary
-    if length arb > 0 && b then do
-        let (k, v) = arb !! 0
+    if not (null arb) && b then do
+        let (k, v) = head arb
         b' <- pick arbitrary
         v' <- if b' then return v else pack <$> pick arbitrary
         i <- pick $ choose (negate $ length arb, 2 * length arb)

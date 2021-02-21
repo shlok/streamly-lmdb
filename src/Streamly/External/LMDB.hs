@@ -293,7 +293,7 @@ writeLMDB (Database penv dbi) options =
             if iter < 3 then do
                 threadId' <- myThreadId
                 when (threadId' /= threadId) $
-                    (throw $ ExceptionString "Error: writeLMDB veered off the original bound thread")
+                    throw (ExceptionString "Error: writeLMDB veered off the original bound thread")
                 return $ iter + 1
             else
                 return iter
@@ -335,7 +335,7 @@ writeLMDB (Database penv dbi) options =
         return (threadId, iter', currChunkSz' + 1, Just (ptxn, ref)))
     (do
         isBound <- liftIO isCurrentThreadBound
-        threadId <- liftIO $ myThreadId
+        threadId <- liftIO myThreadId
         if isBound then
             return (threadId, 0 :: Int, 0, Nothing)
         else
@@ -344,7 +344,7 @@ writeLMDB (Database penv dbi) options =
     (\(threadId, _, _, mtxn) -> liftIO $ do
         threadId' <- myThreadId
         when (threadId' /= threadId) $
-            (throw $ ExceptionString "Error: writeLMDB veered off the original bound thread at the end")
+            throw (ExceptionString "Error: writeLMDB veered off the original bound thread at the end")
         case mtxn of
             Nothing -> return ()
             Just (_, ref) -> runIORefFinalizer ref)
