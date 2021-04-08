@@ -5,23 +5,16 @@
 
 packages:
 - completed:
-    hackage: streamly-0.7.2@sha256:2dbcbd2d807b5465a281bde1a71a21f1e1e1b00be93b23083a868a07dc76de95,28286
+    hackage: streamly-0.7.3@sha256:5c528f670e7313a71971bae465fa04db5f7016471a3edb88eb53c272539970b9,28284
     pantry-tree:
       size: 12739
-      sha256: fe4ea63b78d983f54a4a159727aa1f441b23aa1d919405de370474bdd0e6791f
+      sha256: 153dbdb796efd528e597012d9b12057f575bf7ea1930d7cca38bd0a30b2fe54f
   original:
-    hackage: streamly-0.7.2@sha256:2dbcbd2d807b5465a281bde1a71a21f1e1e1b00be93b23083a868a07dc76de95,28286
-- completed:
-    hackage: primitive-0.7.0.1@sha256:a381571c36edc7dca28b77fe8159b43c14c640087ec5946adacf949feec64231,3433
-    pantry-tree:
-      size: 3221
-      sha256: fea4312bd404ad504e44a7fd933a3b3442c0a5e1c41bd8abec3c2e7282d88e18
-  original:
-    hackage: primitive-0.7.0.1@sha256:a381571c36edc7dca28b77fe8159b43c14c640087ec5946adacf949feec64231,3433
+    hackage: streamly-0.7.3@sha256:5c528f670e7313a71971bae465fa04db5f7016471a3edb88eb53c272539970b9,28284
 snapshots:
 - completed:
-    size: 563099
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/2.yaml
-    sha256: 92b1a17e31d0a978fca4bf270305d4d1dd8092271bf60eafbc9349c890854026
+    size: 567037
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/9.yaml
+    sha256: d7d8d5106e53d1669964bd8bd2b0f88a5ad192d772f5376384b76738fd992311
   original:
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/2.yaml
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/9.yaml

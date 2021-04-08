@@ -1,7 +1,6 @@
 resolver:
-  url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/2.yaml
+  url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/17/9.yaml
 packages:
 - .
 extra-deps:
-- streamly-0.7.2@sha256:2dbcbd2d807b5465a281bde1a71a21f1e1e1b00be93b23083a868a07dc76de95,28286
-- primitive-0.7.0.1@sha256:a381571c36edc7dca28b77fe8159b43c14c640087ec5946adacf949feec64231,3433
+- streamly-0.7.3@sha256:5c528f670e7313a71971bae465fa04db5f7016471a3edb88eb53c272539970b9,28284
