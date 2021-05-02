@@ -1,10 +1,10 @@
 name:                streamly-lmdb
-version:             0.2.0
+version:             0.2.1
 github:              "shlok/streamly-lmdb"
 license:             BSD3
 author:              "Shlok Datye"
 maintainer:          "sd-haskell@quant.is"
-copyright:           "2020 Shlok Datye"
+copyright:           "2021 Shlok Datye"
 
 extra-source-files:
 - README.md

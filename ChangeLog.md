@@ -1,3 +1,7 @@
+## 0.2.1
+
+* Allow QuickCheck <2.15 and tasty <1.5.
+
 ## 0.2.0
 
 * Added read options for backward reading and starting from a specific key.
