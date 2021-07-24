@@ -52,11 +52,11 @@ import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
 import Foreign.Marshal.Utils (with)
 import Foreign.Storable (poke)
-import Streamly.Internal.Data.Fold (Fold (Fold))
-import Streamly.Internal.Data.Stream.StreamD (newFinalizedIORef, runIORefFinalizer)
+import Streamly.Internal.Data.Fold (Fold (Fold), Step (Partial))
+import Streamly.Internal.Data.IOFinalizer (newIOFinalizer, runIOFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
 import Streamly.Internal.Data.Unfold (supply)
-import Streamly.Internal.Data.Unfold.Types (Unfold (Unfold))
+import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
 
 import Streamly.External.LMDB.Internal
 import Streamly.External.LMDB.Internal.Foreign
@@ -197,7 +197,7 @@ unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
             (Forward, Just _) -> (mdb_set_range, mdb_next)
             (Backward, Nothing) -> (mdb_last, mdb_prev)
             (Backward, Just _) ->  (mdb_set_range, mdb_prev)
-    in flip supply firstOp $ Unfold
+    in supply firstOp $ Unfold
         (\(op, pcurs, pk, pv, ref) -> do
             rc <- liftIO $
                 if op == mdb_set_range && subsequentOp == mdb_prev then do
@@ -221,7 +221,7 @@ unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
 
             found <- liftIO $
                 if rc /= 0 && rc /= mdb_notfound then do
-                    runIORefFinalizer ref
+                    runIOFinalizer ref
                     throwLMDBErrNum "mdb_cursor_get" rc
                 else
                     return $ rc /= mdb_notfound
@@ -231,7 +231,7 @@ unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
                 !v <- liftIO $ (\x -> vmap (mv_data x, fromIntegral $ mv_size x)) =<< peek pv
                 return $ Yield (k, v) (subsequentOp, pcurs, pk, pv, ref)
             else do
-                runIORefFinalizer ref
+                runIOFinalizer ref
                 return Stop)
         (\op -> do
             (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
@@ -245,7 +245,7 @@ unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
                     Just k -> unsafeUseAsCStringLen k $ \(kp, kl) ->
                         poke pk (MDB_val (fromIntegral kl) kp)
 
-                ref <- liftIO . newFinalizedIORef $ do
+                ref <- liftIO . newIOFinalizer $ do
                     free pv >> free pk
                     c_mdb_cursor_close pcurs
                     -- No need to commit this read-only transaction.
@@ -301,7 +301,7 @@ writeLMDB (Database penv dbi) options =
         currChunkSz' <- liftIO $
             if currChunkSz >= txnSize then do
                 let (_, ref) = fromJust mtxn
-                runIORefFinalizer ref
+                runIOFinalizer ref
                 return 0
             else
                 return currChunkSz
@@ -310,7 +310,7 @@ writeLMDB (Database penv dbi) options =
             if currChunkSz' == 0 then
                 liftIO $ mask_ $ do
                     ptxn <- mdb_txn_begin penv nullPtr 0
-                    ref <- newFinalizedIORef $ mdb_txn_commit ptxn
+                    ref <- newIOFinalizer $ mdb_txn_commit ptxn
                     return (ptxn, ref)
             else
                 return $ fromJust mtxn
@@ -331,13 +331,13 @@ writeLMDB (Database penv dbi) options =
                                             && vbs == v
                                 else
                                     return False
-                    unless ok $ runIORefFinalizer ref >> throw e)
-        return (threadId, iter', currChunkSz' + 1, Just (ptxn, ref)))
+                    unless ok $ runIOFinalizer ref >> throw e)
+        return $ Partial (threadId, iter', currChunkSz' + 1, Just (ptxn, ref)))
     (do
         isBound <- liftIO isCurrentThreadBound
         threadId <- liftIO myThreadId
         if isBound then
-            return (threadId, 0 :: Int, 0, Nothing)
+            return $ Partial (threadId, 0 :: Int, 0, Nothing)
         else
             throw $ ExceptionString "Error: writeLMDB should be executed on a bound thread")
     -- This final part is incompatible with scans.
@@ -347,4 +347,4 @@ writeLMDB (Database penv dbi) options =
             throw (ExceptionString "Error: writeLMDB veered off the original bound thread at the end")
         case mtxn of
             Nothing -> return ()
-            Just (_, ref) -> runIORefFinalizer ref)
+            Just (_, ref) -> runIOFinalizer ref)

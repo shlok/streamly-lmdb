@@ -6,10 +6,9 @@ import Foreign (Ptr, callocBytes)
 import Foreign.C.Types (CChar)
 import Foreign.Marshal.Array (advancePtr, pokeArray)
 import Streamly.External.LMDB
-import Streamly.Internal.Data.Fold.Types
+import Streamly.Internal.Data.Fold.Type (Step (Partial), Fold (Fold))
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
-import Streamly.Internal.Data.Unfold (fold)
-import Streamly.Internal.Data.Unfold.Types (Unfold (Unfold))
+import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
 import System.Directory (createDirectory, doesPathExist)
 import System.Environment (getArgs)
 import qualified Data.ByteString as B
@@ -65,7 +64,7 @@ dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
                 copyBytes keyData3 x3 >> copyBytes valData3 x3
                 return $ Yield () (x3 + 1)) return
 
-        let unf = flip U.supply (((0,0),0),0) $ ((unf0 `U.outerProduct` unf1) `U.outerProduct` unf2) `U.outerProduct` unf3
+        let unf = U.supply (((0,0),0),0) $ ((unf0 `crossProduct` unf1) `crossProduct` unf2) `crossProduct` unf3
 
         let unf' = U.take numPairs $ U.mapM (\_ -> do
                 k <- unsafePackCStringLen (keyData, 8 * fromIntegral keyFactor)
@@ -74,15 +73,15 @@ dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
 
         let writeFold = writeLMDB db (defaultWriteOptions { writeTransactionSize = chunkSz })
 
-        _ <- U.fold unf' writeFold undefined
+        _ <- U.fold writeFold unf' undefined
         return 0
 
 dispatch ["read-cursor", path] = do
     env <- openEnvironment @ReadOnly path (defaultLimits { mapSize = tebibyte })
     db <- getDatabase env Nothing
     let fold' = Fold (\(!key,!value,!total,!pair) (kl, vl) ->
-            return (key + kl, value + vl, total + kl + vl, pair + 1)) (return (0, 0, 0, 0 :: Int)) return
-    (k,v,t,p) <- Streamly.Internal.Data.Unfold.fold (unsafeReadLMDB db defaultReadOptions (return . snd) (return . snd)) fold' undefined
+            return $ Partial (key + kl, value + vl, total + kl + vl, pair + 1)) (return $ Partial (0, 0, 0, 0 :: Int)) return
+    (k,v,t,p) <- U.fold fold' (unsafeReadLMDB db defaultReadOptions (return . snd) (return . snd)) undefined
     putStrLn $ "Key byte count:   " ++ show k
     putStrLn $ "Value byte count: " ++ show v
     putStrLn $ "Total byte count: " ++ show t
@@ -93,8 +92,8 @@ dispatch ["read-cursor-safe", path] = do
     env <- openEnvironment @ReadOnly path (defaultLimits { mapSize = tebibyte })
     db <- getDatabase env Nothing
     let fold' = Fold (\(!key,!value,!total,!pair) (b1, b2) ->
-            return (key + B.length b1, value + B.length b2, total + B.length b1 + B.length b2, pair + 1)) (return (0, 0, 0, 0 :: Int)) return
-    (k,v,t,p) <- Streamly.Internal.Data.Unfold.fold (readLMDB db defaultReadOptions) fold' undefined
+            return $ Partial (key + B.length b1, value + B.length b2, total + B.length b1 + B.length b2, pair + 1)) (return $ Partial (0, 0, 0, 0 :: Int)) return
+    (k,v,t,p) <- U.fold fold' (readLMDB db defaultReadOptions) undefined
     putStrLn $ "Key byte count:   " ++ show k
     putStrLn $ "Value byte count: " ++ show v
     putStrLn $ "Total byte count: " ++ show t
@@ -117,3 +116,7 @@ copyBytes ptr x =
     forM_ ptr $ \p -> do
         let x_ = fromIntegral x
         pokeArray p [x_]
+
+{-# INLINE crossProduct #-}
+crossProduct :: Monad m => Unfold m a b -> Unfold m c d -> Unfold m (a, c) (b, d)
+crossProduct u1 u2 = U.cross (U.lmap fst u1) (U.lmap snd u2)

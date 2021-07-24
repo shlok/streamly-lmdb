@@ -1,4 +1,7 @@
-resolver: lts-16.21
+resolver:
+  url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/18/3.yaml
 packages:
 - .
 - .. # streamly-lmdb
+extra-deps:
+- streamly-0.8.0@sha256:9784c80ee1ada51477520cabc4e92a0c76a6bb265f968a188f2fce818e7398e0,19654
