@@ -1,3 +1,7 @@
+## 0.3.0
+
+* Updated for Streamly 0.8.0.
+
 ## 0.2.1
 
 * Allow QuickCheck <2.15 and tasty <1.5.
