@@ -1,42 +1,57 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | The functionality for the limits and getting the environment and database were mostly
--- obtained from the [lmdb-simple](https://hackage.haskell.org/package/lmdb-simple) library.
+-- | = Acknowledgments
+--
+-- The functionality for the limits and getting the environment and database, in particular the idea
+-- of specifying the read-only or read-write mode at the type level, was mostly obtained from the
+-- [lmdb-simple](https://hackage.haskell.org/package/lmdb-simple) library.
 module Streamly.External.LMDB
-  ( -- ** Types
-    Database,
+  ( -- * Environment
+    -- | With LMDB, one first creates a so-called “environment,” which one can think of as a file or
+    -- folder on disk.
     Environment,
-    Limits (..),
-    LMDB_Error (..),
-    MDB_ErrCode (..),
+    openEnvironment,
+    isReadOnlyEnvironment,
+
+    -- ** Mode
     Mode,
     ReadWrite,
     ReadOnly,
-    ReadDirection (..),
-    ReadOptions (..),
-    OverwriteOptions (..),
-    WriteOptions (..),
 
-    -- ** Environment and database
+    -- ** Limits
+    Limits (..),
     defaultLimits,
-    openEnvironment,
-    isReadOnlyEnvironment,
-    getDatabase,
-
-    -- ** Utility
     gibibyte,
     tebibyte,
+
+    -- * Database
+    -- | After creating an environment, one creates within it one or more databases.
+    --
+    -- Note: We currently have no functionality here for closing and disposing of databases or
+    -- environments because we have had no need for it yet. In any case, it is a common practice
+    -- with LMDB to create one’s environments and databases once and reuse them for the remainder of
+    -- the program’s execution.
+    Database,
+    getDatabase,
     clearDatabase,
 
-    -- ** Reading
-    defaultReadOptions,
+    -- * Reading
     readLMDB,
     unsafeReadLMDB,
+    ReadOptions (..),
+    defaultReadOptions,
+    ReadDirection (..),
 
-    -- ** Writing
-    defaultWriteOptions,
+    -- * Writing
     writeLMDB,
+    WriteOptions (..),
+    defaultWriteOptions,
+    OverwriteOptions (..),
+
+    -- * Error types
+    LMDB_Error (..),
+    MDB_ErrCode (..),
   )
 where
 
@@ -138,11 +153,11 @@ defaultLimits =
       maxReaders = 126
     }
 
--- A convenience constant for obtaining a 1 GiB map size.
+-- | A convenience constant for obtaining a 1 GiB map size.
 gibibyte :: Int
 gibibyte = 1024 * 1024 * 1024
 
--- A convenience constant for obtaining a 1 TiB map size.
+-- | A convenience constant for obtaining a 1 TiB map size.
 tebibyte :: Int
 tebibyte = 1024 * 1024 * 1024 * 1024
 
@@ -163,7 +178,8 @@ openEnvironment path limits = do
   let maxDbs = maxDatabases limits in when (maxDbs /= 0) $ mdb_env_set_maxdbs penv maxDbs
   mdb_env_set_maxreaders penv (maxReaders limits)
 
-  -- Always use MDB_NOTLS.
+  -- Always use MDB_NOTLS; this is crucial for Haskell applications. (See
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L615)
   let env = Environment penv :: Mode mode => Environment mode
       flags = mdb_notls : [mdb_rdonly | isReadOnlyEnvironment env]
 
@@ -179,6 +195,16 @@ openEnvironment path limits = do
 
   return env
 
+-- | Gets a database with the given name. When creating a database (i.e., getting it for the first
+-- time), one must do so in 'ReadWrite' mode.
+--
+-- If only one database is desired within the environment, the name can be 'Nothing' (known as the
+-- “unnamed database”).
+--
+-- If one or more named databases (a database with a 'Just' name) are desired, the 'maxDatabases' of
+-- the environment’s limits should have been adjusted accordingly. The unnamed database will in this
+-- case contain the names of the named databases as keys, which one is allowed to read but not
+-- write.
 getDatabase :: (Mode mode) => Environment mode -> Maybe String -> IO (Database mode)
 getDatabase env@(Environment penv) name = do
   ptxn <- mdb_txn_begin penv nullPtr (combineOptions $ [mdb_rdonly | isReadOnlyEnvironment env])
@@ -208,6 +234,7 @@ data ReadOptions = ReadOptions
   }
   deriving (Show)
 
+-- | By default, we start reading from the beginning of the database (i.e., from the smallest key).
 defaultReadOptions :: ReadOptions
 defaultReadOptions =
   ReadOptions
