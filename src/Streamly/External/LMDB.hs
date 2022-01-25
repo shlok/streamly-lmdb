@@ -8,6 +8,7 @@
 -- [lmdb-simple](https://hackage.haskell.org/package/lmdb-simple) library.
 module Streamly.External.LMDB
   ( -- * Environment
+
     -- | With LMDB, one first creates a so-called “environment,” which one can think of as a file or
     -- folder on disk.
     Environment,
@@ -26,6 +27,7 @@ module Streamly.External.LMDB
     tebibyte,
 
     -- * Database
+
     -- | After creating an environment, one creates within it one or more databases.
     --
     -- Note: We currently have no functionality here for closing and disposing of databases or
@@ -39,6 +41,13 @@ module Streamly.External.LMDB
     -- * Reading
     readLMDB,
     unsafeReadLMDB,
+
+    -- ** Read-only transactions
+    ReadOnlyTxn,
+    beginReadOnlyTxn,
+    abortReadOnlyTxn,
+
+    -- ** Read options
     ReadOptions (..),
     defaultReadOptions,
     ReadDirection (..),
@@ -62,7 +71,7 @@ import Control.Monad (guard, unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString, packCStringLen)
 import Data.ByteString.Unsafe (unsafePackCStringLen, unsafeUseAsCStringLen)
-import Data.Maybe (fromJust)
+import Data.Maybe (fromJust, isNothing)
 import Data.Void (Void)
 import Foreign (Ptr, alloca, free, malloc, nullPtr, peek)
 import Foreign.C (Errno (Errno), eNOTDIR)
@@ -74,6 +83,7 @@ import Streamly.External.LMDB.Internal.Foreign
   ( LMDB_Error (..),
     MDB_ErrCode (..),
     MDB_env,
+    MDB_txn,
     MDB_val (MDB_val, mv_data, mv_size),
     c_mdb_cursor_close,
     c_mdb_cursor_get,
@@ -223,44 +233,31 @@ clearDatabase (Database penv dbi) =
     )
     >>= wait
 
--- | Direction of key iteration.
-data ReadDirection = Forward | Backward deriving (Show)
-
-data ReadOptions = ReadOptions
-  { readDirection :: !ReadDirection,
-    -- | If 'Nothing', a forward [backward] iteration starts at the beginning [end] of the database.
-    -- Otherwise, it starts at the first key that is greater [less] than or equal to the 'Just' key.
-    readStart :: !(Maybe ByteString)
-  }
-  deriving (Show)
-
--- | By default, we start reading from the beginning of the database (i.e., from the smallest key).
-defaultReadOptions :: ReadOptions
-defaultReadOptions =
-  ReadOptions
-    { readDirection = Forward,
-      readStart = Nothing
-    }
-
 -- | Creates an unfold with which we can stream key-value pairs from the given database.
 --
--- A read transaction is kept open for the duration of the unfold; one should therefore bear in mind
--- LMDB's [caveats regarding long-lived transactions](https://git.io/JJZE6).
+-- If an existing read-only transaction is not provided, a read-only transaction is automatically
+-- created and kept open for the duration of the unfold; we suggest doing this as a first option.
+-- However, if you find this to be a bottleneck (e.g., if you find upon profiling that a significant
+-- time is being spent at @mdb_txn_begin@, or if you find yourself having to increase 'maxReaders'
+-- in the environment’s limits because the transactions are not being garbage collected fast
+-- enough), consider precreating a transaction using 'beginReadOnlyTxn'.
 --
--- If you don’t want the overhead of intermediate 'ByteString's (on your way to your eventual data
+-- In any case, bear in mind at all times LMDB’s [caveats regarding long-lived
+-- transactions](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L107).
+--
+-- If you don’t want the overhead of intermediate @ByteString@s (on your way to your eventual data
 -- structures), use 'unsafeReadLMDB' instead.
 {-# INLINE readLMDB #-}
 readLMDB ::
   (MonadIO m, Mode mode) =>
   Database mode ->
+  Maybe ReadOnlyTxn ->
   ReadOptions ->
   Unfold m Void (ByteString, ByteString)
-readLMDB db ropts = unsafeReadLMDB db ropts packCStringLen packCStringLen
+readLMDB db mtxn ropts = unsafeReadLMDB db mtxn ropts packCStringLen packCStringLen
 
--- | Creates an unfold with which we can stream key-value pairs from the given database.
---
--- A read transaction is kept open for the duration of the unfold; one should therefore bear in mind
--- LMDB's [caveats regarding long-lived transactions](https://git.io/JJZE6).
+-- | Similar to 'readLMDB', except that the keys and values are not automatically converted into
+-- Haskell @ByteString@s.
 --
 -- To ensure safety, make sure that the memory pointed to by the 'CStringLen' for each key/value
 -- mapping function call is (a) only read (and not written to); and (b) not used after the mapping
@@ -270,11 +267,12 @@ readLMDB db ropts = unsafeReadLMDB db ropts packCStringLen packCStringLen
 unsafeReadLMDB ::
   (MonadIO m, Mode mode) =>
   Database mode ->
+  Maybe ReadOnlyTxn ->
   ReadOptions ->
   (CStringLen -> IO k) ->
   (CStringLen -> IO v) ->
   Unfold m Void (k, v)
-unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
+unsafeReadLMDB (Database penv dbi) mtxn ropts kmap vmap =
   let (firstOp, subsequentOp) = case (readDirection ropts, readStart ropts) of
         (Forward, Nothing) -> (mdb_first, mdb_next)
         (Forward, Just _) -> (mdb_set_range, mdb_next)
@@ -324,7 +322,9 @@ unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
           ( \op -> do
               (pcurs, pk, pv, ref) <- liftIO $
                 mask_ $ do
-                  ptxn <- liftIO $ mdb_txn_begin penv nullPtr mdb_rdonly
+                  ptxn <- case mtxn of
+                    Nothing -> liftIO $ mdb_txn_begin penv nullPtr mdb_rdonly
+                    Just (ReadOnlyTxn ptxn') -> return ptxn'
                   pcurs <- liftIO $ mdb_cursor_open ptxn dbi
                   pk <- liftIO malloc
                   pv <- liftIO malloc
@@ -336,12 +336,49 @@ unsafeReadLMDB (Database penv dbi) ropts kmap vmap =
 
                   ref <- liftIO . newIOFinalizer $ do
                     free pv >> free pk
+                    -- Note: If no transaction is provided to this function, it could happen that
+                    -- mdb_cursor_close() gets called after mdb_txn_abort() -- the former being
+                    -- called during garbage collection. This is allowed by LMDB for read-only
+                    -- transactions.
                     c_mdb_cursor_close pcurs
-                    -- No need to commit this read-only transaction.
-                    c_mdb_txn_abort ptxn
+                    when (isNothing mtxn) $
+                      -- There is no need to commit this read-only transaction.
+                      c_mdb_txn_abort ptxn
                   return (pcurs, pk, pv, ref)
               return (op, pcurs, pk, pv, ref)
           )
+
+newtype ReadOnlyTxn = ReadOnlyTxn (Ptr MDB_txn)
+
+-- | Begins an LMDB read-only transaction for use with 'readLMDB' or 'unsafeReadLMDB'. It is your
+-- responsibility to (a) use the transaction only on databases in the same environment, (b) make
+-- sure that those databases were already obtained before the transaction was begun, and (c) dispose
+-- of the transaction with 'abortReadOnlyTxn'.
+beginReadOnlyTxn :: Environment mode -> IO ReadOnlyTxn
+beginReadOnlyTxn (Environment penv) = ReadOnlyTxn <$> mdb_txn_begin penv nullPtr mdb_rdonly
+
+-- | Disposes of a read-only transaction created with 'beginReadOnlyTxn'.
+abortReadOnlyTxn :: ReadOnlyTxn -> IO ()
+abortReadOnlyTxn (ReadOnlyTxn ptxn) = c_mdb_txn_abort ptxn
+
+data ReadOptions = ReadOptions
+  { readDirection :: !ReadDirection,
+    -- | If 'Nothing', a forward [backward] iteration starts at the beginning [end] of the database.
+    -- Otherwise, it starts at the first key that is greater [less] than or equal to the 'Just' key.
+    readStart :: !(Maybe ByteString)
+  }
+  deriving (Show)
+
+-- | By default, we start reading from the beginning of the database (i.e., from the smallest key).
+defaultReadOptions :: ReadOptions
+defaultReadOptions =
+  ReadOptions
+    { readDirection = Forward,
+      readStart = Nothing
+    }
+
+-- | Direction of key iteration.
+data ReadDirection = Forward | Backward deriving (Show)
 
 data OverwriteOptions = OverwriteAllow | OverwriteAllowSame | OverwriteDisallow deriving (Eq)
 

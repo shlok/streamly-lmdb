@@ -3,7 +3,7 @@
 module Streamly.External.LMDB.Tests (tests) where
 
 import Control.Concurrent.Async (asyncBound, wait)
-import Control.Exception (SomeException, onException, try)
+import Control.Exception (SomeException, bracket, onException, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString, pack, unpack)
 import qualified Data.ByteString as B
@@ -12,12 +12,16 @@ import Data.List (find, foldl', nubBy, sort)
 import Data.Word (Word8)
 import Foreign (castPtr, nullPtr, with)
 import Streamly.External.LMDB
-  ( Mode,
+  ( Environment,
+    Mode,
     OverwriteOptions (..),
     ReadDirection (..),
+    ReadOnlyTxn,
     ReadOptions (..),
     ReadWrite,
     WriteOptions (..),
+    abortReadOnlyTxn,
+    beginReadOnlyTxn,
     clearDatabase,
     defaultReadOptions,
     defaultWriteOptions,
@@ -41,21 +45,24 @@ import Test.QuickCheck.Monadic (PropertyM, monadicIO, pick, run)
 import Test.Tasty (TestTree)
 import Test.Tasty.QuickCheck (arbitrary, testProperty)
 
-tests :: IO (Database ReadWrite) -> [TestTree]
-tests db =
-  [ testReadLMDB db,
-    testUnsafeReadLMDB db,
-    testWriteLMDB db,
-    testWriteLMDB_2 db,
-    testWriteLMDB_3 db,
+tests :: IO (Database ReadWrite, Environment ReadWrite) -> [TestTree]
+tests dbenv =
+  [ testReadLMDB dbenv,
+    testUnsafeReadLMDB dbenv,
+    testWriteLMDB dbenv,
+    testWriteLMDB_2 dbenv,
+    testWriteLMDB_3 dbenv,
     testBetween
   ]
 
+withReadOnlyTxn :: (Mode mode) => Environment mode -> (ReadOnlyTxn -> IO r) -> IO r
+withReadOnlyTxn env = bracket (beginReadOnlyTxn env) abortReadOnlyTxn
+
 -- | Clear the database, write key-value pairs to it in a normal manner, read
 -- them back using our library, and make sure the result is what we wrote.
-testReadLMDB :: (Mode mode) => IO (Database mode) -> TestTree
+testReadLMDB :: (Mode mode) => IO (Database mode, Environment mode) -> TestTree
 testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
-  db <- run res
+  (db, env) <- run res
   keyValuePairs <- arbitraryKeyValuePairs''
   run $ clearDatabase db
 
@@ -63,14 +70,16 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
   let keyValuePairsInDb = sort . removeDuplicateKeys $ keyValuePairs
 
   (readOpts, expectedResults) <- pick $ readOptionsAndResults keyValuePairsInDb
-  results <- run . toList $ unfold (readLMDB db readOpts) undefined
+  let unf txn = toList $ unfold (readLMDB db txn readOpts) undefined
+  results <- run $ unf Nothing
+  resultsTxn <- run $ withReadOnlyTxn env (unf . Just)
 
-  return $ results == expectedResults
+  return $ results == expectedResults && resultsTxn == expectedResults
 
 -- | Similar to 'testReadLMDB', except that it tests the unsafe function in a different manner.
-testUnsafeReadLMDB :: (Mode mode) => IO (Database mode) -> TestTree
+testUnsafeReadLMDB :: (Mode mode) => IO (Database mode, Environment mode) -> TestTree
 testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
-  db <- run res
+  (db, env) <- run res
   keyValuePairs <- arbitraryKeyValuePairs''
   run $ clearDatabase db
 
@@ -79,18 +88,20 @@ testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
 
   (readOpts, expectedResults) <- pick $ readOptionsAndResults keyValuePairsInDb
   let expectedLengths = map (\(k, v) -> (B.length k, B.length v)) expectedResults
-  lengths <-
-    run . toList $
-      unfold (unsafeReadLMDB db readOpts (return . snd) (return . snd)) undefined
+  let unf txn =
+        toList $
+          unfold (unsafeReadLMDB db txn readOpts (return . snd) (return . snd)) undefined
+  lengths <- run $ unf Nothing
+  lengthsTxn <- run $ withReadOnlyTxn env (unf . Just)
 
-  return $ lengths == expectedLengths
+  return $ lengths == expectedLengths && lengthsTxn == expectedLengths
 
 -- | Clear the database, write key-value pairs to it using our library with key overwriting allowed,
 -- read them back using our library (already covered by 'testReadLMDB'), and make sure the result is
 -- what we wrote.
-testWriteLMDB :: IO (Database ReadWrite) -> TestTree
+testWriteLMDB :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
 testWriteLMDB res = testProperty "writeLMDB" . monadicIO $ do
-  db <- run res
+  (db, _) <- run res
   keyValuePairs <- arbitraryKeyValuePairs
   run $ clearDatabase db
 
@@ -107,16 +118,16 @@ testWriteLMDB res = testProperty "writeLMDB" . monadicIO $ do
   run $ asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait
   let keyValuePairsInDb = sort . removeDuplicateKeys $ keyValuePairs
 
-  readPairsAll <- run . toList $ unfold (readLMDB db defaultReadOptions) undefined
+  readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
 
   return $ keyValuePairsInDb == readPairsAll
 
 -- | Clear the database, write key-value pairs to it using our library with key overwriting
 -- disallowed, and make sure an exception occurs iff we had a duplicate key in our pairs.
 -- Furthermore make sure that key-value pairs prior to a duplicate key are actually in the database.
-testWriteLMDB_2 :: IO (Database ReadWrite) -> TestTree
+testWriteLMDB_2 :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
 testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
-  db <- run res
+  (db, _) <- run res
   keyValuePairs <- arbitraryKeyValuePairs'
   run $ clearDatabase db
 
@@ -136,7 +147,7 @@ testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
       Right _ -> return . not $ hasDuplicateKeys keyValuePairs
 
   let keyValuePairsInDb = sort . prefixBeforeDuplicate $ keyValuePairs
-  readPairsAll <- run . toList $ unfold (readLMDB db defaultReadOptions) undefined
+  readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
   let pairsAsExpected = keyValuePairsInDb == readPairsAll
 
   return $ exceptionAsExpected && pairsAsExpected
@@ -145,9 +156,9 @@ testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
 -- disallowed except when attempting to replace an existing key-value pair, and make sure an
 -- exception occurs iff we had a duplicate key with different values in our pairs. Furthermore make
 -- sure that key-value pairs prior to a such a duplicate key are actually in the database.
-testWriteLMDB_3 :: IO (Database ReadWrite) -> TestTree
+testWriteLMDB_3 :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
 testWriteLMDB_3 res = testProperty "writeLMDB_3" . monadicIO $ do
-  db <- run res
+  (db, _) <- run res
   keyValuePairs <- arbitraryKeyValuePairs'
   run $ clearDatabase db
 
@@ -169,7 +180,7 @@ testWriteLMDB_3 res = testProperty "writeLMDB_3" . monadicIO $ do
   let keyValuePairsInDb =
         sort . removeDuplicateKeys . prefixBeforeDuplicateWithDiffVal $
           keyValuePairs
-  readPairsAll <- run . toList $ unfold (readLMDB db defaultReadOptions) undefined
+  readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
   let pairsAsExpected = keyValuePairsInDb == readPairsAll
 
   return $ exceptionAsExpected && pairsAsExpected

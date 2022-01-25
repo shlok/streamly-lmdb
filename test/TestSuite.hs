@@ -2,6 +2,7 @@ module Main where
 
 import Streamly.External.LMDB
   ( Database,
+    Environment,
     ReadWrite,
     defaultLimits,
     getDatabase,
@@ -25,12 +26,12 @@ main = do
           tmpDir <- createTempDirectory tmpParent "streamly-lmdb-tests"
           env <- openEnvironment tmpDir $ defaultLimits {mapSize = tebibyte}
           db <- getDatabase env Nothing
-          return (tmpDir, db)
+          return (tmpDir, (db, env))
       )
       (\(tmpDir, _) -> removeDirectoryRecursive tmpDir)
       (\io -> tests $ snd <$> io)
 
-tests :: IO (Database ReadWrite) -> TestTree
+tests :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
 tests res =
   testGroup
     "Tests"
