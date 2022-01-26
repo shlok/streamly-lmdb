@@ -5,12 +5,19 @@
 
 packages:
 - completed:
-    hackage: streamly-0.8.0@sha256:9784c80ee1ada51477520cabc4e92a0c76a6bb265f968a188f2fce818e7398e0,19654
+    hackage: streamly-0.8.1.1@sha256:fe605deaea1d5b9c913ca3b70288fa1a8953b751379458563f8e8b2647c13779,22154
     pantry-tree:
-      size: 21676
-      sha256: 42c3843e920955b647a25a125c090efa72e024d1ef73d8e3ccf5710dc9217940
+      size: 23717
+      sha256: 11bfa895e45c841c649a217e433ce83dae3a5ff281ba11ed05b9932ade42613d
   original:
-    hackage: streamly-0.8.0@sha256:9784c80ee1ada51477520cabc4e92a0c76a6bb265f968a188f2fce818e7398e0,19654
+    hackage: streamly-0.8.1.1@sha256:fe605deaea1d5b9c913ca3b70288fa1a8953b751379458563f8e8b2647c13779,22154
+- completed:
+    hackage: unicode-data-0.3.0@sha256:0545e079705a5381d0893f8fe8daaa08fc9174baeab269b9cf651817d8eadbc6,5123
+    pantry-tree:
+      size: 2555
+      sha256: 6ccabf28007368d01c8c9ed9353e781e33c0037b74fbe908c5da0af9d09c299a
+  original:
+    hackage: unicode-data-0.3.0@sha256:0545e079705a5381d0893f8fe8daaa08fc9174baeab269b9cf651817d8eadbc6,5123
 snapshots:
 - completed:
     size: 585603

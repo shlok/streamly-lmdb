@@ -5,19 +5,23 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define E(func, ...) \
-    do { \
-        if (func(__VA_ARGS__) != 0) { \
+#define E(func, ...)                                                 \
+    do                                                               \
+    {                                                                \
+        if (func(__VA_ARGS__) != 0)                                  \
+        {                                                            \
             printf("%s error (%s:%d)\n", #func, __FILE__, __LINE__); \
-            return 1; \
-        } \
-    } while(0)
+            return 1;                                                \
+        }                                                            \
+    } while (0)
 
 void print_usage();
-void __attribute__ ((noinline)) copy_bytes(char *memory, int factor, int x, int offset);
+void __attribute__((noinline)) copy_bytes(char *memory, int factor, int x, int offset);
 
-int main(int argc, char *argv[]) {
-    if (argc <= 2) {
+int main(int argc, char *argv[])
+{
+    if (argc <= 2)
+    {
         print_usage();
         return 1;
     }
@@ -27,8 +31,10 @@ int main(int argc, char *argv[]) {
     unsigned long long tb = kb * kb * kb * kb;
     E(mdb_env_create, &env);
     E(mdb_env_set_mapsize, env, tb);
-    if (strcmp(argv[1], "write") == 0) {
-        if (argc != 7) {
+    if (strcmp(argv[1], "write") == 0)
+    {
+        if (argc != 7)
+        {
             print_usage();
             return 1;
         }
@@ -36,13 +42,20 @@ int main(int argc, char *argv[]) {
         int value_factor = strtol(argv[4], NULL, 10);
         long long num_pairs = strtoll(argv[5], NULL, 10);
         int chunk_size = strtol(argv[6], NULL, 10);
-        if (!(key_factor > 0 && value_factor > 0 && 0 < num_pairs && chunk_size > 0 && chunk_size <= num_pairs)) {
+        int valid_write_args = key_factor > 0 &&
+                               value_factor > 0 &&
+                               0 < num_pairs &&
+                               chunk_size > 0 &&
+                               chunk_size <= num_pairs;
+        if (!valid_write_args)
+        {
             printf("Invalid write arguments.\n");
             print_usage();
             return 1;
         }
         struct stat buffer;
-        if (stat(path, &buffer) == 0) {
+        if (stat(path, &buffer) == 0)
+        {
             printf("File already exists at %s\n", path);
             return 1;
         }
@@ -60,39 +73,60 @@ int main(int argc, char *argv[]) {
 
         int current_chunk_size = 0;
         long long i = 0;
-        for (int x0 = 0; x0 <= 255; x0++) { copy_bytes(key_data, key_factor, x0, 4); copy_bytes(val_data, value_factor, x0, 4);
-        for (int x1 = 0; x1 <= 255; x1++) { copy_bytes(key_data, key_factor, x1, 5); copy_bytes(val_data, value_factor, x1, 5);
-        for (int x2 = 0; x2 <= 255; x2++) { copy_bytes(key_data, key_factor, x2, 6); copy_bytes(val_data, value_factor, x2, 6);
-        for (int x3 = 0; x3 <= 255; x3++) { copy_bytes(key_data, key_factor, x3, 7); copy_bytes(val_data, value_factor, x3, 7);
-            if (i >= num_pairs) {
-                E(mdb_txn_commit, txn);
-                return 0; // Complete.
+        for (int x0 = 0; x0 <= 255; x0++)
+        {
+            copy_bytes(key_data, key_factor, x0, 4);
+            copy_bytes(val_data, value_factor, x0, 4);
+            for (int x1 = 0; x1 <= 255; x1++)
+            {
+                copy_bytes(key_data, key_factor, x1, 5);
+                copy_bytes(val_data, value_factor, x1, 5);
+                for (int x2 = 0; x2 <= 255; x2++)
+                {
+                    copy_bytes(key_data, key_factor, x2, 6);
+                    copy_bytes(val_data, value_factor, x2, 6);
+                    for (int x3 = 0; x3 <= 255; x3++)
+                    {
+                        copy_bytes(key_data, key_factor, x3, 7);
+                        copy_bytes(val_data, value_factor, x3, 7);
+                        if (i >= num_pairs)
+                        {
+                            E(mdb_txn_commit, txn);
+                            return 0; // Complete.
+                        }
+                        if (current_chunk_size >= chunk_size)
+                        {
+                            E(mdb_txn_commit, txn);
+                            current_chunk_size = 0;
+                        }
+                        if (current_chunk_size == 0)
+                        {
+                            E(mdb_txn_begin, env, NULL, 0, &txn);
+                        }
+
+                        MDB_val key;
+                        key.mv_size = 8 * key_factor;
+                        key.mv_data = key_data;
+
+                        MDB_val value;
+                        value.mv_size = 8 * value_factor;
+                        value.mv_data = val_data;
+
+                        E(mdb_put, txn, dbi, &key, &value, 0);
+
+                        current_chunk_size++;
+                        i++;
+                    }
+                }
             }
-            if (current_chunk_size >= chunk_size) {
-                E(mdb_txn_commit, txn);
-                current_chunk_size = 0;
-            }
-            if (current_chunk_size == 0) {
-                E(mdb_txn_begin, env, NULL, 0, &txn);
-            }
-
-            MDB_val key;
-            key.mv_size = 8 * key_factor;
-            key.mv_data = key_data;
-
-            MDB_val value;
-            value.mv_size = 8 * value_factor;
-            value.mv_data = val_data;
-
-            E(mdb_put, txn, dbi, &key, &value, 0);
-
-            current_chunk_size++;
-            i++;
-        }}}}
+        }
         printf("Overflow.\n");
         return 1;
-    } else if (strcmp(argv[1], "read-cursor") == 0) {
-        if (argc != 3) {
+    }
+    else if (strcmp(argv[1], "read-cursor") == 0)
+    {
+        if (argc != 3)
+        {
             print_usage();
             return 1;
         }
@@ -115,16 +149,20 @@ int main(int argc, char *argv[]) {
         MDB_val key;
         MDB_val val;
         int rc;
-        do {
+        do
+        {
             rc = mdb_cursor_get(curs, &key, &val, op);
-            if (rc != 0 && rc != MDB_NOTFOUND) {
+            if (rc != 0 && rc != MDB_NOTFOUND)
+            {
                 printf("cursor_get error\n");
                 return 1;
             }
-            if (op == MDB_FIRST) {
+            if (op == MDB_FIRST)
+            {
                 op = MDB_NEXT;
             }
-            if (rc != MDB_NOTFOUND) {
+            if (rc != MDB_NOTFOUND)
+            {
                 key_byte_count += key.mv_size;
                 value_byte_count += val.mv_size;
                 total_byte_count += key.mv_size + val.mv_size;
@@ -137,8 +175,11 @@ int main(int argc, char *argv[]) {
         printf("Value byte count: %lld\n", value_byte_count);
         printf("Total byte count: %lld\n", total_byte_count);
         printf("Pair count:       %lld\n", pair_count);
-    } else if (strcmp(argv[1], "read-keys") == 0) {
-        if (argc != 4) {
+    }
+    else if (strcmp(argv[1], "read-keys") == 0)
+    {
+        if (argc != 4)
+        {
             print_usage();
             return 1;
         }
@@ -159,39 +200,58 @@ int main(int argc, char *argv[]) {
         long long value_byte_count = 0;
         long long total_byte_count = 0;
         long long pair_count = 0;
-        for (int x0 = 0; x0 <= 255; x0++) { copy_bytes(key_data, key_factor, x0, 4);
-        for (int x1 = 0; x1 <= 255; x1++) { copy_bytes(key_data, key_factor, x1, 5);
-        for (int x2 = 0; x2 <= 255; x2++) { copy_bytes(key_data, key_factor, x2, 6);
-        for (int x3 = 0; x3 <= 255; x3++) { copy_bytes(key_data, key_factor, x3, 7);
-            MDB_val key;
-            key.mv_size = 8 * key_factor;
-            key.mv_data = key_data;
+        for (int x0 = 0; x0 <= 255; x0++)
+        {
+            copy_bytes(key_data, key_factor, x0, 4);
+            for (int x1 = 0; x1 <= 255; x1++)
+            {
+                copy_bytes(key_data, key_factor, x1, 5);
+                for (int x2 = 0; x2 <= 255; x2++)
+                {
+                    copy_bytes(key_data, key_factor, x2, 6);
+                    for (int x3 = 0; x3 <= 255; x3++)
+                    {
+                        copy_bytes(key_data, key_factor, x3, 7);
+                        MDB_val key;
+                        key.mv_size = 8 * key_factor;
+                        key.mv_data = key_data;
 
-            MDB_val value;
-            value.mv_size = -1;
-            value.mv_data = NULL;
-            // Profiling shows that most of the time (by orders of magnitude) is spent in mdb_get().
-            int rc = mdb_get(txn, dbi, &key, &value);
-            if (rc != 0 && rc != MDB_NOTFOUND) {
-                printf("mdb_get error\n");
-                return 1;
-            } else if (rc == MDB_NOTFOUND) {
-                E(mdb_txn_commit, txn);
-                printf("Key byte count:   %lld\n", key_byte_count);
-                printf("Value byte count: %lld\n", value_byte_count);
-                printf("Total byte count: %lld\n", total_byte_count);
-                printf("Pair count:       %lld\n", pair_count);
-                return 0;
-            } else {
-                key_byte_count += key.mv_size;
-                value_byte_count += value.mv_size;
-                total_byte_count += key.mv_size + value.mv_size;
-                pair_count++;
+                        MDB_val value;
+                        value.mv_size = -1;
+                        value.mv_data = NULL;
+                        // Profiling shows that most of the time (by orders of magnitude) is spent
+                        // in mdb_get().
+                        int rc = mdb_get(txn, dbi, &key, &value);
+                        if (rc != 0 && rc != MDB_NOTFOUND)
+                        {
+                            printf("mdb_get error\n");
+                            return 1;
+                        }
+                        else if (rc == MDB_NOTFOUND)
+                        {
+                            E(mdb_txn_commit, txn);
+                            printf("Key byte count:   %lld\n", key_byte_count);
+                            printf("Value byte count: %lld\n", value_byte_count);
+                            printf("Total byte count: %lld\n", total_byte_count);
+                            printf("Pair count:       %lld\n", pair_count);
+                            return 0;
+                        }
+                        else
+                        {
+                            key_byte_count += key.mv_size;
+                            value_byte_count += value.mv_size;
+                            total_byte_count += key.mv_size + value.mv_size;
+                            pair_count++;
+                        }
+                    }
+                }
             }
-        }}}}
+        }
         printf("Overflow.\n");
         return 1;
-    } else {
+    }
+    else
+    {
         print_usage();
         return 1;
     }
@@ -199,14 +259,18 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-void print_usage() {
-    printf("bench-lmdb write [path] [key factor] [value factor] [# key-value pairs] [# pairs in each transaction]\n");
+void print_usage()
+{
+    printf("bench-lmdb write [path] [key factor] [value factor] \
+            [# key-value pairs] [# pairs in each transaction]\n");
     printf("bench-lmdb read-cursor [path]\n");
     printf("bench-lmdb read-keys [path] [key factor]\n");
 }
 
-void copy_bytes(char *memory, int factor, int x, int offset) {
-    for (int i = 0; i < factor; i++) {
-        *(memory + 8*i + offset) = (unsigned char)x;
+void copy_bytes(char *memory, int factor, int x, int offset)
+{
+    for (int i = 0; i < factor; i++)
+    {
+        *(memory + 8 * i + offset) = (unsigned char)x;
     }
 }
