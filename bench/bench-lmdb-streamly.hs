@@ -13,6 +13,7 @@ import Streamly.External.LMDB
     ReadOnly,
     ReadWrite,
     WriteOptions (writeTransactionSize),
+    beginReadOnlyTxn,
     defaultLimits,
     defaultReadOptions,
     defaultWriteOptions,
@@ -132,7 +133,24 @@ dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
           _ <- U.fold writeFold unf' undefined
           return 0
 dispatch ["read-cursor", path] = do
+  readCursor path False
+dispatch ["read-cursor-safe", path] = do
+  readCursorSafe path False
+-- A precreated read-only transaction should make almost no difference for large enough databases.
+dispatch ["read-cursor-txn", path] = do
+  readCursor path True
+dispatch ["read-cursor-safe-txn", path] = do
+  readCursorSafe path True
+dispatch _ = do
+  printUsage
+  return 1
+
+type UsePrecreatedTxn = Bool
+
+readCursor :: String -> UsePrecreatedTxn -> IO Int
+readCursor path txn = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
+  mtxn <- if txn then Just <$> beginReadOnlyTxn env else return Nothing
   db <- getDatabase env Nothing
   let fold' =
         Fold
@@ -144,15 +162,18 @@ dispatch ["read-cursor", path] = do
   (k, v, t, p) <-
     U.fold
       fold'
-      (unsafeReadLMDB db Nothing defaultReadOptions (return . snd) (return . snd))
+      (unsafeReadLMDB db mtxn defaultReadOptions (return . snd) (return . snd))
       undefined
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
   putStrLn $ "Total byte count: " ++ show t
   putStrLn $ "Pair count:       " ++ show p
   return 0
-dispatch ["read-cursor-safe", path] = do
+
+readCursorSafe :: String -> UsePrecreatedTxn -> IO Int
+readCursorSafe path txn = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
+  mtxn <- if txn then Just <$> beginReadOnlyTxn env else return Nothing
   db <- getDatabase env Nothing
   let fold' =
         Fold
@@ -167,15 +188,12 @@ dispatch ["read-cursor-safe", path] = do
           )
           (return $ Partial (0, 0, 0, 0 :: Int))
           return
-  (k, v, t, p) <- U.fold fold' (readLMDB db Nothing defaultReadOptions) undefined
+  (k, v, t, p) <- U.fold fold' (readLMDB db mtxn defaultReadOptions) undefined
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
   putStrLn $ "Total byte count: " ++ show t
   putStrLn $ "Pair count:       " ++ show p
   return 0
-dispatch _ = do
-  printUsage
-  return 1
 
 printUsage :: IO ()
 printUsage = do
@@ -183,7 +201,9 @@ printUsage = do
     "bench-lmdb write [path] [key factor] [value factor] "
       ++ "[# key-value pairs] [# pairs in each transaction]"
   putStrLn "bench-lmdb read-cursor [path]"
+  putStrLn "bench-lmdb read-cursor-txn [path]"
   putStrLn "bench-lmdb read-cursor-safe [path]"
+  putStrLn "bench-lmdb read-cursor-safe-txn [path]"
 
 {-# INLINE copyBytes #-}
 copyBytes :: [Ptr CChar] -> Int -> IO ()

@@ -96,12 +96,16 @@ main = do
               csvFile = "./tmp/read/read-cursor.csv"
           shells (format ("rm -f " % fp % "") csvFile) empty
 
+          -- We did not add “diff” for the “txn” columns. For now just look if they are similar to
+          -- the corresponding “non-txn” columns.
           output csvFile . return . unsafeTextToLine . T.pack $
             "pairCount,kvFactor,"
               ++ "c_mean,c_std,"
               ++ "hsPlain_mean,hsPlain_std,"
               ++ "hsStreamly_mean,hsStreamly_std,"
+              ++ "hsStreamlyTxn_mean,hsStreamlyTxn_std,"
               ++ "hsStreamlySafe_mean,hsStreamlySafe_std,"
+              ++ "hsStreamlySafeTxn_mean,hsStreamlySafeTxn_std,"
               ++ "hsPlain_diff_c_mean,hsPlain_diff_c_std,"
               ++ "hsStreamly_diff_hsPlain_mean,hsStreamly_diff_hsPlain_std,"
               ++ "hsStreamlySafe_diff_hsStreamly_mean,hsStreamlySafe_diff_hsStreamly_std"
@@ -109,7 +113,6 @@ main = do
           forM_ pairCounts $ \pairCount -> forM_ kvFactors $ \kvFactor -> do
             let dbPath = format ("" % fp % "/test_" % d % "_" % d % "") tmpDir pairCount kvFactor
             let expectedInOutput = format ("Pair count:       " % d % "") pairCount
-            let args = format ("read-cursor " % s % "") dbPath
             let warmCount = 2
             let timeCount = 5
 
@@ -120,54 +123,54 @@ main = do
                         V.fromList $ map (realToFrac . (/ fromIntegral pairCount) . (* 1e9)) secs
                    in (mean nsPerPair, stdDev nsPerPair)
 
-            procs "echo" [format ("    Timing database " % s % " with C...") dbPath] empty
+            let runProcs description exec cmd = do
+                  procs
+                    "echo"
+                    [format ("    Timing database " % s % " with " % s % "...") dbPath description]
+                    empty
+                  toStats
+                    <$> timeCommand
+                      Nothing
+                      (format ("" % s % " " % s % " " % s % "") exec cmd dbPath)
+                      [expectedInOutput]
+                      warmCount
+                      timeCount
+
             (cMean, cStd) <-
-              toStats
-                <$> timeCommand
-                  Nothing
-                  (format ("" % s % " " % s % "") c_executable args)
-                  [expectedInOutput]
-                  warmCount
-                  timeCount
+              runProcs
+                "C"
+                c_executable
+                "read-cursor"
 
-            procs
-              "echo"
-              [format ("    Timing database " % s % " with Haskell (plain)...") dbPath]
-              empty
             (hsPlainMean, hsPlainStd) <-
-              toStats
-                <$> timeCommand
-                  Nothing
-                  (format ("" % s % " " % s % "") hs_plain_executable args)
-                  [expectedInOutput]
-                  warmCount
-                  timeCount
+              runProcs
+                "Haskell (plain)"
+                hs_plain_executable
+                "read-cursor"
 
-            procs
-              "echo"
-              [format ("    Timing database " % s % " with Haskell (streamly)...") dbPath]
-              empty
             (hsStreamlyMean, hsStreamlyStd) <-
-              toStats
-                <$> timeCommand
-                  Nothing
-                  (format ("" % s % " " % s % "") hs_streamly_executable args)
-                  [expectedInOutput]
-                  warmCount
-                  timeCount
+              runProcs
+                "Haskell (streamly)"
+                hs_streamly_executable
+                "read-cursor"
 
-            procs
-              "echo"
-              [format ("    Timing database " % s % " with Haskell (streamly, safe)...") dbPath]
-              empty
+            (hsStreamlyTxnMean, hsStreamlyTxnStd) <-
+              runProcs
+                "Haskell (streamly, txn)"
+                hs_streamly_executable
+                "read-cursor-txn"
+
             (hsStreamlySafeMean, hsStreamlySafeStd) <-
-              toStats
-                <$> timeCommand
-                  Nothing
-                  (format ("" % s % " read-cursor-safe " % s % "") hs_streamly_executable dbPath)
-                  [expectedInOutput]
-                  warmCount
-                  timeCount
+              runProcs
+                "Haskell (streamly, safe)"
+                hs_streamly_executable
+                "read-cursor-safe"
+
+            (hsStreamlySafeTxnMean, hsStreamlySafeTxnStd) <-
+              runProcs
+                "Haskell (streamly, safe, txn)"
+                hs_streamly_executable
+                "read-cursor-safe-txn"
 
             let diffStd :: Double -> Double -> Double
                 diffStd std1 std2 =
@@ -185,8 +188,12 @@ main = do
                           hsPlainStd,
                           hsStreamlyMean,
                           hsStreamlyStd,
+                          hsStreamlyTxnMean,
+                          hsStreamlyTxnStd,
                           hsStreamlySafeMean,
                           hsStreamlySafeStd,
+                          hsStreamlySafeTxnMean,
+                          hsStreamlySafeTxnStd,
                           hsPlainMean - cMean,
                           diffStd hsPlainStd cStd,
                           hsStreamlyMean - hsPlainMean,
