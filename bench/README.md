@@ -12,6 +12,6 @@ These programs are currently undocumented, apart from the brief usage descriptio
 
 * Install [Stack](https://docs.haskellstack.org/en/stable/README/).
 * Install LMDB on your system. Debian Linux: `sudo apt-get install liblmdb-dev`. macOS: `brew install lmdb`.
-* Install other necessary programs. Debian Linux: `sudo apt-get install lmdb-utils pcregrep`. macOS: `brew install gnu-time TODO`.
+* Install other necessary programs. Debian Linux: `sudo apt-get install lmdb-utils pcregrep`. macOS: `brew install gnu-time pcre`.
 * Run `stack build` and `stack exec -- bench`.
 * View the `csv` files. We are currently not explaining the columns in detail here, but our main conclusions are outlined in `../README.md`.
