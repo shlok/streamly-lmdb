@@ -1,3 +1,7 @@
+## 0.4.0
+
+* Added support for precreating read-only transactions.
+
 ## 0.3.0
 
 * Updated for Streamly 0.8.0.
