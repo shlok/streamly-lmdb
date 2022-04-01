@@ -336,7 +336,7 @@ unsafeReadLMDB (Database penv dbi) mtxn ropts kmap vmap =
 
                   ref <- liftIO . newIOFinalizer $ do
                     free pv >> free pk
-                    -- Note: If no transaction is provided to this function, it could happen that
+                    -- Note: If a transaction is provided to this function, it could happen that
                     -- mdb_cursor_close() gets called after mdb_txn_abort() -- the former being
                     -- called during garbage collection. This is allowed by LMDB for read-only
                     -- transactions.
