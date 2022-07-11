@@ -12,7 +12,8 @@ import Data.List (find, foldl', nubBy, sort)
 import Data.Word (Word8)
 import Foreign (castPtr, nullPtr, with)
 import Streamly.External.LMDB
-  ( Environment,
+  ( Cursor,
+    Environment,
     Mode,
     OverwriteOptions (..),
     ReadDirection (..),
@@ -23,8 +24,10 @@ import Streamly.External.LMDB
     abortReadOnlyTxn,
     beginReadOnlyTxn,
     clearDatabase,
+    closeCursor,
     defaultReadOptions,
     defaultWriteOptions,
+    openCursor,
     readLMDB,
     unsafeReadLMDB,
     writeLMDB,
@@ -55,8 +58,16 @@ tests dbenv =
     testBetween
   ]
 
-withReadOnlyTxn :: (Mode mode) => Environment mode -> (ReadOnlyTxn -> IO r) -> IO r
-withReadOnlyTxn env = bracket (beginReadOnlyTxn env) abortReadOnlyTxn
+withReadOnlyTxnAndCurs ::
+  (Mode mode) =>
+  Environment mode ->
+  Database mode ->
+  ((ReadOnlyTxn, Cursor) -> IO r) ->
+  IO r
+withReadOnlyTxnAndCurs env db =
+  bracket
+    (beginReadOnlyTxn env >>= \txn -> openCursor txn db >>= \curs -> return (txn, curs))
+    (\(txn, curs) -> closeCursor curs >> abortReadOnlyTxn txn)
 
 -- | Clear the database, write key-value pairs to it in a normal manner, read
 -- them back using our library, and make sure the result is what we wrote.
@@ -72,7 +83,7 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
   (readOpts, expectedResults) <- pick $ readOptionsAndResults keyValuePairsInDb
   let unf txn = toList $ unfold (readLMDB db txn readOpts) undefined
   results <- run $ unf Nothing
-  resultsTxn <- run $ withReadOnlyTxn env (unf . Just)
+  resultsTxn <- run $ withReadOnlyTxnAndCurs env db (unf . Just)
 
   return $ results == expectedResults && resultsTxn == expectedResults
 
@@ -92,7 +103,7 @@ testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
         toList $
           unfold (unsafeReadLMDB db txn readOpts (return . snd) (return . snd)) undefined
   lengths <- run $ unf Nothing
-  lengthsTxn <- run $ withReadOnlyTxn env (unf . Just)
+  lengthsTxn <- run $ withReadOnlyTxnAndCurs env db (unf . Just)
 
   return $ lengths == expectedLengths && lengthsTxn == expectedLengths
 

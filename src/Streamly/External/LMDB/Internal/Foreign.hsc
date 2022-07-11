@@ -79,6 +79,12 @@ foreign import ccall unsafe "lmdb.h mdb_cursor_get"
 foreign import ccall unsafe "lmdb.h mdb_cursor_close"
     c_mdb_cursor_close :: Ptr MDB_cursor -> IO ()
 
+foreign import ccall unsafe "lmdb.h mdb_dbi_close"
+    c_mdb_dbi_close :: Ptr MDB_env -> MDB_dbi_t -> IO ()
+
+foreign import ccall unsafe "lmdb.h mdb_env_close"
+    c_mdb_env_close :: Ptr MDB_env -> IO ()
+
 foreign import ccall unsafe "lmdb.h mdb_get"
     c_mdb_get :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 

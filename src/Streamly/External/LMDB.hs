@@ -14,6 +14,7 @@ module Streamly.External.LMDB
     Environment,
     openEnvironment,
     isReadOnlyEnvironment,
+    closeEnvironment,
 
     -- ** Mode
     Mode,
@@ -37,15 +38,19 @@ module Streamly.External.LMDB
     Database,
     getDatabase,
     clearDatabase,
+    closeDatabase,
 
     -- * Reading
     readLMDB,
     unsafeReadLMDB,
 
-    -- ** Read-only transactions
+    -- ** Read-only transactions and cursors
     ReadOnlyTxn,
     beginReadOnlyTxn,
     abortReadOnlyTxn,
+    Cursor,
+    openCursor,
+    closeCursor,
 
     -- ** Read options
     ReadOptions (..),
@@ -82,11 +87,14 @@ import Streamly.External.LMDB.Internal (Database (..), Mode (..), ReadOnly, Read
 import Streamly.External.LMDB.Internal.Foreign
   ( LMDB_Error (..),
     MDB_ErrCode (..),
+    MDB_cursor,
     MDB_env,
     MDB_txn,
     MDB_val (MDB_val, mv_data, mv_size),
     c_mdb_cursor_close,
     c_mdb_cursor_get,
+    c_mdb_dbi_close,
+    c_mdb_env_close,
     c_mdb_get,
     c_mdb_txn_abort,
     combineOptions,
@@ -205,6 +213,22 @@ openEnvironment path limits = do
 
   return env
 
+-- | Closes the given environment.
+--
+-- If you have merely a few dozen environments at most, there should be no need for this. (It is a
+-- common practice with LMDB to create one’s environments once and reuse them for the remainder of
+-- the program’s execution.) If you find yourself needing this, it is your responsibility to heed
+-- the [documented
+-- caveats](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787).
+--
+-- In particular, you will probably, before calling this function, want to (a) use 'closeDatabase',
+-- and (b) pass in precreated transactions and cursors to 'readLMDB' and 'unsafeReadLMDB' to make
+-- sure there are no transactions or cursors still left to be cleaned up by the garbage collector.
+-- (As an alternative to (b), one could try manually triggering the garbage collector.)
+closeEnvironment :: (Mode mode) => Environment mode -> IO ()
+closeEnvironment (Environment penv) =
+  c_mdb_env_close penv
+
 -- | Gets a database with the given name. When creating a database (i.e., getting it for the first
 -- time), one must do so in 'ReadWrite' mode.
 --
@@ -233,14 +257,26 @@ clearDatabase (Database penv dbi) =
     )
     >>= wait
 
+-- | Closes the given database.
+--
+-- If you have merely a few dozen databases at most, there should be no need for this. (It is a
+-- common practice with LMDB to create one’s databases once and reuse them for the remainder of the
+-- program’s execution.) If you find yourself needing this, it is your responsibility to heed the
+-- [documented
+-- caveats](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200).
+closeDatabase :: (Mode mode) => Database mode -> IO ()
+closeDatabase (Database penv dbi) =
+  c_mdb_dbi_close penv dbi
+
 -- | Creates an unfold with which we can stream key-value pairs from the given database.
 --
--- If an existing read-only transaction is not provided, a read-only transaction is automatically
--- created and kept open for the duration of the unfold; we suggest doing this as a first option.
--- However, if you find this to be a bottleneck (e.g., if you find upon profiling that a significant
--- time is being spent at @mdb_txn_begin@, or if you find yourself having to increase 'maxReaders'
--- in the environment’s limits because the transactions are not being garbage collected fast
--- enough), consider precreating a transaction using 'beginReadOnlyTxn'.
+-- If an existing read-only transaction and cursor are not provided, a read-only transaction and
+-- cursor are automatically created and kept open for the duration of the unfold; we suggest doing
+-- this as a first option. However, if you find this to be a bottleneck (e.g., if you find upon
+-- profiling that a significant time is being spent at @mdb_txn_begin@, or if you find yourself
+-- having to increase 'maxReaders' in the environment’s limits because the transactions and cursors
+-- are not being garbage collected fast enough), consider precreating a transaction and cursor using
+-- 'beginReadOnlyTxn' and 'openCursor'.
 --
 -- In any case, bear in mind at all times LMDB’s [caveats regarding long-lived
 -- transactions](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L107).
@@ -251,10 +287,10 @@ clearDatabase (Database penv dbi) =
 readLMDB ::
   (MonadIO m, Mode mode) =>
   Database mode ->
-  Maybe ReadOnlyTxn ->
+  Maybe (ReadOnlyTxn, Cursor) ->
   ReadOptions ->
   Unfold m Void (ByteString, ByteString)
-readLMDB db mtxn ropts = unsafeReadLMDB db mtxn ropts packCStringLen packCStringLen
+readLMDB db mtxncurs ropts = unsafeReadLMDB db mtxncurs ropts packCStringLen packCStringLen
 
 -- | Similar to 'readLMDB', except that the keys and values are not automatically converted into
 -- Haskell @ByteString@s.
@@ -267,12 +303,12 @@ readLMDB db mtxn ropts = unsafeReadLMDB db mtxn ropts packCStringLen packCString
 unsafeReadLMDB ::
   (MonadIO m, Mode mode) =>
   Database mode ->
-  Maybe ReadOnlyTxn ->
+  Maybe (ReadOnlyTxn, Cursor) ->
   ReadOptions ->
   (CStringLen -> IO k) ->
   (CStringLen -> IO v) ->
   Unfold m Void (k, v)
-unsafeReadLMDB (Database penv dbi) mtxn ropts kmap vmap =
+unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
   let (firstOp, subsequentOp) = case (readDirection ropts, readStart ropts) of
         (Forward, Nothing) -> (mdb_first, mdb_next)
         (Forward, Just _) -> (mdb_set_range, mdb_next)
@@ -322,10 +358,13 @@ unsafeReadLMDB (Database penv dbi) mtxn ropts kmap vmap =
           ( \op -> do
               (pcurs, pk, pv, ref) <- liftIO $
                 mask_ $ do
-                  ptxn <- case mtxn of
-                    Nothing -> liftIO $ mdb_txn_begin penv nullPtr mdb_rdonly
-                    Just (ReadOnlyTxn ptxn') -> return ptxn'
-                  pcurs <- liftIO $ mdb_cursor_open ptxn dbi
+                  (ptxn, pcurs) <- case mtxncurs of
+                    Nothing -> liftIO $ do
+                      ptxn <- mdb_txn_begin penv nullPtr mdb_rdonly
+                      pcurs <- mdb_cursor_open ptxn dbi
+                      return (ptxn, pcurs)
+                    Just (ReadOnlyTxn ptxn, Cursor pcurs) ->
+                      return (ptxn, pcurs)
                   pk <- liftIO malloc
                   pv <- liftIO malloc
 
@@ -336,14 +375,9 @@ unsafeReadLMDB (Database penv dbi) mtxn ropts kmap vmap =
 
                   ref <- liftIO . newIOFinalizer $ do
                     free pv >> free pk
-                    -- Note: If a transaction is provided to this function, it could happen that
-                    -- mdb_cursor_close() gets called after mdb_txn_abort() -- the former being
-                    -- called during garbage collection. This is allowed by LMDB for read-only
-                    -- transactions.
-                    c_mdb_cursor_close pcurs
-                    when (isNothing mtxn) $
+                    when (isNothing mtxncurs) $
                       -- There is no need to commit this read-only transaction.
-                      c_mdb_txn_abort ptxn
+                      c_mdb_cursor_close pcurs >> c_mdb_txn_abort ptxn
                   return (pcurs, pk, pv, ref)
               return (op, pcurs, pk, pv, ref)
           )
@@ -360,6 +394,21 @@ beginReadOnlyTxn (Environment penv) = ReadOnlyTxn <$> mdb_txn_begin penv nullPtr
 -- | Disposes of a read-only transaction created with 'beginReadOnlyTxn'.
 abortReadOnlyTxn :: ReadOnlyTxn -> IO ()
 abortReadOnlyTxn (ReadOnlyTxn ptxn) = c_mdb_txn_abort ptxn
+
+newtype Cursor = Cursor (Ptr MDB_cursor)
+
+-- | Opens a cursor for use with 'readLMDB' or 'unsafeReadLMDB'. It is your responsibility to (a)
+-- make sure the provided database is within the environment on which the provided transaction was
+-- begun, and (b) dispose of the cursor with 'closeCursor' (logically before 'abortReadOnlyTxn',
+-- although the order doesn’t really matter for read-only transactions).
+openCursor :: ReadOnlyTxn -> Database mode -> IO Cursor
+openCursor (ReadOnlyTxn ptxn) (Database _ dbi) =
+  Cursor <$> mdb_cursor_open ptxn dbi
+
+-- | Disposes of a cursor created with 'openCursor'.
+closeCursor :: Cursor -> IO ()
+closeCursor (Cursor pcurs) =
+  c_mdb_cursor_close pcurs
 
 data ReadOptions = ReadOptions
   { readDirection :: !ReadDirection,
