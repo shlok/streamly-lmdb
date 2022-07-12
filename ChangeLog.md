@@ -1,3 +1,7 @@
+## 0.5.0
+
+* Added the ability to close databases and environments.
+
 ## 0.4.0
 
 * Added support for precreating read-only transactions.

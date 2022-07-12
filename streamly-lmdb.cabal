@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           streamly-lmdb
-version:        0.4.0
+version:        0.5.0
 synopsis:       Stream data to or from LMDB databases using the streamly library.
 description:    Please see the README on GitHub at <https://github.com/shlok/streamly-lmdb#readme>
 category:       Database, Streaming, Streamly
