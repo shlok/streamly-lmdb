@@ -18,6 +18,7 @@ import Streamly.External.LMDB
     defaultReadOptions,
     defaultWriteOptions,
     getDatabase,
+    openCursor,
     openEnvironment,
     readLMDB,
     tebibyte,
@@ -150,8 +151,14 @@ type UsePrecreatedTxn = Bool
 readCursor :: String -> UsePrecreatedTxn -> IO Int
 readCursor path txn = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
-  mtxn <- if txn then Just <$> beginReadOnlyTxn env else return Nothing
   db <- getDatabase env Nothing
+  mtxncurs <-
+    if txn
+      then do
+        tx <- beginReadOnlyTxn env
+        curs <- openCursor tx db
+        return . Just $ (tx, curs)
+      else return Nothing
   let fold' =
         Fold
           ( \(!key, !value, !total, !pair) (kl, vl) ->
@@ -162,7 +169,7 @@ readCursor path txn = do
   (k, v, t, p) <-
     U.fold
       fold'
-      (unsafeReadLMDB db mtxn defaultReadOptions (return . snd) (return . snd))
+      (unsafeReadLMDB db mtxncurs defaultReadOptions (return . snd) (return . snd))
       undefined
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
@@ -173,8 +180,14 @@ readCursor path txn = do
 readCursorSafe :: String -> UsePrecreatedTxn -> IO Int
 readCursorSafe path txn = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
-  mtxn <- if txn then Just <$> beginReadOnlyTxn env else return Nothing
   db <- getDatabase env Nothing
+  mtxncurs <-
+    if txn
+      then do
+        tx <- beginReadOnlyTxn env
+        curs <- openCursor tx db
+        return . Just $ (tx, curs)
+      else return Nothing
   let fold' =
         Fold
           ( \(!key, !value, !total, !pair) (b1, b2) ->
@@ -188,7 +201,7 @@ readCursorSafe path txn = do
           )
           (return $ Partial (0, 0, 0, 0 :: Int))
           return
-  (k, v, t, p) <- U.fold fold' (readLMDB db mtxn defaultReadOptions) undefined
+  (k, v, t, p) <- U.fold fold' (readLMDB db mtxncurs defaultReadOptions) undefined
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
   putStrLn $ "Total byte count: " ++ show t
