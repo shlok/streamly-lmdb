@@ -398,8 +398,10 @@ abortReadOnlyTxn (ReadOnlyTxn ptxn) = c_mdb_txn_abort ptxn
 newtype Cursor = Cursor (Ptr MDB_cursor)
 
 -- | Opens a cursor for use with 'readLMDB' or 'unsafeReadLMDB'. It is your responsibility to (a)
--- make sure the provided database is within the environment on which the provided transaction was
--- begun, and (b) dispose of the cursor with 'closeCursor' (logically before 'abortReadOnlyTxn',
+-- make sure the cursor only gets used by a single 'readLMDB' or 'unsafeReadLMDB' @Unfold@ at the
+-- same time (to be safe, one can open a new cursor for every 'readLMDB' or 'unsafeReadLMDB' call),
+-- (b) make sure the provided database is within the environment on which the provided transaction
+-- was begun, and (c) dispose of the cursor with 'closeCursor' (logically before 'abortReadOnlyTxn',
 -- although the order doesn’t really matter for read-only transactions).
 openCursor :: ReadOnlyTxn -> Database mode -> IO Cursor
 openCursor (ReadOnlyTxn ptxn) (Database _ dbi) =
