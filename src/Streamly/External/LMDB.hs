@@ -30,11 +30,6 @@ module Streamly.External.LMDB
     -- * Database
 
     -- | After creating an environment, one creates within it one or more databases.
-    --
-    -- Note: We currently have no functionality here for closing and disposing of databases or
-    -- environments because we have had no need for it yet. In any case, it is a common practice
-    -- with LMDB to create one’s environments and databases once and reuse them for the remainder of
-    -- the program’s execution.
     Database,
     getDatabase,
     clearDatabase,
