@@ -7,8 +7,12 @@ on:
     types:
       - opened
       - synchronize
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
   schedule:
-    - cron: '0 2 * * 6' # At 02:00 on Saturday.
+    - cron: '0 2 1 * *' # At 02:00 on day-of-month 1.
 jobs:
   cabal:
     runs-on: ${{ matrix.os }}
