@@ -18,7 +18,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-18.04", "ubuntu-20.04", "macos-10.15"]
+        os: ["ubuntu-20.04", "ubuntu-22.04", "macos-11", "macos-12"]
         cabal: ["3.4"]
         ghc: ["8.8.4", "8.10.4"]
       fail-fast: false
@@ -54,8 +54,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-18.04", "ubuntu-20.04", "macos-10.15"]
-        stack: ["2.5.1"]
+        os: ["ubuntu-20.04", "ubuntu-22.04", "macos-11", "macos-12"]
+        stack: ["2.9.3"]
       fail-fast: false
     name: stack ${{ matrix.stack }} - ${{ matrix.os }}
     steps:
