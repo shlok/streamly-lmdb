@@ -24,6 +24,9 @@ dependencies:
 ghc-options:
 - -Wall
 
+extra-libraries:
+- lmdb
+
 library:
   source-dirs: src
   c-sources: src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.c

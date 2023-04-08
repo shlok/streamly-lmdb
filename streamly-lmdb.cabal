@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.35.0.
+-- This file has been generated from package.yaml by hpack version 0.34.6.
 --
 -- see: https://github.com/sol/hpack
 
@@ -41,6 +41,8 @@ library
       src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.h
   c-sources:
       src/Streamly/External/LMDB/Internal/streamly_lmdb_foreign.c
+  extra-libraries:
+      lmdb
   build-depends:
       async >=2.2.2 && <2.3
     , base >=4.7 && <5
@@ -57,6 +59,8 @@ test-suite streamly-lmdb-test
   hs-source-dirs:
       test
   ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  extra-libraries:
+      lmdb
   build-depends:
       QuickCheck >=2.13.2 && <2.15
     , async >=2.2.2 && <2.3
