@@ -41,8 +41,8 @@ import Streamly.External.LMDB.Internal.Foreign
     mdb_txn_begin,
     mdb_txn_commit,
   )
-import Streamly.Prelude (fromList, toList, unfold)
-import qualified Streamly.Prelude as S
+import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
+import qualified Streamly.Data.Stream.Prelude as S
 import Test.QuickCheck (Gen, NonEmptyList (..), choose, elements, frequency)
 import Test.QuickCheck.Monadic (PropertyM, monadicIO, pick, run)
 import Test.Tasty (TestTree)

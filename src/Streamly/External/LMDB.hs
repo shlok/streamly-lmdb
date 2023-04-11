@@ -121,7 +121,7 @@ import Streamly.External.LMDB.Internal.Foreign
 import Streamly.Internal.Data.Fold (Fold (Fold), Step (Partial))
 import Streamly.Internal.Data.IOFinalizer (newIOFinalizer, runIOFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
-import Streamly.Internal.Data.Unfold (supply)
+import Streamly.Internal.Data.Unfold (lmap)
 import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
 
 newtype Environment mode = Environment (Ptr MDB_env)
@@ -309,6 +309,7 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
         (Forward, Just _) -> (mdb_set_range, mdb_next)
         (Backward, Nothing) -> (mdb_last, mdb_prev)
         (Backward, Just _) -> (mdb_set_range, mdb_prev)
+      supply = lmap . const
    in supply firstOp $
         Unfold
           ( \(op, pcurs, pk, pv, ref) -> do

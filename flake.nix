@@ -22,7 +22,9 @@
                   streamly-lmdb =
                     final.haskell.lib.compose.addBuildDepends
                       [final.pkgs.lmdb]
-                      (hfinal.callCabal2nix "streamly-lmdb" ./. {});
+                      (hfinal.callCabal2nix "streamly-lmdb" ./. {
+                          streamly = hfinal.streamly_0_9_0;
+                      });
                 };
               };
 
