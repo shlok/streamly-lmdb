@@ -115,7 +115,7 @@ dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
                   return
 
           let unf =
-                U.supply (((0, 0), 0), 0) $
+                (U.lmap . const) (((0, 0), 0), 0) $
                   ((unf0 `crossProduct` unf1) `crossProduct` unf2)
                     `crossProduct` unf3
 
