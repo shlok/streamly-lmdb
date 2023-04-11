@@ -1,11 +1,4 @@
-cabal-version: 1.12
-
--- This file has been generated from package.yaml by hpack version 0.33.0.
---
--- see: https://github.com/sol/hpack
---
--- hash: 722603ac3e4a962728b790842c7643602cc229a7ab0f958eacb21c7a38cb5451
-
+cabal-version:  3.0
 name:           bench
 version:        0.0.1
 build-type:     Simple

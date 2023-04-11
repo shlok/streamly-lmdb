@@ -37,13 +37,13 @@ main = do
   shells "gcc -O2 -Wall bench-lmdb.c -llmdb -o bench-lmdb >> $logfile 2>&1" empty
 
   procs "echo" ["Compiling Haskell programs... "] empty
-  shells "stack build >> $logfile 2>&1" empty
+  shells "cabal build >> $logfile 2>&1" empty
 
   let c_executable = "./bench-lmdb"
   hs_plain_executable <-
-    T.strip <$> strict (inshell "stack exec -- which bench-lmdb-plain 2> /dev/null" empty)
+    T.strip <$> strict (inshell "cabal exec -- which bench-lmdb-plain 2> /dev/null" empty)
   hs_streamly_executable <-
-    T.strip <$> strict (inshell "stack exec -- which bench-lmdb-streamly 2> /dev/null" empty)
+    T.strip <$> strict (inshell "cabal exec -- which bench-lmdb-streamly 2> /dev/null" empty)
 
   echoHrule
   answerIsYes "Perform read benchmarks?"
