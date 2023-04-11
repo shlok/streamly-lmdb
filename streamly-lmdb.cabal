@@ -27,6 +27,8 @@ library
       Streamly.External.LMDB.Internal.Foreign
   other-modules:
       Paths_streamly_lmdb
+  autogen-modules:
+      Paths_streamly_lmdb
   hs-source-dirs:
       src
   ghc-options: -Wall
@@ -50,6 +52,8 @@ test-suite streamly-lmdb-test
   main-is: TestSuite.hs
   other-modules:
       Streamly.External.LMDB.Tests
+      Paths_streamly_lmdb
+  autogen-modules:
       Paths_streamly_lmdb
   hs-source-dirs:
       test
