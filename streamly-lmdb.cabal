@@ -1,20 +1,15 @@
-cabal-version: 1.12
-
--- This file has been generated from package.yaml by hpack version 0.34.6.
---
--- see: https://github.com/sol/hpack
-
+cabal-version:  3.0
 name:           streamly-lmdb
 version:        0.5.0
 synopsis:       Stream data to or from LMDB databases using the streamly library.
 description:    Please see the README on GitHub at <https://github.com/shlok/streamly-lmdb#readme>
 category:       Database, Streaming, Streamly
-homepage:       https://github.com/shlok/streamly-lmdb#readme
+homepage:       https://github.com/shlok/streamly-lmdb
 bug-reports:    https://github.com/shlok/streamly-lmdb/issues
 author:         Shlok Datye
 maintainer:     sd-haskell@quant.is
-copyright:      2022 Shlok Datye
-license:        BSD3
+copyright:      2023 Shlok Datye
+license:        BSD-3-Clause
 license-file:   LICENSE
 build-type:     Simple
 extra-source-files:
@@ -46,7 +41,7 @@ library
   build-depends:
       async >=2.2.2 && <2.3
     , base >=4.7 && <5
-    , bytestring >=0.10.10.0 && <0.11
+    , bytestring >=0.10.10.0 && <0.12
     , streamly ==0.8.*
   default-language: Haskell2010
 
@@ -65,7 +60,7 @@ test-suite streamly-lmdb-test
       QuickCheck >=2.13.2 && <2.15
     , async >=2.2.2 && <2.3
     , base >=4.7 && <5
-    , bytestring >=0.10.10.0 && <0.11
+    , bytestring >=0.10.10.0 && <0.12
     , directory >=1.3.6.0 && <1.4
     , streamly ==0.8.*
     , streamly-lmdb

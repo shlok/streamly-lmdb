@@ -1,6 +1,0 @@
-cradle:
-  stack:
-    - path: ./test
-      component: "streamly-lmdb:test:streamly-lmdb-test"
-    - path: ./src
-      component: "streamly-lmdb:lib"

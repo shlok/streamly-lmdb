@@ -18,9 +18,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-20.04", "ubuntu-22.04", "macos-11", "macos-12"]
+        os: ["ubuntu-22.04", "macos-12"]
         cabal: ["3.6.2"]
-        ghc: ["8.8.4", "8.10.4"]
+        ghc: ["8.10.4", "9.2.7"]
       fail-fast: false
     name: cabal ${{ matrix.cabal }} - ${{ matrix.os }}, ${{ matrix.ghc }}
     env:
@@ -54,7 +54,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-20.04", "ubuntu-22.04", "macos-11", "macos-12"]
+        os: ["ubuntu-22.04", "macos-12"]
         stack: ["2.9.3"]
       fail-fast: false
     name: stack ${{ matrix.stack }} - ${{ matrix.os }}
