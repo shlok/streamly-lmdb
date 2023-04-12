@@ -113,8 +113,8 @@ main = do
           forM_ pairCounts $ \pairCount -> forM_ kvFactors $ \kvFactor -> do
             let dbPath = format ("" % fp % "/test_" % d % "_" % d % "") tmpDir pairCount kvFactor
             let expectedInOutput = format ("Pair count:       " % d % "") pairCount
-            let warmCount = 2
-            let timeCount = 5
+            let warmCount = 3
+            let timeCount = 10
 
             -- Mean and standard deviation of nanoseconds per pair.
             let toStats :: [NominalDiffTime] -> (Double, Double)
@@ -240,8 +240,8 @@ main = do
                     kvFactor
                     pairCount
                     chunkSize
-            let warmCount = 1
-            let timeCount = 5
+            let warmCount = 3
+            let timeCount = 10
             procs "echo" [format ("    Writing database " % s % " with C...") dbPath] empty
             cTimes <-
               timeCommand
