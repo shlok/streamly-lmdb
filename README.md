@@ -19,6 +19,9 @@ Install LMDB on your system:
 
 module Main where
 
+import Data.Function ((&))
+import qualified Streamly.Data.Fold as F
+import qualified Streamly.Data.Stream.Prelude as S
 import Streamly.External.LMDB
   ( Limits (mapSize),
     WriteOptions (writeTransactionSize),
@@ -31,7 +34,6 @@ import Streamly.External.LMDB
     tebibyte,
     writeLMDB,
   )
-import qualified Streamly.Prelude as S
 
 main :: IO ()
 main = do
@@ -59,14 +61,17 @@ main = do
   --     ("foo","b")
   let unfold' = readLMDB db Nothing defaultReadOptions
   let readStream = S.unfold unfold' undefined
-  S.mapM_ print readStream
+  S.mapM print readStream
+    & S.fold F.drain
 ```
 
 ## Benchmarks
 
-See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup>):
+See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup> using GHC 9.2.7 [GHC 8.10.7]):
 
-* **Reading.** For reading a fully cached LMDB database, this library (when `unsafeReadLMDB` is used instead of `readLMDB`) has roughly a 15 ns/pair overhead compared to plain Haskell `IO` code, which has roughly another 10 ns/pair overhead compared to C. (The first two being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.) We deduce that if your total workload per pair takes longer than around 25 ns, your bottleneck will not be your usage of this library as opposed to C.
-* **Writing**. Writing with plain Haskell `IO` code and with this library is, respectively, around 30% and 50% slower than writing with C. We have not dug further into these differences because this write performance is currently good enough for our purposes.
+* **Reading.** For reading a fully cached LMDB database, this library (when `unsafeReadLMDB` is used instead of `readLMDB`) has roughly a 5 ns/pair [15 ns/pair] overhead compared to plain Haskell `IO` code, which has roughly another 10 ns/pair overhead compared to C. (The first two being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.) We deduce that if your total workload per pair takes longer than around 15 ns [25 ns], your bottleneck will not be your usage of this library as opposed to C.
+* **Writing**. Writing with plain Haskell `IO` code and with this library is, respectively, roughly 15% [30%] and 50% slower than writing with C. We have not dug further into these differences because this write performance is currently good enough for our purposes.
 
-<sup>†</sup> [Linode](https://linode.com); Debian 10, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM.
+(There have apparently been some performance improvements between GHC 8.10.7 and 9.2.7.)
+
+<sup>†</sup> April 2023; [Linode](https://linode.com); Debian 11, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM.
