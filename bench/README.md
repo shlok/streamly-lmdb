@@ -13,5 +13,5 @@ These programs are currently undocumented, apart from the brief usage descriptio
 * Note (April 2023): We have only tested this on Debian 11. Feel free to try on other systems.
 * Make sure you have installed [Nix](https://nixos.org) with support for Nix Flakes.
 * Within this directory (`bench`), enter the development shell with `nix develop`.
-* Run `cabal build` and `cabal exec -- bench`.
+* Run `cabal build` and `cabal exec -- bench`. (You will get results for the GHC version specified in `flake.nix`.)
 * View the `csv` files. We are currently not explaining the columns in detail here, but our main conclusions are outlined in `../README.md`.
