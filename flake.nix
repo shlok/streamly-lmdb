@@ -10,6 +10,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         ghcVersion = "927";
+        packageName = "streamly-lmdb";
         config = {};
 
         overlays = [
@@ -19,19 +20,19 @@
             in {
               myHaskellPkgs = haskellPkgs.override {
                 overrides = hfinal: hprev: {
-                  streamly-lmdb =
+                  ${packageName} =
                     final.haskell.lib.compose.addBuildDepends
                       [final.pkgs.lmdb]
-                      (hfinal.callCabal2nix "streamly-lmdb" ./. {
+                      (hfinal.callCabal2nix packageName ./. {
                           streamly = hfinal.streamly_0_9_0;
                       });
                 };
               };
 
-              streamly-lmdb = final.myHaskellPkgs.streamly-lmdb;
+              ${packageName} = final.myHaskellPkgs.${packageName};
 
               myDevShell = final.myHaskellPkgs.shellFor {
-                packages = p: [p.streamly-lmdb];
+                packages = p: [p.${packageName}];
 
                 buildInputs = [final.pkgs.lmdb];
 
@@ -46,8 +47,8 @@
         pkgs = import nixpkgs { inherit config overlays system; };
       in {
         packages = {
-          default = pkgs.streamly-lmdb;
-          streamly-lmdb = pkgs.streamly-lmdb;
+          default = pkgs.${packageName};
+          ${packageName} = pkgs.${packageName};
         };
         
         devShells.default = pkgs.myDevShell;
