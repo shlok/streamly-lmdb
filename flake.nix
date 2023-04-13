@@ -21,12 +21,10 @@
               myHaskellPkgs = haskellPkgs.override {
                 overrides = hfinal: hprev: {
                   ${packageName} =
-                    final.haskell.lib.compose.addBuildDepends
-                      []
-                      (hfinal.callCabal2nix packageName ./. {
-                          streamly = hfinal.streamly_0_9_0;
-                          lmdb = pkgs.lmdb;
-                      });
+                    hfinal.callCabal2nix packageName ./. {
+                      streamly = hfinal.streamly_0_9_0;
+                      lmdb = pkgs.lmdb;
+                    };
                 };
               };
 
