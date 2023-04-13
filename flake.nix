@@ -22,9 +22,10 @@
                 overrides = hfinal: hprev: {
                   ${packageName} =
                     final.haskell.lib.compose.addBuildDepends
-                      [final.pkgs.lmdb]
+                      []
                       (hfinal.callCabal2nix packageName ./. {
                           streamly = hfinal.streamly_0_9_0;
+                          lmdb = pkgs.lmdb;
                       });
                 };
               };
@@ -33,9 +34,6 @@
 
               myDevShell = final.myHaskellPkgs.shellFor {
                 packages = p: [p.${packageName}];
-
-                buildInputs = [final.pkgs.lmdb];
-
                 nativeBuildInputs = [
                   final.myHaskellPkgs.cabal-install
                   final.myHaskellPkgs.haskell-language-server
