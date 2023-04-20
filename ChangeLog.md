@@ -1,3 +1,7 @@
+## 0.6.0
+
+* Updated for Streamly 0.9.0.
+
 ## 0.5.0
 
 * Added the ability to close databases and environments.
