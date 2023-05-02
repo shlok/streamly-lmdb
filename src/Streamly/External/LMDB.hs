@@ -317,7 +317,8 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
                 liftIO $
                   if op == mdb_set_range && subsequentOp == mdb_prev
                     then do
-                      -- Reverse MDB_SET_RANGE.
+                      -- A “reverse MDB_SET_RANGE” (i.e., a “less than or equal to”) is not
+                      -- available in LMDB, so we simulate it ourselves.
                       kfst' <- peek pk
                       kfst <- packCStringLen (mv_data kfst', fromIntegral $ mv_size kfst')
                       rc <- c_mdb_cursor_get pcurs pk pv op
@@ -355,24 +356,27 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
               (pcurs, pk, pv, ref) <- liftIO $
                 mask_ $ do
                   (ptxn, pcurs) <- case mtxncurs of
-                    Nothing -> liftIO $ do
+                    Nothing -> do
                       ptxn <- mdb_txn_begin penv nullPtr mdb_rdonly
                       pcurs <- mdb_cursor_open ptxn dbi
                       return (ptxn, pcurs)
                     Just (ReadOnlyTxn ptxn, Cursor pcurs) ->
                       return (ptxn, pcurs)
-                  pk <- liftIO malloc
-                  pv <- liftIO malloc
+                  pk <- malloc
+                  pv <- malloc
 
                   _ <- case readStart ropts of
                     Nothing -> return ()
                     Just k -> unsafeUseAsCStringLen k $ \(kp, kl) ->
                       poke pk (MDB_val (fromIntegral kl) kp)
 
-                  ref <- liftIO . newIOFinalizer $ do
+                  ref <- newIOFinalizer $ do
                     free pv >> free pk
                     when (isNothing mtxncurs) $
-                      -- There is no need to commit this read-only transaction.
+                      -- With LMDB, there is ordinarily no need to commit read-only transactions.
+                      -- (The exception is when we want to make databases that were opened during
+                      -- the transaction available later, but that’s not applicable here.) We can
+                      -- therefore abort ptxn, both for failure (exceptions) and success.
                       c_mdb_cursor_close pcurs >> c_mdb_txn_abort ptxn
                   return (pcurs, pk, pv, ref)
               return (op, pcurs, pk, pv, ref)
