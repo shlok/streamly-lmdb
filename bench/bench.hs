@@ -56,14 +56,15 @@ main = do
           mktree tmpDir
 
           let mb = 1000000.0 :: Double
-          let pairCounts = [31250000 :: Int, 62500000, 125000000]
+          let pairCounts = [125000000 :: Int]
           let kvFactors = [1 :: Int, 2, 4]
           forM_ pairCounts $ \pairCount -> forM_ kvFactors $ \kvFactor -> do
             let dbPath = format ("" % fp % "/test_" % d % "_" % d % "") tmpDir pairCount kvFactor
             (_, existingDbPairCount) <-
               shellStrict
                 ( format
-                    ( "mdb_stat -e " % s
+                    ( "mdb_stat -e "
+                        % s
                         % " 2> /dev/null | pcregrep -o1 'Entries: (.+)$'"
                     )
                     dbPath
@@ -96,19 +97,15 @@ main = do
               csvFile = "./tmp/read/read-cursor.csv"
           shells (format ("rm -f " % fp % "") csvFile) empty
 
-          -- We did not add “diff” for the “txn” columns. For now just look if they are similar to
-          -- the corresponding “non-txn” columns.
           output csvFile . return . unsafeTextToLine . T.pack $
-            "pairCount,kvFactor,"
-              ++ "c_mean,c_std,"
-              ++ "hsPlain_mean,hsPlain_std,"
-              ++ "hsStreamly_mean,hsStreamly_std,"
-              ++ "hsStreamlyTxn_mean,hsStreamlyTxn_std,"
-              ++ "hsStreamlySafe_mean,hsStreamlySafe_std,"
-              ++ "hsStreamlySafeTxn_mean,hsStreamlySafeTxn_std,"
-              ++ "hsPlain_diff_c_mean,hsPlain_diff_c_std,"
-              ++ "hsStreamly_diff_hsPlain_mean,hsStreamly_diff_hsPlain_std,"
-              ++ "hsStreamlySafe_diff_hsStreamly_mean,hsStreamlySafe_diff_hsStreamly_std"
+            "pair-count,kv-factor,"
+              ++ "c_mean,std,"
+              ++ "hs-plain-unsafeffi_mean,std,"
+              ++ "hs-plain-safeffi_mean,std,"
+              ++ "hs-streamly-unsafe-unsafeffi-notxn_mean,std,"
+              ++ "hs-streamly-unsafe-unsafeffi-txn_mean,std,"
+              ++ "hs-streamly-unsafe-safeffi-notxn_mean,std,"
+              ++ "hs-streamly-safe-safeffi-notxn_mean,std"
 
           forM_ pairCounts $ \pairCount -> forM_ kvFactors $ \kvFactor -> do
             let dbPath = format ("" % fp % "/test_" % d % "_" % d % "") tmpDir pairCount kvFactor
@@ -116,19 +113,12 @@ main = do
             let warmCount = 3
             let timeCount = 10
 
-            -- Mean and standard deviation of nanoseconds per pair.
-            let toStats :: [NominalDiffTime] -> (Double, Double)
-                toStats secs =
-                  let nsPerPair =
-                        V.fromList $ map (realToFrac . (/ fromIntegral pairCount) . (* 1e9)) secs
-                   in (mean nsPerPair, stdDev nsPerPair)
-
             let runProcs description exec cmd = do
                   procs
                     "echo"
                     [format ("    Timing database " % s % " with " % s % "...") dbPath description]
                     empty
-                  toStats
+                  toStats pairCount
                     <$> timeCommand
                       Nothing
                       (format ("" % s % " " % s % " " % s % "") exec cmd dbPath)
@@ -136,71 +126,43 @@ main = do
                       warmCount
                       timeCount
 
-            (cMean, cStd) <-
-              runProcs
-                "C"
-                c_executable
-                "read-cursor"
-
-            (hsPlainMean, hsPlainStd) <-
-              runProcs
-                "Haskell (plain)"
-                hs_plain_executable
-                "read-cursor"
-
-            (hsStreamlyMean, hsStreamlyStd) <-
-              runProcs
-                "Haskell (streamly)"
-                hs_streamly_executable
-                "read-cursor"
-
-            (hsStreamlyTxnMean, hsStreamlyTxnStd) <-
-              runProcs
-                "Haskell (streamly, txn)"
-                hs_streamly_executable
-                "read-cursor-txn"
-
-            (hsStreamlySafeMean, hsStreamlySafeStd) <-
-              runProcs
-                "Haskell (streamly, safe)"
-                hs_streamly_executable
-                "read-cursor-safe"
-
-            (hsStreamlySafeTxnMean, hsStreamlySafeTxnStd) <-
-              runProcs
-                "Haskell (streamly, safe, txn)"
-                hs_streamly_executable
-                "read-cursor-safe-txn"
-
-            let diffStd :: Double -> Double -> Double
-                diffStd std1 std2 =
-                  let two = 2 :: Int
-                   in sqrt $ std1 ^ two + std2 ^ two
+            meansAndStds <-
+              sequence
+                [ runProcs
+                    "C"
+                    c_executable
+                    "read-cursor",
+                  runProcs
+                    "Haskell (plain, unsafeffi)"
+                    hs_plain_executable
+                    "read-cursor-unsafeffi",
+                  runProcs
+                    "Haskell (plain, safeffi)"
+                    hs_plain_executable
+                    "read-cursor-safeffi",
+                  runProcs
+                    "Haskell (streamly, unsafe-unsafeffi-notxn)"
+                    hs_streamly_executable
+                    "read-cursor-unsafe-unsafeffi-notxn",
+                  runProcs
+                    "Haskell (streamly, unsafe-unsafeffi-txn)"
+                    hs_streamly_executable
+                    "read-cursor-unsafe-unsafeffi-txn",
+                  runProcs
+                    "Haskell (streamly, unsafe-safeffi-notxn)"
+                    hs_streamly_executable
+                    "read-cursor-unsafe-safeffi-notxn",
+                  runProcs
+                    "Haskell (streamly, safe-safeffi-notxn)"
+                    hs_streamly_executable
+                    "read-cursor-safe-safeffi-notxn"
+                ]
 
             let line =
                   intercalate "," $
                     [show pairCount, show kvFactor]
-                      ++ map
-                        show
-                        [ cMean,
-                          cStd,
-                          hsPlainMean,
-                          hsPlainStd,
-                          hsStreamlyMean,
-                          hsStreamlyStd,
-                          hsStreamlyTxnMean,
-                          hsStreamlyTxnStd,
-                          hsStreamlySafeMean,
-                          hsStreamlySafeStd,
-                          hsStreamlySafeTxnMean,
-                          hsStreamlySafeTxnStd,
-                          hsPlainMean - cMean,
-                          diffStd hsPlainStd cStd,
-                          hsStreamlyMean - hsPlainMean,
-                          diffStd hsStreamlyStd hsPlainStd,
-                          hsStreamlySafeMean - hsStreamlyMean,
-                          diffStd hsStreamlySafeStd hsStreamlyStd
-                        ]
+                      ++ concatMap (\(mean', std) -> [show mean', show std]) meansAndStds
+
             append csvFile . return . unsafeTextToLine . T.pack $ line
             procs "echo" [format ("    Appended results to " % s % "") csvFile] empty
       )
@@ -217,90 +179,75 @@ main = do
           let csvFile :: (IsString a) => a
               csvFile = "./tmp/write/write.csv"
           output csvFile . return . unsafeTextToLine . T.pack $
-            "pairCount,kvFactor,"
-              ++ "c_mean,c_std,"
-              ++ "hsPlain_mean,hsPlain_std,"
-              ++ "hsStreamly_mean,hsStreamly_std,"
-              ++ "hsPlain_div_c_mean,hsPlain_div_c_std,"
-              ++ "hsStreamly_div_c_mean,hsStreamly_div_c_std,"
-              ++ "hsStreamly_div_hsPlain_mean,hsStreamly_div_hsPlain_std"
+            "pair-count,kv-factor,"
+              ++ "c_mean,std,"
+              ++ "hs-plain-unsafeffi_mean,std,"
+              ++ "hs-plain-safeffi_mean,std,"
+              ++ "hs-streamly-unsafeffi_mean,std,"
+              ++ "hs-streamly-safeffi_mean,std"
 
           let mb = 1000000.0 :: Double
-          let pairCounts = [1000000 :: Int, 10000000]
+          let pairCounts = [10000000 :: Int]
           let kvFactors = [1 :: Int, 2]
+
           forM_ pairCounts $ \pairCount -> forM_ kvFactors $ \kvFactor -> do
             let dbPath = format ("" % fp % "/test_" % d % "_" % d % "") tmpDir pairCount kvFactor
             let chunkSize :: Int =
                   round $ mb / (8 * fromIntegral kvFactor + 8 * fromIntegral kvFactor)
-            let args =
-                  format
-                    ("write " % s % " " % d % " " % d % " " % d % " " % d % "")
-                    dbPath
-                    kvFactor
-                    kvFactor
-                    pairCount
-                    chunkSize
             let warmCount = 3
             let timeCount = 10
-            procs "echo" [format ("    Writing database " % s % " with C...") dbPath] empty
-            cTimes <-
-              timeCommand
-                (Just dbPath)
-                (format ("" % s % " " % s % "") c_executable args)
-                []
-                warmCount
-                timeCount
-            procs
-              "echo"
-              [format ("    Writing database " % s % " with Haskell (plain)...") dbPath]
-              empty
-            hsPlainTimes <-
-              timeCommand
-                (Just dbPath)
-                (format ("" % s % " " % s % "") hs_plain_executable args)
-                []
-                warmCount
-                timeCount
-            procs
-              "echo"
-              [format ("    Writing database " % s % " with Haskell (streamly)...") dbPath]
-              empty
-            hsStreamlyTimes <-
-              timeCommand
-                (Just dbPath)
-                (format ("" % s % " " % s % "") hs_streamly_executable args)
-                []
-                warmCount
-                timeCount
+            
+            let runProcs description exec cmd = do
+                  let args =
+                        format
+                          ("" % s % " " % s % " " % d % " " % d % " " % d % " " % d % "")
+                          cmd
+                          dbPath
+                          kvFactor
+                          kvFactor
+                          pairCount
+                          chunkSize
+                  procs
+                    "echo"
+                    [format ("    Writing database " % s % " with " % s % "...") dbPath description]
+                    empty
+                  toStats pairCount
+                    <$> timeCommand
+                      (Just dbPath)
+                      (format ("" % s % " " % s % "") exec args)
+                      []
+                      warmCount
+                      timeCount
 
-            let hsPlainDivCTimes = [a / b | a <- hsPlainTimes, b <- cTimes]
-            let hsStreamlyDivCTimes = [a / b | a <- hsStreamlyTimes, b <- cTimes]
-            let hsStreamlyDivHsPlainTimes = [a / b | a <- hsStreamlyTimes, b <- hsPlainTimes]
-
-            let mean' :: [NominalDiffTime] -> Double
-                mean' xs = mean . V.fromList $ map realToFrac xs
-
-            let std' :: [NominalDiffTime] -> Double
-                std' xs = stdDev . V.fromList $ map realToFrac xs
+            meansAndStds <-
+              sequence
+                [ runProcs
+                    "C"
+                    c_executable
+                    "write",
+                  runProcs
+                    "Haskell (plain, unsafeffi)"
+                    hs_plain_executable
+                    "write-unsafeffi",
+                  runProcs
+                    "Haskell (plain, safeffi)"
+                    hs_plain_executable
+                    "write-safeffi",
+                  runProcs
+                    "Haskell (streamly, unsafeffi)"
+                    hs_streamly_executable
+                    "write-unsafeffi",
+                  runProcs
+                    "Haskell (streamly, safeffi)"
+                    hs_streamly_executable
+                    "write-safeffi"
+                ]
 
             let line =
                   intercalate "," $
                     [show pairCount, show kvFactor]
-                      ++ map
-                        show
-                        [ mean' cTimes,
-                          std' cTimes,
-                          mean' hsPlainTimes,
-                          std' hsPlainTimes,
-                          mean' hsStreamlyTimes,
-                          std' hsStreamlyTimes,
-                          mean' hsPlainDivCTimes,
-                          std' hsPlainDivCTimes,
-                          mean' hsStreamlyDivCTimes,
-                          std' hsStreamlyDivCTimes,
-                          mean' hsStreamlyDivHsPlainTimes,
-                          std' hsStreamlyDivHsPlainTimes
-                        ]
+                      ++ concatMap (\(mean', std) -> [show mean', show std]) meansAndStds
+
             append csvFile . return . unsafeTextToLine . T.pack $ line
             procs "echo" [format ("    Appended results to " % s % "") csvFile] empty
       )
@@ -326,7 +273,9 @@ timeCommand' cmdAndArgs expectedInOut = do
     then return t
     else
       error $
-        "all of " ++ show expectedInOut ++ " were not found in output "
+        "all of "
+          ++ show expectedInOut
+          ++ " were not found in output "
           ++ show out
           ++ " of command "
           ++ show cmdAndArgs
@@ -347,3 +296,10 @@ timeCommand forceRemovalPath cmdAndArgs expectedInOut warmCount timeCount = do
   removePath
   echo "done."
   return times
+
+-- Mean and standard deviation of nanoseconds per pair.
+toStats :: Int -> [NominalDiffTime] -> (Double, Double)
+toStats pairCount secs =
+  let nsPerPair =
+        V.fromList $ map (realToFrac . (/ fromIntegral pairCount) . (* 1e9)) secs
+   in (mean nsPerPair, stdDev nsPerPair)

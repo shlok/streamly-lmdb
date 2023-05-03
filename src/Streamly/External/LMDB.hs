@@ -80,44 +80,6 @@ import Foreign.Marshal.Utils (with)
 import Foreign.Storable (poke)
 import Streamly.External.LMDB.Internal (Database (..), Mode (..), ReadOnly, ReadWrite)
 import Streamly.External.LMDB.Internal.Foreign
-  ( LMDB_Error (..),
-    MDB_ErrCode (..),
-    MDB_cursor,
-    MDB_env,
-    MDB_txn,
-    MDB_val (MDB_val, mv_data, mv_size),
-    c_mdb_cursor_close,
-    c_mdb_cursor_get,
-    c_mdb_dbi_close,
-    c_mdb_env_close,
-    c_mdb_get,
-    c_mdb_txn_abort,
-    combineOptions,
-    mdb_append,
-    mdb_clear,
-    mdb_create,
-    mdb_cursor_open,
-    mdb_dbi_open,
-    mdb_env_create,
-    mdb_env_open,
-    mdb_env_set_mapsize,
-    mdb_env_set_maxdbs,
-    mdb_env_set_maxreaders,
-    mdb_first,
-    mdb_last,
-    mdb_next,
-    mdb_nooverwrite,
-    mdb_nosubdir,
-    mdb_notfound,
-    mdb_notls,
-    mdb_prev,
-    mdb_put_,
-    mdb_rdonly,
-    mdb_set_range,
-    mdb_txn_begin,
-    mdb_txn_commit,
-    throwLMDBErrNum,
-  )
 import Streamly.Internal.Data.Fold (Fold (Fold), Step (Partial))
 import Streamly.Internal.Data.IOFinalizer (newIOFinalizer, runIOFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
@@ -309,6 +271,23 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
         (Forward, Just _) -> (mdb_set_range, mdb_next)
         (Backward, Nothing) -> (mdb_last, mdb_prev)
         (Backward, Just _) -> (mdb_set_range, mdb_prev)
+      (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
+        if readUnsafeFFI ropts
+          then
+            ( mdb_txn_begin_unsafe,
+              mdb_cursor_open_unsafe,
+              c_mdb_cursor_get_unsafe,
+              c_mdb_cursor_close_unsafe,
+              c_mdb_txn_abort_unsafe
+            )
+          else
+            ( mdb_txn_begin,
+              mdb_cursor_open,
+              c_mdb_cursor_get,
+              c_mdb_cursor_close,
+              c_mdb_txn_abort
+            )
+
       supply = lmap . const
    in supply firstOp $
         Unfold
@@ -321,19 +300,19 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
                       -- available in LMDB, so we simulate it ourselves.
                       kfst' <- peek pk
                       kfst <- packCStringLen (mv_data kfst', fromIntegral $ mv_size kfst')
-                      rc <- c_mdb_cursor_get pcurs pk pv op
+                      rc <- cursor_get pcurs pk pv op
                       if rc /= 0 && rc == mdb_notfound
-                        then c_mdb_cursor_get pcurs pk pv mdb_last
+                        then cursor_get pcurs pk pv mdb_last
                         else
                           if rc == 0
                             then do
                               k' <- peek pk
                               k <- unsafePackCStringLen (mv_data k', fromIntegral $ mv_size k')
                               if k /= kfst
-                                then c_mdb_cursor_get pcurs pk pv mdb_prev
+                                then cursor_get pcurs pk pv mdb_prev
                                 else return rc
                             else return rc
-                    else c_mdb_cursor_get pcurs pk pv op
+                    else cursor_get pcurs pk pv op
 
               found <-
                 liftIO $
@@ -357,8 +336,8 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
                 mask_ $ do
                   (ptxn, pcurs) <- case mtxncurs of
                     Nothing -> do
-                      ptxn <- mdb_txn_begin penv nullPtr mdb_rdonly
-                      pcurs <- mdb_cursor_open ptxn dbi
+                      ptxn <- txn_begin penv nullPtr mdb_rdonly
+                      pcurs <- cursor_open ptxn dbi
                       return (ptxn, pcurs)
                     Just (ReadOnlyTxn ptxn, Cursor pcurs) ->
                       return (ptxn, pcurs)
@@ -377,7 +356,7 @@ unsafeReadLMDB (Database penv dbi) mtxncurs ropts kmap vmap =
                       -- (The exception is when we want to make databases that were opened during
                       -- the transaction available later, but that’s not applicable here.) We can
                       -- therefore abort ptxn, both for failure (exceptions) and success.
-                      c_mdb_cursor_close pcurs >> c_mdb_txn_abort ptxn
+                      cursor_close pcurs >> txn_abort ptxn
                   return (pcurs, pk, pv, ref)
               return (op, pcurs, pk, pv, ref)
           )
@@ -416,35 +395,60 @@ data ReadOptions = ReadOptions
   { readDirection :: !ReadDirection,
     -- | If 'Nothing', a forward [backward] iteration starts at the beginning [end] of the database.
     -- Otherwise, it starts at the first key that is greater [less] than or equal to the 'Just' key.
-    readStart :: !(Maybe ByteString)
+    readStart :: !(Maybe ByteString),
+    -- | Use @unsafe@ FFI calls under the hood. This can increase iteration speed, but one should
+    -- bear in mind that @unsafe@ FFI calls can have an adverse impact on the performance of the
+    -- rest of the program (e.g., its ability to effectively spawn green threads).
+    readUnsafeFFI :: !Bool
   }
   deriving (Show)
 
--- | By default, we start reading from the beginning of the database (i.e., from the smallest key).
+-- | By default, we start reading from the beginning of the database (i.e., from the smallest key),
+-- and we don’t use unsafe FFI calls.
 defaultReadOptions :: ReadOptions
 defaultReadOptions =
   ReadOptions
     { readDirection = Forward,
-      readStart = Nothing
+      readStart = Nothing,
+      readUnsafeFFI = False
     }
 
 -- | Direction of key iteration.
 data ReadDirection = Forward | Backward deriving (Show)
 
-data OverwriteOptions = OverwriteAllow | OverwriteAllowSame | OverwriteDisallow deriving (Eq)
+data OverwriteOptions
+  = -- | When a key reoccurs, overwrite the value.
+    OverwriteAllow
+  | -- | When a key reoccurs, throw an exception except when the value is the same.
+    OverwriteAllowSame
+  | -- | When a key reoccurs, throw an exception.
+    OverwriteDisallow
+  deriving (Eq)
 
 data WriteOptions = WriteOptions
-  { writeTransactionSize :: !Int,
-    overwriteOptions :: !OverwriteOptions,
-    writeAppend :: !Bool
+  { -- | The number of key-value pairs per write transaction.
+    writeTransactionSize :: !Int,
+    writeOverwriteOptions :: !OverwriteOptions,
+    -- | Assume the input data is already ordered. This allows the use of @MDB_APPEND@ under the
+    -- hood and substantially improves write performance. An exception will be thrown if the
+    -- assumption about the ordering is not true.
+    writeAppend :: !Bool,
+    -- | Use @unsafe@ FFI calls under the hood. This can increase write performance, but one should
+    -- bear in mind that @unsafe@ FFI calls can have an adverse impact on the performance of the
+    -- rest of the program (e.g., its ability to effectively spawn green threads).
+    writeUnsafeFFI :: !Bool
   }
 
+-- | By default, we use a write transaction size of 1 (one write transaction for each key-value
+-- pair), allow overwriting, don’t assume that the input data is already ordered, and don’t use
+-- unsafe FFI calls.
 defaultWriteOptions :: WriteOptions
 defaultWriteOptions =
   WriteOptions
     { writeTransactionSize = 1,
-      overwriteOptions = OverwriteAllow,
-      writeAppend = False
+      writeOverwriteOptions = OverwriteAllow,
+      writeAppend = False,
+      writeUnsafeFFI = False
     }
 
 newtype ExceptionString = ExceptionString String deriving (Show)
@@ -463,13 +467,17 @@ instance Exception ExceptionString
 -- KB chunks and benchmark from there.
 {-# INLINE writeLMDB #-}
 writeLMDB :: (MonadIO m) => Database ReadWrite -> WriteOptions -> Fold m (ByteString, ByteString) ()
-writeLMDB (Database penv dbi) options =
-  let txnSize = max 1 (writeTransactionSize options)
-      overwriteOpt = overwriteOptions options
+writeLMDB (Database penv dbi) wopts =
+  let txnSize = max 1 (writeTransactionSize wopts)
+      overwriteOpt = writeOverwriteOptions wopts
       flags =
         combineOptions $
           [mdb_nooverwrite | overwriteOpt `elem` [OverwriteAllowSame, OverwriteDisallow]]
-            ++ [mdb_append | writeAppend options]
+            ++ [mdb_append | writeAppend wopts]
+      (txn_begin, txn_commit, put_, get) =
+        if writeUnsafeFFI wopts
+          then (mdb_txn_begin_unsafe, mdb_txn_commit_unsafe, mdb_put_unsafe_, c_mdb_get_unsafe)
+          else (mdb_txn_begin, mdb_txn_commit, mdb_put_, c_mdb_get)
    in Fold
         ( \(threadId, iter, currChunkSz, mtxn) (k, v) -> do
             -- In the first few iterations, ascertain that we are still on the same (bound) thread.
@@ -497,21 +505,21 @@ writeLMDB (Database penv dbi) options =
               if currChunkSz' == 0
                 then liftIO $
                   mask_ $ do
-                    ptxn <- mdb_txn_begin penv nullPtr 0
-                    ref <- newIOFinalizer $ mdb_txn_commit ptxn
+                    ptxn <- txn_begin penv nullPtr 0
+                    ref <- newIOFinalizer $ txn_commit ptxn
                     return (ptxn, ref)
                 else return $ fromJust mtxn
 
             liftIO $
               unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
                 catch
-                  (mdb_put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags)
+                  (put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags)
                   ( \(e :: LMDB_Error) -> do
                       -- Discard error if OverwriteAllowSame was specified and the error from LMDB
                       -- was due to the exact same key-value pair already existing in the database.
                       ok <- with (MDB_val (fromIntegral kl) kp) $ \pk ->
                         alloca $ \pv -> do
-                          rc <- c_mdb_get ptxn dbi pk pv
+                          rc <- get ptxn dbi pk pv
                           if rc == 0
                             then do
                               v' <- peek pv

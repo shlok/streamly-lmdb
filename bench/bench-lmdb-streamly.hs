@@ -9,50 +9,66 @@ import Foreign (Ptr, callocBytes)
 import Foreign.C.Types (CChar)
 import Foreign.Marshal.Array (advancePtr, pokeArray)
 import Streamly.External.LMDB
-  ( Limits (mapSize),
-    ReadOnly,
-    ReadWrite,
-    WriteOptions (writeTransactionSize),
-    beginReadOnlyTxn,
-    defaultLimits,
-    defaultReadOptions,
-    defaultWriteOptions,
-    getDatabase,
-    openCursor,
-    openEnvironment,
-    readLMDB,
-    tebibyte,
-    unsafeReadLMDB,
-    writeLMDB,
-  )
 import Streamly.Internal.Data.Fold.Type (Fold (Fold), Step (Partial))
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
 import qualified Streamly.Internal.Data.Unfold as U
 import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
 import System.Directory (createDirectory, doesPathExist)
 import System.Environment (getArgs)
+import System.Exit
 
-main :: IO Int
+main :: IO ()
 main = getArgs >>= dispatch
 
-dispatch :: [String] -> IO Int
-dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
+dispatch :: [String] -> IO ()
+dispatch ["write-unsafeffi", path, keyFactor', valueFactor', numPairs', chunkSize'] =
+  write (UnsafeFFI True) path keyFactor' valueFactor' numPairs' chunkSize'
+dispatch ["write-safeffi", path, keyFactor', valueFactor', numPairs', chunkSize'] =
+  write (UnsafeFFI False) path keyFactor' valueFactor' numPairs' chunkSize'
+-- For reading, these two should be the fastest. (A precreated read-only transaction should make
+-- almost no difference for large enough databases, and we only check this for this first
+-- unsafe-unsafeffi combination.)
+dispatch ["read-cursor-unsafe-unsafeffi-notxn", path] = do
+  readCursorUnsafe path (UnsafeFFI True) (PrecreatedTxn False)
+dispatch ["read-cursor-unsafe-unsafeffi-txn", path] = do
+  readCursorUnsafe path (UnsafeFFI True) (PrecreatedTxn True)
+
+-- Using safe FFI should be slower.
+dispatch ["read-cursor-unsafe-safeffi-notxn", path] = do
+  readCursorUnsafe path (UnsafeFFI False) (PrecreatedTxn False)
+
+-- Additionally, using safeLMDB should be even slower.
+dispatch ["read-cursor-safe-safeffi-notxn", path] = do
+  readCursorSafe path (UnsafeFFI False) (PrecreatedTxn False)
+dispatch _ = do
+  printUsage
+  exitFailure
+
+newtype PrecreatedTxn = PrecreatedTxn Bool
+
+newtype UnsafeFFI = UnsafeFFI Bool
+
+write :: UnsafeFFI -> String -> String -> String -> String -> String -> IO ()
+write (UnsafeFFI unsafeFFI) path keyFactor' valueFactor' numPairs' chunkSize' = do
   let keyFactor = read keyFactor'
   let valFactor = read valueFactor'
   let numPairs :: Int = read numPairs'
   let chunkSz = read chunkSize'
   exists <- doesPathExist path
   if not $
-    keyFactor > 0 && valFactor > 0 && numPairs > 0 && chunkSz > 0
+    keyFactor > 0
+      && valFactor > 0
+      && numPairs > 0
+      && chunkSz > 0
       && chunkSz <= numPairs
     then do
       putStrLn "Invalid write arguments."
-      return 1
+      exitFailure
     else
       if exists
         then do
           putStrLn $ "File already exists at " ++ show path
-          return 1
+          exitFailure
         else do
           createDirectory path
           env <- openEnvironment @ReadWrite path (defaultLimits {mapSize = tebibyte})
@@ -63,15 +79,15 @@ dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
           keyData :: Ptr CChar <- callocBytes $ fromIntegral keySize
           valData :: Ptr CChar <- callocBytes $ fromIntegral valSize
 
-          let keyData0 = map (\i -> advancePtr keyData (8 * i + 4)) [0 .. keyFactor -1]
-          let keyData1 = map (\i -> advancePtr keyData (8 * i + 5)) [0 .. keyFactor -1]
-          let keyData2 = map (\i -> advancePtr keyData (8 * i + 6)) [0 .. keyFactor -1]
-          let keyData3 = map (\i -> advancePtr keyData (8 * i + 7)) [0 .. keyFactor -1]
+          let keyData0 = map (\i -> advancePtr keyData (8 * i + 4)) [0 .. keyFactor - 1]
+          let keyData1 = map (\i -> advancePtr keyData (8 * i + 5)) [0 .. keyFactor - 1]
+          let keyData2 = map (\i -> advancePtr keyData (8 * i + 6)) [0 .. keyFactor - 1]
+          let keyData3 = map (\i -> advancePtr keyData (8 * i + 7)) [0 .. keyFactor - 1]
 
-          let valData0 = map (\i -> advancePtr valData (8 * i + 4)) [0 .. valFactor -1]
-          let valData1 = map (\i -> advancePtr valData (8 * i + 5)) [0 .. valFactor -1]
-          let valData2 = map (\i -> advancePtr valData (8 * i + 6)) [0 .. valFactor -1]
-          let valData3 = map (\i -> advancePtr valData (8 * i + 7)) [0 .. valFactor -1]
+          let valData0 = map (\i -> advancePtr valData (8 * i + 4)) [0 .. valFactor - 1]
+          let valData1 = map (\i -> advancePtr valData (8 * i + 5)) [0 .. valFactor - 1]
+          let valData2 = map (\i -> advancePtr valData (8 * i + 6)) [0 .. valFactor - 1]
+          let valData3 = map (\i -> advancePtr valData (8 * i + 7)) [0 .. valFactor - 1]
 
           let unf0 =
                 Unfold
@@ -129,31 +145,22 @@ dispatch ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
                     )
                     unf
 
-          let writeFold = writeLMDB db (defaultWriteOptions {writeTransactionSize = chunkSz})
+          let writeFold =
+                writeLMDB
+                  db
+                  ( defaultWriteOptions
+                      { writeTransactionSize = chunkSz,
+                        writeUnsafeFFI = unsafeFFI
+                      }
+                  )
+          U.fold writeFold unf' undefined
 
-          _ <- U.fold writeFold unf' undefined
-          return 0
-dispatch ["read-cursor", path] = do
-  readCursor path False
-dispatch ["read-cursor-safe", path] = do
-  readCursorSafe path False
--- A precreated read-only transaction should make almost no difference for large enough databases.
-dispatch ["read-cursor-txn", path] = do
-  readCursor path True
-dispatch ["read-cursor-safe-txn", path] = do
-  readCursorSafe path True
-dispatch _ = do
-  printUsage
-  return 1
-
-type UsePrecreatedTxn = Bool
-
-readCursor :: String -> UsePrecreatedTxn -> IO Int
-readCursor path txn = do
+readCursorUnsafe :: String -> UnsafeFFI -> PrecreatedTxn -> IO ()
+readCursorUnsafe path (UnsafeFFI unsafeFFI) (PrecreatedTxn precreatedTxn) = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
   db <- getDatabase env Nothing
   mtxncurs <-
-    if txn
+    if precreatedTxn
       then do
         tx <- beginReadOnlyTxn env
         curs <- openCursor tx db
@@ -166,23 +173,23 @@ readCursor path txn = do
           )
           (return $ Partial (0, 0, 0, 0 :: Int))
           return
+      ropts = defaultReadOptions {readUnsafeFFI = unsafeFFI}
   (k, v, t, p) <-
     U.fold
       fold'
-      (unsafeReadLMDB db mtxncurs defaultReadOptions (return . snd) (return . snd))
+      (unsafeReadLMDB db mtxncurs ropts (return . snd) (return . snd))
       undefined
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
   putStrLn $ "Total byte count: " ++ show t
   putStrLn $ "Pair count:       " ++ show p
-  return 0
 
-readCursorSafe :: String -> UsePrecreatedTxn -> IO Int
-readCursorSafe path txn = do
+readCursorSafe :: String -> UnsafeFFI -> PrecreatedTxn -> IO ()
+readCursorSafe path (UnsafeFFI unsafeFFI) (PrecreatedTxn precreatedTxn) = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
   db <- getDatabase env Nothing
   mtxncurs <-
-    if txn
+    if precreatedTxn
       then do
         tx <- beginReadOnlyTxn env
         curs <- openCursor tx db
@@ -201,22 +208,22 @@ readCursorSafe path txn = do
           )
           (return $ Partial (0, 0, 0, 0 :: Int))
           return
-  (k, v, t, p) <- U.fold fold' (readLMDB db mtxncurs defaultReadOptions) undefined
+      ropts = defaultReadOptions {readUnsafeFFI = unsafeFFI}
+  (k, v, t, p) <- U.fold fold' (readLMDB db mtxncurs ropts) undefined
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
   putStrLn $ "Total byte count: " ++ show t
   putStrLn $ "Pair count:       " ++ show p
-  return 0
 
 printUsage :: IO ()
 printUsage = do
   putStrLn $
     "bench-lmdb write [path] [key factor] [value factor] "
       ++ "[# key-value pairs] [# pairs in each transaction]"
-  putStrLn "bench-lmdb read-cursor [path]"
-  putStrLn "bench-lmdb read-cursor-txn [path]"
-  putStrLn "bench-lmdb read-cursor-safe [path]"
-  putStrLn "bench-lmdb read-cursor-safe-txn [path]"
+  putStrLn "bench-lmdb read-cursor-unsafe-unsafeffi-notxn [path]"
+  putStrLn "bench-lmdb read-cursor-unsafe-unsafeffi-txn [path]"
+  putStrLn "bench-lmdb read-cursor-unsafe-safeffi-notxn [path]"
+  putStrLn "bench-lmdb read-cursor-safe-safeffi-notxn [path]"
 
 {-# INLINE copyBytes #-}
 copyBytes :: [Ptr CChar] -> Int -> IO ()

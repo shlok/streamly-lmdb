@@ -6,33 +6,11 @@ import Foreign (Ptr, alloca, callocBytes, free, malloc, nullPtr, peek)
 import Foreign.C.Types
 import Foreign.Marshal.Array (advancePtr, pokeArray)
 import Streamly.External.LMDB.Internal.Foreign
-  ( MDB_cursor_op_t,
-    MDB_env,
-    MDB_txn,
-    c_mdb_cursor_close,
-    c_mdb_cursor_get,
-    c_mdb_env_create,
-    c_mdb_env_set_mapsize,
-    combineOptions,
-    mdb_cursor_open,
-    mdb_dbi_open,
-    mdb_env_open,
-    mdb_first,
-    mdb_next,
-    mdb_notfound,
-    mdb_notls,
-    mdb_put_,
-    mdb_rdonly,
-    mdb_txn_begin,
-    mdb_txn_commit,
-    mv_size,
-    throwLMDBErrNum,
-  )
 import System.Directory (createDirectory, doesPathExist)
 import System.Environment (getArgs)
-import System.Exit (exitSuccess)
+import System.Exit
 
-main :: IO Int
+main :: IO ()
 main = do
   penv <- alloca $ \ppenv ->
     c_mdb_env_create ppenv >>= \rc ->
@@ -43,47 +21,67 @@ main = do
 
   getArgs >>= dispatch penv
 
-dispatch :: Ptr MDB_env -> [String] -> IO Int
-dispatch penv ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] = do
+dispatch :: Ptr MDB_env -> [String] -> IO ()
+dispatch penv ["write-unsafeffi", path, keyFactor', valueFactor', numPairs', chunkSize'] =
+  write penv (UnsafeFFI True) path keyFactor' valueFactor' numPairs' chunkSize'
+dispatch penv ["write-safeffi", path, keyFactor', valueFactor', numPairs', chunkSize'] =
+  write penv (UnsafeFFI False) path keyFactor' valueFactor' numPairs' chunkSize'
+dispatch penv ["read-cursor-unsafeffi", path] = readCursor penv (UnsafeFFI True) path
+dispatch penv ["read-cursor-safeffi", path] = readCursor penv (UnsafeFFI False) path
+dispatch _ _ = do
+  printUsage
+  exitFailure
+
+newtype UnsafeFFI = UnsafeFFI Bool
+
+write :: Ptr MDB_env -> UnsafeFFI -> FilePath -> String -> String -> String -> String -> IO ()
+write penv (UnsafeFFI unsafeFFI) path keyFactor' valueFactor' numPairs' chunkSize' = do
   let keyFactor = read keyFactor'
   let valFactor = read valueFactor'
   let numPairs = read numPairs'
   let chunkSz = read chunkSize'
+
+  let (txn_begin, txn_commit, put_) =
+        if unsafeFFI
+          then (mdb_txn_begin_unsafe, mdb_txn_commit_unsafe, mdb_put_unsafe_)
+          else (mdb_txn_begin, mdb_txn_commit, mdb_put_)
+
   exists <- doesPathExist path
   if not $
-    keyFactor > 0 && valFactor > 0
+    keyFactor > 0
+      && valFactor > 0
       && numPairs > 0
       && 0 < chunkSz
       && chunkSz <= numPairs
     then do
       putStrLn "Invalid write arguments."
-      return 1
+      exitFailure
     else
       if exists
         then do
           putStrLn $ "File already exists at " ++ show path
-          return 1
+          exitFailure
         else do
           createDirectory path
           mdb_env_open penv path mdb_notls
-          ptxn' <- mdb_txn_begin penv nullPtr mdb_rdonly
+          ptxn' <- txn_begin penv nullPtr mdb_rdonly
           dbi <- mdb_dbi_open ptxn' Nothing 0
-          mdb_txn_commit ptxn'
+          txn_commit ptxn'
 
           let keySize = 8 * fromIntegral keyFactor
           let valSize = 8 * fromIntegral valFactor
           keyData :: Ptr CChar <- callocBytes $ fromIntegral keySize
           valData :: Ptr CChar <- callocBytes $ fromIntegral valSize
 
-          let keyData0 = map (\i -> advancePtr keyData (8 * i + 4)) [0 .. keyFactor -1]
-          let keyData1 = map (\i -> advancePtr keyData (8 * i + 5)) [0 .. keyFactor -1]
-          let keyData2 = map (\i -> advancePtr keyData (8 * i + 6)) [0 .. keyFactor -1]
-          let keyData3 = map (\i -> advancePtr keyData (8 * i + 7)) [0 .. keyFactor -1]
+          let keyData0 = map (\i -> advancePtr keyData (8 * i + 4)) [0 .. keyFactor - 1]
+          let keyData1 = map (\i -> advancePtr keyData (8 * i + 5)) [0 .. keyFactor - 1]
+          let keyData2 = map (\i -> advancePtr keyData (8 * i + 6)) [0 .. keyFactor - 1]
+          let keyData3 = map (\i -> advancePtr keyData (8 * i + 7)) [0 .. keyFactor - 1]
 
-          let valData0 = map (\i -> advancePtr valData (8 * i + 4)) [0 .. valFactor -1]
-          let valData1 = map (\i -> advancePtr valData (8 * i + 5)) [0 .. valFactor -1]
-          let valData2 = map (\i -> advancePtr valData (8 * i + 6)) [0 .. valFactor -1]
-          let valData3 = map (\i -> advancePtr valData (8 * i + 7)) [0 .. valFactor -1]
+          let valData0 = map (\i -> advancePtr valData (8 * i + 4)) [0 .. valFactor - 1]
+          let valData1 = map (\i -> advancePtr valData (8 * i + 5)) [0 .. valFactor - 1]
+          let valData2 = map (\i -> advancePtr valData (8 * i + 6)) [0 .. valFactor - 1]
+          let valData3 = map (\i -> advancePtr valData (8 * i + 7)) [0 .. valFactor - 1]
 
           let go0 :: Ptr MDB_txn -> Int -> Int -> Int -> IO ()
               {-# INLINE go0 #-}
@@ -113,17 +111,17 @@ dispatch penv ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] =
                           go3 !ptxn3 !i3 !currChunkSz3 !x3 = do
                             copyBytes keyData3 x3 >> copyBytes valData3 x3
                             when (i3 >= numPairs) $
-                              mdb_txn_commit ptxn3 >> exitSuccess -- Complete.
+                              txn_commit ptxn3 >> exitSuccess -- Complete.
                             currChunkSz3_ <-
                               if currChunkSz3 >= chunkSz
-                                then mdb_txn_commit ptxn3 >> return 0
+                                then txn_commit ptxn3 >> return 0
                                 else return currChunkSz3
                             ptxn3_ <-
                               if currChunkSz3_ == 0
-                                then mdb_txn_begin penv nullPtr 0
+                                then txn_begin penv nullPtr 0
                                 else return ptxn3
 
-                            mdb_put_ ptxn3_ dbi keyData keySize valData valSize 0
+                            put_ ptxn3_ dbi keyData keySize valData valSize 0
 
                             if x3 < 255
                               then go3 ptxn3_ (i3 + 1) (currChunkSz3_ + 1) (x3 + 1)
@@ -131,22 +129,39 @@ dispatch penv ["write", path, keyFactor', valueFactor', numPairs', chunkSize'] =
 
           go0 nullPtr 0 0 0
 
-          return 0
-dispatch penv ["read-cursor", path] = do
-  mdb_env_open penv path $ combineOptions [mdb_notls, mdb_rdonly]
-  ptxn' <- mdb_txn_begin penv nullPtr mdb_rdonly
-  dbi <- mdb_dbi_open ptxn' Nothing 0
-  mdb_txn_commit ptxn'
+readCursor :: Ptr MDB_env -> UnsafeFFI -> FilePath -> IO ()
+readCursor penv (UnsafeFFI unsafeFFI) path = do
+  let (txn_begin, txn_commit, cursor_open, cursor_get, cursor_close) =
+        if unsafeFFI
+          then
+            ( mdb_txn_begin_unsafe,
+              mdb_txn_commit_unsafe,
+              mdb_cursor_open_unsafe,
+              c_mdb_cursor_get_unsafe,
+              c_mdb_cursor_close_unsafe
+            )
+          else
+            ( mdb_txn_begin,
+              mdb_txn_commit,
+              mdb_cursor_open,
+              c_mdb_cursor_get,
+              c_mdb_cursor_close
+            )
 
-  ptxn <- mdb_txn_begin penv nullPtr mdb_rdonly
-  pcurs <- mdb_cursor_open ptxn dbi
+  mdb_env_open penv path $ combineOptions [mdb_notls, mdb_rdonly]
+  ptxn' <- txn_begin penv nullPtr mdb_rdonly
+  dbi <- mdb_dbi_open ptxn' Nothing 0
+  txn_commit ptxn'
+
+  ptxn <- txn_begin penv nullPtr mdb_rdonly
+  pcurs <- cursor_open ptxn dbi
 
   pk <- malloc
   pv <- malloc
 
   let go :: Int -> Int -> Int -> Int -> MDB_cursor_op_t -> IO (Int, Int, Int, Int)
       go !keyByteCount !valueByteCount !totalByteCount !pairCount !op = do
-        rc <- c_mdb_cursor_get pcurs pk pv op
+        rc <- cursor_get pcurs pk pv op
         if rc == mdb_notfound
           then return (keyByteCount, valueByteCount, totalByteCount, pairCount)
           else
@@ -166,25 +181,24 @@ dispatch penv ["read-cursor", path] = do
   (keyByteCount, valueByteCount, totalByteCount, pairCount) <- go 0 0 0 0 mdb_first
 
   free pk >> free pv
-  c_mdb_cursor_close pcurs
-  mdb_txn_commit ptxn
+  cursor_close pcurs
+  txn_commit ptxn
 
   putStrLn $ "Key byte count:   " ++ show keyByteCount
   putStrLn $ "Value byte count: " ++ show valueByteCount
   putStrLn $ "Total byte count: " ++ show totalByteCount
   putStrLn $ "Pair count:       " ++ show pairCount
 
-  return 0
-dispatch _ _ = do
-  printUsage
-  return 1
-
 printUsage :: IO ()
 printUsage = do
   putStrLn $
-    "bench-lmdb write [path] [key factor] [value factor] "
+    "bench-lmdb write-unsafeffi [path] [key factor] [value factor] "
       ++ "[# key-value pairs] [# pairs in each transaction]"
-  putStrLn "bench-lmdb read-cursor [path]"
+  putStrLn $
+    "bench-lmdb write-safeffi [path] [key factor] [value factor] "
+      ++ "[# key-value pairs] [# pairs in each transaction]"
+  putStrLn "bench-lmdb read-cursor-unsafeffi [path]"
+  putStrLn "bench-lmdb read-cursor-safeffi [path]"
 
 {-# INLINE copyBytes #-}
 copyBytes :: [Ptr CChar] -> Int -> IO ()

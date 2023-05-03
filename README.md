@@ -67,11 +67,15 @@ main = do
 
 ## Benchmarks
 
-See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup> using GHC 9.2.7 [GHC 8.10.7]):
+See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup>):
 
-* **Reading.** For reading a fully cached LMDB database, this library (when `unsafeReadLMDB` is used instead of `readLMDB`) has roughly a 5 ns/pair [15 ns/pair] overhead compared to plain Haskell `IO` code, which has roughly another 10 ns/pair overhead compared to C. (The first two being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.) We deduce that if your total workload per pair takes longer than around 15 ns [25 ns], your bottleneck will not be your usage of this library as opposed to C.
-* **Writing**. Writing with plain Haskell `IO` code and with this library is, respectively, roughly 15% [30%] and 50% slower than writing with C. We have not dug further into these differences because this write performance is currently good enough for our purposes.
+* **Reading:**
+  - For iterating through a fully cached LMDB database, this library has roughly a 110 ns/pair overhead compared to C. (Plain Haskell `IO` code has roughly a 70 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
+  - By using `unsafeReadLMDB` instead of `readLMDB`, you can get the overhead down to roughly 100 ns/pair.
+  - By additionally using the `readUnsafeFFI` option (to use `unsafe` FFI calls under the hood), you can get the overhead down to roughly 40 ns/pair.
 
-(There have apparently been some performance improvements between GHC 8.10.7 and 9.2.7.)
+* **Writing:**
+  - For writing to an LMDB database, this library has roughly a 210 ns/pair overhead compared to C. (Plain Haskell `IO` code has roughly a 100 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
+  - By using the `writeUnsafeFFI` option (to use `unsafe` FFI calls under the hood), you can get the overhead down to roughly 140 ns/pair.
 
-<sup>†</sup> April 2023; [Linode](https://linode.com); Debian 11, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM.
+<sup>†</sup> May 2023; [Linode](https://linode.com); Debian 11, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM.

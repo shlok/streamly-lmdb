@@ -40,61 +40,85 @@ instance Storable MDB_val where
         #{poke MDB_val, mv_data} ptr pd
     {-# INLINE poke #-}
 
-foreign import ccall unsafe "lmdb.h mdb_strerror"
+foreign import ccall safe "lmdb.h mdb_strerror"
     c_mdb_strerror :: CInt -> IO CString
 
-foreign import ccall unsafe "lmdb.h mdb_env_create"
+foreign import ccall safe "lmdb.h mdb_env_create"
     c_mdb_env_create :: Ptr (Ptr MDB_env) -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_env_set_mapsize"
+foreign import ccall safe "lmdb.h mdb_env_set_mapsize"
     c_mdb_env_set_mapsize :: Ptr MDB_env -> CSize -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_env_set_maxreaders"
+foreign import ccall safe "lmdb.h mdb_env_set_maxreaders"
     c_mdb_env_set_maxreaders :: Ptr MDB_env -> CUInt -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_env_set_maxdbs"
+foreign import ccall safe "lmdb.h mdb_env_set_maxdbs"
     c_mdb_env_set_maxdbs :: Ptr MDB_env -> MDB_dbi_t -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_env_open"
+foreign import ccall safe "lmdb.h mdb_env_open"
     c_mdb_env_open :: Ptr MDB_env -> CString -> CUInt -> MDB_mode_t -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_txn_begin"
+foreign import ccall safe "lmdb.h mdb_txn_begin"
     c_mdb_txn_begin :: Ptr MDB_env -> Ptr MDB_txn -> CUInt -> Ptr (Ptr MDB_txn) -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_dbi_open"
+foreign import ccall unsafe "lmdb.h mdb_txn_begin"
+    c_mdb_txn_begin_unsafe :: Ptr MDB_env -> Ptr MDB_txn -> CUInt -> Ptr (Ptr MDB_txn) -> IO CInt
+
+foreign import ccall safe "lmdb.h mdb_dbi_open"
     c_mdb_dbi_open :: Ptr MDB_txn -> CString -> CUInt -> Ptr MDB_dbi_t -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_txn_commit"
+foreign import ccall safe "lmdb.h mdb_txn_commit"
     c_mdb_txn_commit :: Ptr MDB_txn -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_txn_abort"
+foreign import ccall unsafe "lmdb.h mdb_txn_commit"
+    c_mdb_txn_commit_unsafe :: Ptr MDB_txn -> IO CInt
+
+foreign import ccall safe "lmdb.h mdb_txn_abort"
     c_mdb_txn_abort :: Ptr MDB_txn -> IO ()
 
-foreign import ccall unsafe "lmdb.h mdb_cursor_open"
+foreign import ccall unsafe "lmdb.h mdb_txn_abort"
+    c_mdb_txn_abort_unsafe :: Ptr MDB_txn -> IO ()
+
+foreign import ccall safe "lmdb.h mdb_cursor_open"
     c_mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi_t -> Ptr (Ptr MDB_cursor) -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_cursor_get"
+foreign import ccall unsafe "lmdb.h mdb_cursor_open"
+    c_mdb_cursor_open_unsafe :: Ptr MDB_txn -> MDB_dbi_t -> Ptr (Ptr MDB_cursor) -> IO CInt
+
+foreign import ccall safe "lmdb.h mdb_cursor_get"
     c_mdb_cursor_get :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_cursor_op_t -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_cursor_close"
+foreign import ccall unsafe "lmdb.h mdb_cursor_get"
+    c_mdb_cursor_get_unsafe :: Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_cursor_op_t -> IO CInt
+
+foreign import ccall safe "lmdb.h mdb_cursor_close"
     c_mdb_cursor_close :: Ptr MDB_cursor -> IO ()
 
-foreign import ccall unsafe "lmdb.h mdb_dbi_close"
+foreign import ccall unsafe "lmdb.h mdb_cursor_close"
+    c_mdb_cursor_close_unsafe :: Ptr MDB_cursor -> IO ()
+
+foreign import ccall safe "lmdb.h mdb_dbi_close"
     c_mdb_dbi_close :: Ptr MDB_env -> MDB_dbi_t -> IO ()
 
-foreign import ccall unsafe "lmdb.h mdb_env_close"
+foreign import ccall safe "lmdb.h mdb_env_close"
     c_mdb_env_close :: Ptr MDB_env -> IO ()
 
-foreign import ccall unsafe "lmdb.h mdb_get"
+foreign import ccall safe "lmdb.h mdb_get"
     c_mdb_get :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_put"
+foreign import ccall unsafe "lmdb.h mdb_get"
+    c_mdb_get_unsafe :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
+foreign import ccall safe "lmdb.h mdb_put"
     c_mdb_put :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> CUInt -> IO CInt
 
-foreign import ccall unsafe "streamly_lmdb_foreign.h mdb_put_"
+foreign import ccall safe "streamly_lmdb_foreign.h mdb_put_"
     c_mdb_put_ :: Ptr MDB_txn -> MDB_dbi_t -> Ptr CChar -> CSize -> Ptr CChar -> CSize -> CUInt -> IO CInt
 
-foreign import ccall unsafe "lmdb.h mdb_drop"
+foreign import ccall unsafe "streamly_lmdb_foreign.h mdb_put_"
+    c_mdb_put_unsafe_ :: Ptr MDB_txn -> MDB_dbi_t -> Ptr CChar -> CSize -> Ptr CChar -> CSize -> CUInt -> IO CInt
+
+foreign import ccall safe "lmdb.h mdb_drop"
     c_mdb_drop :: Ptr MDB_txn -> MDB_dbi_t -> CInt -> IO CInt
 
 data LMDB_Error = LMDB_Error
@@ -237,15 +261,31 @@ mdb_txn_begin penv parent flags =
     alloca $ \pptxn -> c_mdb_txn_begin penv parent flags pptxn >>= \rc ->
         if rc /= 0 then throwLMDBErrNum "mdb_txn_begin" rc else peek pptxn
 
+mdb_txn_begin_unsafe :: Ptr MDB_env -> Ptr MDB_txn -> CUInt -> IO (Ptr MDB_txn)
+mdb_txn_begin_unsafe penv parent flags =
+    alloca $ \pptxn -> c_mdb_txn_begin_unsafe penv parent flags pptxn >>= \rc ->
+        if rc /= 0 then throwLMDBErrNum "mdb_txn_begin" rc else peek pptxn
+
 -- If the commit fails, aborts the transaction.
 mdb_txn_commit :: Ptr MDB_txn -> IO ()
 mdb_txn_commit ptxn =
     c_mdb_txn_commit ptxn >>= \rc ->
         when (rc /= 0) $ c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_txn_commit" rc
 
+-- If the commit fails, aborts the transaction.
+mdb_txn_commit_unsafe :: Ptr MDB_txn -> IO ()
+mdb_txn_commit_unsafe ptxn =
+    c_mdb_txn_commit_unsafe ptxn >>= \rc ->
+        when (rc /= 0) $ c_mdb_txn_abort_unsafe ptxn >> throwLMDBErrNum "mdb_txn_commit" rc
+
 mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi_t -> IO (Ptr MDB_cursor)
 mdb_cursor_open ptxn dbi =
     alloca $ \ppcurs -> c_mdb_cursor_open ptxn dbi ppcurs >>= \rc ->
+        if rc /= 0 then c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_cursor_open" rc else peek ppcurs
+
+mdb_cursor_open_unsafe :: Ptr MDB_txn -> MDB_dbi_t -> IO (Ptr MDB_cursor)
+mdb_cursor_open_unsafe ptxn dbi =
+    alloca $ \ppcurs -> c_mdb_cursor_open_unsafe ptxn dbi ppcurs >>= \rc ->
         if rc /= 0 then c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_cursor_open" rc else peek ppcurs
 
 mdb_dbi_open :: Ptr MDB_txn -> Maybe String -> CUInt -> IO MDB_dbi_t
@@ -264,6 +304,12 @@ mdb_put ptxn dbi pk pv flags =
 mdb_put_ :: Ptr MDB_txn -> MDB_dbi_t -> Ptr CChar -> CSize -> Ptr CChar -> CSize -> CUInt -> IO ()
 mdb_put_ ptxn dbi pk ks pv vs flags =
     c_mdb_put_ ptxn dbi pk ks pv vs flags >>= \rc ->
+        when (rc /= 0) $ throwLMDBErrNum "mdb_put_" rc
+
+{-# INLINE mdb_put_unsafe_ #-}
+mdb_put_unsafe_ :: Ptr MDB_txn -> MDB_dbi_t -> Ptr CChar -> CSize -> Ptr CChar -> CSize -> CUInt -> IO ()
+mdb_put_unsafe_ ptxn dbi pk ks pv vs flags =
+    c_mdb_put_unsafe_ ptxn dbi pk ks pv vs flags >>= \rc ->
         when (rc /= 0) $ throwLMDBErrNum "mdb_put_" rc
 
 mdb_clear :: Ptr MDB_txn -> MDB_dbi_t -> IO ()

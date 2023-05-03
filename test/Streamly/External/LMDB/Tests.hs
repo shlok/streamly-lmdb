@@ -11,38 +11,11 @@ import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.List (find, foldl', nubBy, sort)
 import Data.Word (Word8)
 import Foreign (castPtr, nullPtr, with)
-import Streamly.External.LMDB
-  ( Cursor,
-    Environment,
-    Mode,
-    OverwriteOptions (..),
-    ReadDirection (..),
-    ReadOnlyTxn,
-    ReadOptions (..),
-    ReadWrite,
-    WriteOptions (..),
-    abortReadOnlyTxn,
-    beginReadOnlyTxn,
-    clearDatabase,
-    closeCursor,
-    defaultReadOptions,
-    defaultWriteOptions,
-    openCursor,
-    readLMDB,
-    unsafeReadLMDB,
-    writeLMDB,
-  )
-import Streamly.External.LMDB.Internal (Database (..))
-import Streamly.External.LMDB.Internal.Foreign
-  ( MDB_val (..),
-    combineOptions,
-    mdb_nooverwrite,
-    mdb_put,
-    mdb_txn_begin,
-    mdb_txn_commit,
-  )
 import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
 import qualified Streamly.Data.Stream.Prelude as S
+import Streamly.External.LMDB
+import Streamly.External.LMDB.Internal (Database (..))
+import Streamly.External.LMDB.Internal.Foreign
 import Test.QuickCheck (Gen, NonEmptyList (..), choose, elements, frequency)
 import Test.QuickCheck.Monadic (PropertyM, monadicIO, pick, run)
 import Test.Tasty (TestTree)
@@ -117,12 +90,14 @@ testWriteLMDB res = testProperty "writeLMDB" . monadicIO $ do
   run $ clearDatabase db
 
   chunkSz <- pick arbitrary
+  unsafeFFI <- pick arbitrary
 
   let fol' =
         writeLMDB db $
           defaultWriteOptions
             { writeTransactionSize = chunkSz,
-              overwriteOptions = OverwriteAllow
+              writeOverwriteOptions = OverwriteAllow,
+              writeUnsafeFFI = unsafeFFI
             }
 
   -- TODO: Run with new "bound" functionality in streamly.
@@ -143,13 +118,15 @@ testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
   run $ clearDatabase db
 
   chunkSz <- pick arbitrary
+  unsafeFFI <- pick arbitrary
 
   -- TODO: Run with new "bound" functionality in streamly.
   let fol' =
         writeLMDB db $
           defaultWriteOptions
             { writeTransactionSize = chunkSz,
-              overwriteOptions = OverwriteDisallow
+              writeOverwriteOptions = OverwriteDisallow,
+              writeUnsafeFFI = unsafeFFI
             }
   e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
   exceptionAsExpected <-
@@ -174,13 +151,15 @@ testWriteLMDB_3 res = testProperty "writeLMDB_3" . monadicIO $ do
   run $ clearDatabase db
 
   chunkSz <- pick arbitrary
+  unsafeFFI <- pick arbitrary
 
   -- TODO: Run with new "bound" functionality in streamly.
   let fol' =
         writeLMDB db $
           defaultWriteOptions
             { writeTransactionSize = chunkSz,
-              overwriteOptions = OverwriteAllowSame
+              writeOverwriteOptions = OverwriteAllowSame,
+              writeUnsafeFFI = unsafeFFI
             }
   e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
   exceptionAsExpected <-
@@ -310,9 +289,10 @@ readOptionsAndResults :: PairsInDatabase -> Gen (ReadOptions, ExpectedReadResult
 readOptionsAndResults pairsInDb = do
   forw <- arbitrary
   let dir = if forw then Forward else Backward
+  unsafeFFI <- arbitrary
   let len = length pairsInDb
   readAll <- frequency [(1, return True), (3, return False)]
-  let ropts = defaultReadOptions {readDirection = dir}
+  let ropts = defaultReadOptions {readDirection = dir, readUnsafeFFI = unsafeFFI}
   if readAll
     then return (ropts {readStart = Nothing}, (if forw then id else reverse) pairsInDb)
     else
