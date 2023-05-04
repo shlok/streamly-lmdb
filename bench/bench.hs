@@ -4,10 +4,13 @@
 module Main where
 
 import Control.Monad (forM, forM_)
+import qualified Data.ByteString as B
 import Data.List (intercalate)
 import qualified Data.Text as T
 import qualified Data.Vector as V
+import Data.Word
 import Statistics.Sample (mean, stdDev)
+import qualified Text.Printf as T
 import Turtle
 
 data Platform = PlatformLinux | PlatformMacOS deriving (Eq)
@@ -196,7 +199,7 @@ main = do
                   round $ mb / (8 * fromIntegral kvFactor + 8 * fromIntegral kvFactor)
             let warmCount = 3
             let timeCount = 10
-            
+
             let runProcs description exec cmd = do
                   let args =
                         format
@@ -250,6 +253,67 @@ main = do
 
             append csvFile . return . unsafeTextToLine . T.pack $ line
             procs "echo" [format ("    Appended results to " % s % "") csvFile] empty
+      )
+
+  echoHrule
+  answerIsYes "Perform file reading with C?"
+    >>= flip
+      when
+      ( do
+          let tmpDir :: (IsString a) => a
+              tmpDir = "./tmp/c-file-read"
+
+          procs "echo" ["-n", format ("    Removing " % s % " (if it exists)... ") tmpDir] empty
+          shells (format ("rm -rf " % fp % "") tmpDir) empty
+          echo "done."
+          mktree tmpDir
+
+          let multiplier = 5000
+              add = 200
+              fileCount :: Word64 = 256 * multiplier + add
+
+          procs
+            "echo"
+            ["-n", format ("    Writing " % d % " 1-byte files (with Haskell)... ") fileCount]
+            empty
+          forM_ [0 .. fileCount - 1] $ \idx -> do
+            let byte :: Word8 = fromIntegral idx
+                filePath :: String = T.printf "%s/file%d" (tmpDir :: String) idx
+            B.writeFile filePath (B.singleton byte)
+          echo "done."
+
+          let descriptions =
+                [ "1st time (directly from disk)",
+                  "2nd time (possibly directly from memory)",
+                  "3rd time (possibly directly from memory)",
+                  "4th time (possibly directly from memory)",
+                  "5th time (possibly directly from memory)"
+                ]
+          forM_ descriptions $ \desc -> do
+            procs
+              "echo"
+              [ format
+                  ("    Reading " % d % " 1-byte files (with C program; " % s % ")... ")
+                  fileCount
+                  desc
+              ]
+              empty
+
+            let expectedSum :: Word64 = (255 * 256 `div` 2) * multiplier + (add - 1) * add `div` 2
+                expectedInOutput =
+                  format ("File count: " % d % "\nSum: " % d % "") fileCount expectedSum
+            seconds <-
+              timeCommand'
+                (format ("" % s % " read-files " % fp % "") c_executable tmpDir)
+                [expectedInOutput]
+
+            putStrLn $
+              "        Microseconds / file: "
+                ++ show ((realToFrac seconds :: Double) / fromIntegral fileCount * 1e6)
+          
+          procs "echo" ["-n", format ("    Removing " % s % "... ") tmpDir] empty
+          shells (format ("rm -rf " % fp % "") tmpDir) empty
+          echo "done."
       )
 
 failWithMsg :: Line -> IO a

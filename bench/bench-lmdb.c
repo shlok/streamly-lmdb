@@ -214,6 +214,36 @@ int main(int argc, char *argv[]) {
     }
     printf("Overflow.\n");
     return 1;
+  } else if (strcmp(argv[1], "read-files") == 0) {
+    // Read all files in path (non-recursively), read one byte from each file
+    // (as an int), and output the sum of the integers.
+    DIR *dir;
+    if ((dir = opendir(path)) != NULL) {
+      FILE *fp;
+      struct dirent *ent;
+      long long sum = 0;
+      long long file_count = 0;
+      while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_type == DT_REG) { // Read only regular files.
+          char f_path[256];
+          if (snprintf(f_path, 256, "%s/%s", path, ent->d_name) >= 256) {
+            printf("Error: unexpected truncation.\n");
+            return 1;
+          };
+          fp = fopen(f_path, "r");
+          int byte = fgetc(fp);
+          sum += (long)byte;
+          file_count++;
+          fclose(fp);
+        };
+      }
+      printf("File count: %lld\n", file_count);
+      printf("Sum: %lld\n", sum);
+      closedir(dir);
+    } else {
+      printf("Error: Unable to open directory: %s\n", path);
+      return 1;
+    }
   } else {
     print_usage();
     return 1;
@@ -227,6 +257,7 @@ void print_usage() {
             [# key-value pairs] [# pairs in each transaction]\n");
   printf("bench-lmdb read-cursor [path]\n");
   printf("bench-lmdb read-keys [path] [key factor]\n");
+  printf("bench-lmdb read-files [path]\n");
 }
 
 void copy_bytes(char *memory, int factor, int x, int offset) {

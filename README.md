@@ -69,13 +69,15 @@ main = do
 
 See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup>):
 
-* **Reading:**
+* Reading:
   - For iterating through a fully cached LMDB database, this library has roughly a 110 ns/pair overhead compared to C. (Plain Haskell `IO` code has roughly a 70 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
-  - By using `unsafeReadLMDB` instead of `readLMDB`, you can get the overhead down to roughly 100 ns/pair.
-  - By additionally using the `readUnsafeFFI` option (to use `unsafe` FFI calls under the hood), you can get the overhead down to roughly 40 ns/pair.
+  - By using `unsafeReadLMDB` instead of `readLMDB`, we can get the overhead down to roughly 100 ns/pair.
+  - By additionally using the `readUnsafeFFI` option (to use `unsafe` FFI calls under the hood), we can get the overhead down to roughly 40 ns/pair.
 
-* **Writing:**
+* Writing:
   - For writing to an LMDB database, this library has roughly a 210 ns/pair overhead compared to C. (Plain Haskell `IO` code has roughly a 100 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
-  - By using the `writeUnsafeFFI` option (to use `unsafe` FFI calls under the hood), you can get the overhead down to roughly 140 ns/pair.
+  - By using the `writeUnsafeFFI` option (to use `unsafe` FFI calls under the hood), we can get the overhead down to roughly 140 ns/pair.
 
-<sup>†</sup> May 2023; [Linode](https://linode.com); Debian 11, Dedicated 32GB: 16 CPU, 640GB Storage, 32GB RAM.
+* For most Haskell programs, these differences will not cause problems. (For instance, note that merely opening and reading 1 byte from a file with C already takes us tens of *microseconds*.)
+
+<sup>†</sup> May 2023; [Linode](https://linode.com); Debian 11, Dedicated 32GB: 16 CPU, 640GB SSD storage, 32GB RAM.
