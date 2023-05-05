@@ -1,3 +1,7 @@
+## 0.7.0
+
+* Added `readUnsafeFFI` and `writeUnsafeFFI` options.
+
 ## 0.6.0
 
 * Updated for Streamly 0.9.0.
