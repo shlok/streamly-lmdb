@@ -57,6 +57,11 @@ module Streamly.External.LMDB
     WriteOptions (..),
     defaultWriteOptions,
     OverwriteOptions (..),
+    WriteAppend (..),
+    writeFailureThrow,
+    writeFailureThrowDebug,
+    writeFailureStop,
+    writeFailureIgnore,
 
     -- * Error types
     LMDB_Error (..),
@@ -66,25 +71,27 @@ where
 
 import Control.Concurrent (isCurrentThreadBound, myThreadId)
 import Control.Concurrent.Async (asyncBound, wait)
-import Control.Exception (Exception, catch, mask_, throw, tryJust)
-import Control.Monad (guard, unless, when)
+import Control.Exception
+import Control.Monad
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString, packCStringLen)
 import Data.ByteString.Unsafe (unsafePackCStringLen, unsafeUseAsCStringLen)
-import Data.Maybe (fromJust, isNothing)
+import Data.Maybe
 import Data.Void (Void)
 import Foreign (Ptr, alloca, free, malloc, nullPtr, peek)
 import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
 import Foreign.Marshal.Utils (with)
 import Foreign.Storable (poke)
+import qualified Streamly.Data.Fold as F
 import Streamly.External.LMDB.Internal (Database (..), Mode (..), ReadOnly, ReadWrite)
 import Streamly.External.LMDB.Internal.Foreign
-import Streamly.Internal.Data.Fold (Fold (Fold), Step (Partial))
+import Streamly.Internal.Data.Fold (Fold (Fold), Step (..))
 import Streamly.Internal.Data.IOFinalizer (newIOFinalizer, runIOFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
 import Streamly.Internal.Data.Unfold (lmap)
 import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
+import Text.Printf
 
 newtype Environment mode = Environment (Ptr MDB_env)
 
@@ -419,41 +426,69 @@ data ReadDirection = Forward | Backward deriving (Show)
 data OverwriteOptions
   = -- | When a key reoccurs, overwrite the value.
     OverwriteAllow
-  | -- | When a key reoccurs, throw an exception except when the value is the same.
-    OverwriteAllowSame
-  | -- | When a key reoccurs, throw an exception.
-    OverwriteDisallow
-  deriving (Eq)
+  | -- | When a key reoccurs, hand the offending key-value pair to the 'writeFailureFold'—except
+    -- when the value is the same as before.
+    OverwriteAllowSameValue
+  | -- | When a key reoccurs, hand the offending key-value pair to the 'writeFailureFold'.
+    OverwriteDisallow !WriteAppend
+  deriving (Eq, Show)
 
-data WriteOptions = WriteOptions
+-- | Assume the input data is already ordered. This allows the use of @MDB_APPEND@ under the hood
+-- and substantially improves write performance.
+newtype WriteAppend = WriteAppend Bool deriving (Eq, Show)
+
+data WriteOptions a = WriteOptions
   { -- | The number of key-value pairs per write transaction.
     writeTransactionSize :: !Int,
     writeOverwriteOptions :: !OverwriteOptions,
-    -- | Assume the input data is already ordered. This allows the use of @MDB_APPEND@ under the
-    -- hood and substantially improves write performance. An exception will be thrown if the
-    -- assumption about the ordering is not true.
-    writeAppend :: !Bool,
     -- | Use @unsafe@ FFI calls under the hood. This can increase write performance, but one should
     -- bear in mind that @unsafe@ FFI calls can have an adverse impact on the performance of the
     -- rest of the program (e.g., its ability to effectively spawn green threads).
-    writeUnsafeFFI :: !Bool
+    writeUnsafeFFI :: !Bool,
+    -- | A fold for handling unsuccessful writes.
+    writeFailureFold :: !(Fold IO (LMDB_Error, ByteString, ByteString) a)
   }
 
 -- | By default, we use a write transaction size of 1 (one write transaction for each key-value
--- pair), allow overwriting, don’t assume that the input data is already ordered, and don’t use
--- unsafe FFI calls.
-defaultWriteOptions :: WriteOptions
+-- pair), allow overwriting, don’t use unsafe FFI calls, and use 'writeFailureThrow' as the failure
+-- fold.
+defaultWriteOptions :: WriteOptions ()
 defaultWriteOptions =
   WriteOptions
     { writeTransactionSize = 1,
-      writeOverwriteOptions = OverwriteAllow,
-      writeAppend = False,
-      writeUnsafeFFI = False
+      writeOverwriteOptions = OverwriteDisallow (WriteAppend False),
+      writeUnsafeFFI = False,
+      writeFailureFold = writeFailureThrow
     }
 
-newtype ExceptionString = ExceptionString String deriving (Show)
+-- | Throw an exception upon write failure.
+writeFailureThrow :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureThrow =
+  Fold (\() (e, _, _) -> throw e) (return $ Partial ()) (const $ return ())
 
-instance Exception ExceptionString
+-- | Throw an exception upon write failure; and include the offending key-value pair in the
+-- exception’s description.
+writeFailureThrowDebug :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureThrowDebug =
+  Fold
+    ( \() (e, k, v) ->
+        let desc = e_description e
+         in throw e {e_description = printf "%s; key=%s; value=%s" desc (show k) (show v)}
+    )
+    (return $ Partial ())
+    (const $ return ())
+
+-- | Gracefully stop upon write failure.
+writeFailureStop :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureStop = void F.one
+
+-- | Ignore write failures.
+writeFailureIgnore :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureIgnore = F.drain
+
+newtype StreamlyLMDBError = StreamlyLMDBError String deriving (Show)
+
+instance Exception StreamlyLMDBError
 
 -- | Creates a fold with which we can stream key-value pairs into the given database.
 --
@@ -466,87 +501,150 @@ instance Exception ExceptionString
 -- transaction for each key-value pair) could yield suboptimal performance. One could try, e.g., 100
 -- KB chunks and benchmark from there.
 {-# INLINE writeLMDB #-}
-writeLMDB :: (MonadIO m) => Database ReadWrite -> WriteOptions -> Fold m (ByteString, ByteString) ()
+writeLMDB ::
+  (MonadIO m) =>
+  Database ReadWrite ->
+  WriteOptions a ->
+  Fold m (ByteString, ByteString) a
 writeLMDB (Database penv dbi) wopts =
-  let txnSize = max 1 (writeTransactionSize wopts)
-      overwriteOpt = writeOverwriteOptions wopts
-      flags =
-        combineOptions $
-          [mdb_nooverwrite | overwriteOpt `elem` [OverwriteAllowSame, OverwriteDisallow]]
-            ++ [mdb_append | writeAppend wopts]
-      (txn_begin, txn_commit, put_, get) =
-        if writeUnsafeFFI wopts
-          then (mdb_txn_begin_unsafe, mdb_txn_commit_unsafe, mdb_put_unsafe_, c_mdb_get_unsafe)
-          else (mdb_txn_begin, mdb_txn_commit, mdb_put_, c_mdb_get)
-   in Fold
-        ( \(threadId, iter, currChunkSz, mtxn) (k, v) -> do
-            -- In the first few iterations, ascertain that we are still on the same (bound) thread.
-            iter' <-
-              liftIO $
-                if iter < 3
-                  then do
-                    threadId' <- myThreadId
-                    when (threadId' /= threadId) $
-                      throw
-                        (ExceptionString "Error: writeLMDB veered off the original bound thread")
-                    return $ iter + 1
-                  else return iter
+  go (writeFailureFold wopts)
+  where
+    {-# INLINE go #-}
+    go (Fold failStep failInit failExtract) =
+      let txnSize = max 1 (writeTransactionSize wopts)
 
-            currChunkSz' <-
-              liftIO $
-                if currChunkSz >= txnSize
-                  then do
-                    let (_, ref) = fromJust mtxn
-                    runIOFinalizer ref
-                    return 0
-                  else return currChunkSz
+          overwriteOpt = writeOverwriteOptions wopts
+          nooverwrite = case overwriteOpt of
+            OverwriteAllowSameValue ->
+              -- Disallow overwriting from LMDB’s point of view; see (*).
+              True
+            OverwriteDisallow _ -> True
+            OverwriteAllow -> False
+          append = case overwriteOpt of
+            OverwriteDisallow (WriteAppend True) -> True
+            _ -> False
+          flags =
+            combineOptions $ [mdb_nooverwrite | nooverwrite] ++ [mdb_append | append]
 
-            (ptxn, ref) <-
-              if currChunkSz' == 0
-                then liftIO $
-                  mask_ $ do
-                    ptxn <- txn_begin penv nullPtr 0
-                    ref <- newIOFinalizer $ txn_commit ptxn
-                    return (ptxn, ref)
-                else return $ fromJust mtxn
+          (txn_begin, txn_commit, put_, get) =
+            if writeUnsafeFFI wopts
+              then (mdb_txn_begin_unsafe, mdb_txn_commit_unsafe, mdb_put_unsafe_, c_mdb_get_unsafe)
+              else (mdb_txn_begin, mdb_txn_commit, mdb_put_, c_mdb_get)
+       in Fold
+            ( \(threadId, iter, mtxn, fstep) (k, v) -> do
+                -- In the first few iterations, ascertain that we are still on the same (bound)
+                -- thread.
+                iter' <-
+                  if iter < 3
+                    then do
+                      threadId' <- liftIO myThreadId
+                      when (threadId' /= threadId) $
+                        throwErr "writeLMDB veered off the original bound thread"
+                      return $ iter + 1
+                    else return iter
 
-            liftIO $
-              unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
-                catch
-                  (put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags)
-                  ( \(e :: LMDB_Error) -> do
-                      -- Discard error if OverwriteAllowSame was specified and the error from LMDB
-                      -- was due to the exact same key-value pair already existing in the database.
-                      ok <- with (MDB_val (fromIntegral kl) kp) $ \pk ->
-                        alloca $ \pv -> do
-                          rc <- get ptxn dbi pk pv
-                          if rc == 0
-                            then do
-                              v' <- peek pv
-                              vbs <- unsafePackCStringLen (mv_data v', fromIntegral $ mv_size v')
-                              return $
-                                overwriteOpt == OverwriteAllowSame
-                                  && e_code e == Right MDB_KEYEXIST
-                                  && vbs == v
-                            else return False
-                      unless ok $ runIOFinalizer ref >> throw e
-                  )
-            return $ Partial (threadId, iter', currChunkSz' + 1, Just (ptxn, ref))
-        )
-        ( do
-            isBound <- liftIO isCurrentThreadBound
-            threadId <- liftIO myThreadId
-            if isBound
-              then return $ Partial (threadId, 0 :: Int, 0, Nothing)
-              else throw $ ExceptionString "Error: writeLMDB should be executed on a bound thread"
-        )
-        -- This final part is incompatible with scans.
-        ( \(threadId, _, _, mtxn) -> liftIO $ do
-            threadId' <- myThreadId
-            when (threadId' /= threadId) $
-              throw
-                (ExceptionString "Error: writeLMDB veered off the original bound thread at the end")
-            case mtxn of
-              Nothing -> return ()
-              Just (_, ref) -> runIOFinalizer ref
-        )
+                let beginTxn = liftIO . mask_ $ do
+                      ptxn <- txn_begin penv nullPtr 0
+                      ref <- newIOFinalizer $ txn_commit ptxn
+                      return (ptxn, ref, 0)
+
+                (ptxn, ref, chunkSz) <- case mtxn of
+                  Nothing -> beginTxn -- The first transaction.
+                  Just txn@(_, ref, chunkSz) ->
+                    if chunkSz >= txnSize
+                      then do
+                        runIOFinalizer ref
+                        beginTxn
+                      else -- create txn again.
+                        return txn
+
+                -- If the insert succeeds from our point of view (although it could have failed from
+                -- LMDB’s point of view; see (*)), we get a new chunk size. Otherwise, we get the
+                -- LMDB exception.
+                eChunkSz <- liftIO $
+                  unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
+                    catch
+                      ( do
+                          put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags
+                          return . Right $ chunkSz + 1
+                      )
+                      ( \(e :: LMDB_Error) ->
+                          -- (*) Discard LMDB error if OverwriteAllowSameValue was specified and the
+                          -- error from LMDB was due to the exact same key-value pair already
+                          -- existing in the database.
+                          with (MDB_val (fromIntegral kl) kp) $ \pk -> alloca $ \pv -> do
+                            rc <- get ptxn dbi pk pv
+                            if rc == 0
+                              then do
+                                v' <- peek pv
+                                vbs <- unsafePackCStringLen (mv_data v', fromIntegral $ mv_size v')
+                                let ok =
+                                      overwriteOpt == OverwriteAllowSameValue
+                                        && e_code e == Right MDB_KEYEXIST
+                                        && vbs == v
+                                return $
+                                  if ok
+                                    then Right chunkSz
+                                    else Left e
+                              else do
+                                return $ Left e
+                      )
+
+                case eChunkSz of
+                  Right chunkSz' ->
+                    return $ Partial (threadId, iter', Just (ptxn, ref, chunkSz'), fstep)
+                  Left e -> do
+                    case fstep of
+                      Done _ ->
+                        -- When the failure fold completes with Done, the outer writeLMDB fold
+                        -- should already have completed with Done as well; see below. We should
+                        -- therefore never arrive here.
+                        throwErr "writeLMDB: Unexpected Done."
+                      Partial s -> do
+                        -- Feed the offending key-value pair into the failure fold.
+                        fstep' <- liftIO $ onException (failStep s (e, k, v)) (runIOFinalizer ref)
+                        case fstep' of
+                          Done a -> do
+                            -- (**) The failure fold completed with Done; complete the outer
+                            -- writeLMDB fold with Done as well.
+                            runIOFinalizer ref
+                            return $ Done a
+                          Partial _ ->
+                            -- The failure fold did not request completion; continue the outer
+                            -- writeLMDB fold as if nothing happened.
+                            return $
+                              Partial (threadId, iter', Just (ptxn, ref, chunkSz), fstep')
+            )
+            ( do
+                threadId <- liftIO myThreadId
+                liftIO isCurrentThreadBound
+                  >>= flip unless (throwErr "writeLMDB should be executed on a bound thread")
+
+                fstep <- liftIO failInit
+                case fstep of
+                  Done _ -> throwErr "writeLMDB: writeFailureFold should begin with Partial"
+                  Partial _ -> return ()
+
+                return $ Partial (threadId, 0 :: Int, Nothing, fstep)
+            )
+            -- This final part is incompatible with scans.
+            ( \(threadId, _, mtxn, fstep) -> liftIO $ do
+                threadId' <- myThreadId
+                when (threadId' /= threadId) $
+                  throwErr "writeLMDB veered off the original bound thread at the end"
+
+                case mtxn of
+                  Nothing -> return ()
+                  Just (_, ref, _) -> runIOFinalizer ref
+
+                case fstep of
+                  Done _ ->
+                    -- As the failure fold completed with Done, the outer writeLMDB fold should have
+                    -- completed as well; see (**).
+                    throwErr "writeLMDB: Unexpected Done (extract)."
+                  Partial s ->
+                    failExtract s
+            )
+
+throwErr :: String -> m a
+throwErr = throw . StreamlyLMDBError
