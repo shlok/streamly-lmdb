@@ -85,6 +85,7 @@ import Streamly.Internal.Data.IOFinalizer (newIOFinalizer, runIOFinalizer)
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
 import Streamly.Internal.Data.Unfold (lmap)
 import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
+import Text.Printf
 
 newtype Environment mode = Environment (Ptr MDB_env)
 
@@ -436,7 +437,10 @@ data WriteOptions = WriteOptions
     -- | Use @unsafe@ FFI calls under the hood. This can increase write performance, but one should
     -- bear in mind that @unsafe@ FFI calls can have an adverse impact on the performance of the
     -- rest of the program (e.g., its ability to effectively spawn green threads).
-    writeUnsafeFFI :: !Bool
+    writeUnsafeFFI :: !Bool,
+    -- | If an error occurs during writing (i.e., during @mdb_put@ under the hood), show the
+    -- offending key-value pair in the thrown exception.
+    writeDebug :: !(Maybe (ByteString -> String, ByteString -> String))
   }
 
 -- | By default, we use a write transaction size of 1 (one write transaction for each key-value
@@ -448,7 +452,8 @@ defaultWriteOptions =
     { writeTransactionSize = 1,
       writeOverwriteOptions = OverwriteAllow,
       writeAppend = False,
-      writeUnsafeFFI = False
+      writeUnsafeFFI = False,
+      writeDebug = Nothing
     }
 
 newtype ExceptionString = ExceptionString String deriving (Show)
@@ -529,7 +534,17 @@ writeLMDB (Database penv dbi) wopts =
                                   && e_code e == Right MDB_KEYEXIST
                                   && vbs == v
                             else return False
-                      unless ok $ runIOFinalizer ref >> throw e
+
+                      unless ok $ do
+                        runIOFinalizer ref
+                        let desc =
+                              e_description e
+                                ++ ( case writeDebug wopts of
+                                       Nothing -> ""
+                                       Just (kOut, vOut) ->
+                                         printf " ; key = %s ; value = %s" (kOut k) (vOut v)
+                                   )
+                        throw e {e_description = desc}
                   )
             return $ Partial (threadId, iter', currChunkSz' + 1, Just (ptxn, ref))
         )
