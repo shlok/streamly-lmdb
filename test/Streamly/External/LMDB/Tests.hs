@@ -1,35 +1,46 @@
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Streamly.External.LMDB.Tests (tests) where
 
 import Control.Concurrent.Async (asyncBound, wait)
-import Control.Exception (SomeException, bracket, onException, try)
+import Control.Exception hiding (assert)
 import Control.Monad (forM_)
-import Data.ByteString (ByteString, pack, unpack)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
-import Data.List (find, foldl', nubBy, sort)
-import Data.Word (Word8)
-import Foreign (castPtr, nullPtr, with)
+import Data.ByteString.Unsafe
+import Data.Either
+import Data.List
+import Data.Word
+import Foreign
 import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
 import qualified Streamly.Data.Stream.Prelude as S
 import Streamly.External.LMDB
 import Streamly.External.LMDB.Internal (Database (..))
 import Streamly.External.LMDB.Internal.Foreign
-import Test.QuickCheck (Gen, NonEmptyList (..), choose, elements, frequency)
-import Test.QuickCheck.Monadic (PropertyM, monadicIO, pick, run)
+import Test.QuickCheck
+import Test.QuickCheck.Monadic
 import Test.Tasty (TestTree)
-import Test.Tasty.QuickCheck (arbitrary, testProperty)
+import Test.Tasty.QuickCheck
+import Text.Printf
 
 tests :: IO (Database ReadWrite, Environment ReadWrite) -> [TestTree]
 tests dbenv =
   [ testReadLMDB dbenv,
-    testUnsafeReadLMDB dbenv,
-    testWriteLMDB dbenv,
-    testWriteLMDB_2 dbenv,
-    testWriteLMDB_3 dbenv,
-    testBetween
+    testUnsafeReadLMDB dbenv
   ]
+    ++ ( do
+           overwriteOpts <-
+             [ OverwriteAllow,
+               OverwriteAllowSame,
+               OverwriteDisallow $ WriteAppend False,
+               OverwriteDisallow $ WriteAppend True
+               ]
+           failureFold <- [FailureThrow, FailureStop, FailureIgnore]
+           return $ testWriteLMDB overwriteOpts failureFold dbenv
+       )
+    ++ [ testBetween
+       ]
 
 withReadOnlyTxnAndCurs ::
   (Mode mode) =>
@@ -47,7 +58,7 @@ withReadOnlyTxnAndCurs env db =
 testReadLMDB :: (Mode mode) => IO (Database mode, Environment mode) -> TestTree
 testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
   (db, env) <- run res
-  keyValuePairs <- arbitraryKeyValuePairs''
+  keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
   run $ clearDatabase db
 
   run $ writeChunk db False keyValuePairs
@@ -64,7 +75,7 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
 testUnsafeReadLMDB :: (Mode mode) => IO (Database mode, Environment mode) -> TestTree
 testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
   (db, env) <- run res
-  keyValuePairs <- arbitraryKeyValuePairs''
+  keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
   run $ clearDatabase db
 
   run $ writeChunk db False keyValuePairs
@@ -80,128 +91,197 @@ testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
 
   return $ lengths == expectedLengths && lengthsTxn == expectedLengths
 
--- | Clear the database, write key-value pairs to it using our library with key overwriting allowed,
--- read them back using our library (already covered by 'testReadLMDB'), and make sure the result is
--- what we wrote.
-testWriteLMDB :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
-testWriteLMDB res = testProperty "writeLMDB" . monadicIO $ do
-  (db, _) <- run res
-  keyValuePairs <- arbitraryKeyValuePairs
-  run $ clearDatabase db
+data FailureFold = FailureThrow | FailureStop | FailureIgnore deriving (Show)
 
-  chunkSz <- pick arbitrary
-  unsafeFFI <- pick arbitrary
+-- | Clear the database, write key-value pairs to it using our library with various options, read
+-- all key-value pairs back from the database using our library (already covered by 'testReadLMDB'),
+-- and make sure they are as expected.
+testWriteLMDB ::
+  OverwriteOptions ->
+  FailureFold ->
+  IO (Database ReadWrite, Environment ReadWrite) ->
+  TestTree
+testWriteLMDB overwriteOpts failureFold res =
+  testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold)) . monadicIO $
+    do
+      (db, _) <- run res
+      run $ clearDatabase db
 
-  let fol' =
-        writeLMDB db $
-          defaultWriteOptions
-            { writeTransactionSize = chunkSz,
-              writeOverwriteOptions = OverwriteAllow,
-              writeUnsafeFFI = unsafeFFI
-            }
+      -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
+      -- normally result in bad performance. We therefore base the number of pairs on the chunk
+      -- size.
+      chunkSz <- pick $ chooseInt (1, 100)
+      let maxPairs = chunkSz * 5
+      unsafeFFI <- pick arbitrary
 
-  -- TODO: Run with new "bound" functionality in streamly.
-  run $ asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait
-  let keyValuePairsInDb = sort . removeDuplicateKeys $ keyValuePairs
+      let failureFold' = case failureFold of
+            FailureThrow -> throwOnWriteFailure
+            FailureStop -> stopOnWriteFailure
+            FailureIgnore -> ignoreWriteFailures
 
-  readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+      let fol' =
+            writeLMDB db $
+              defaultWriteOptions
+                { writeTransactionSize = chunkSz,
+                  writeOverwriteOptions = overwriteOpts,
+                  writeUnsafeFFI = unsafeFFI,
+                  writeFailureFold = failureFold'
+                }
 
-  return $ keyValuePairsInDb == readPairsAll
+      -- Write key-value pairs to the database.
+      keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairsDupsMoreLikely maxPairs
+      let hasDuplicates = hasDuplicateKeys keyValuePairs
+          hasDuplicatesWithDiffVals = hasDuplicateKeysWithDiffVals keyValuePairs
+          isSorted = sort keyValuePairs == keyValuePairs
+          isStrictlySorted = isSorted && not hasDuplicates
+      e <- run $ try @SomeException (asyncBound (S.fold fol' $ fromList keyValuePairs) >>= wait)
 
--- | Clear the database, write key-value pairs to it using our library with key overwriting
--- disallowed, and make sure an exception occurs iff we had a duplicate key in our pairs.
--- Furthermore make sure that key-value pairs prior to a duplicate key are actually in the database.
-testWriteLMDB_2 :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
-testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
-  (db, _) <- run res
-  keyValuePairs <- arbitraryKeyValuePairs'
-  run $ clearDatabase db
+      --  overwriteOpts <- [OverwriteAllow, OverwriteAllowSame, OverwriteDisallow]
+      --  writeAppend' <- [False, True]
+      --  failureFold <- [FailureThrow, FailureStop, FailureIgnore]
 
-  chunkSz <- pick arbitrary
-  unsafeFFI <- pick arbitrary
+      -- Make sure exceptions occurred as expected.
+      let exceptionAssert s = assertMsg $ "unexpected exception " ++ s
+      case failureFold of
+        FailureStop -> exceptionAssert "(1)" (isRight e)
+        FailureIgnore -> exceptionAssert "(2)" (isRight e)
+        FailureThrow -> case overwriteOpts of
+          OverwriteAllow -> exceptionAssert "(3)" (isRight e)
+          OverwriteAllowSame -> case e of
+            Left _ -> exceptionAssert "(4)" hasDuplicatesWithDiffVals
+            Right _ -> exceptionAssert "(5)" $ not hasDuplicatesWithDiffVals
+          OverwriteDisallow (WriteAppend False) -> case e of
+            Left _ -> exceptionAssert "(6)" hasDuplicates
+            Right _ -> exceptionAssert "(7)" $ not hasDuplicates
+          OverwriteDisallow (WriteAppend True) -> case e of
+            Left _ -> exceptionAssert "(8)" $ not isStrictlySorted
+            Right _ -> exceptionAssert "(9)" isStrictlySorted
 
-  -- TODO: Run with new "bound" functionality in streamly.
-  let fol' =
-        writeLMDB db $
-          defaultWriteOptions
-            { writeTransactionSize = chunkSz,
-              writeOverwriteOptions = OverwriteDisallow,
-              writeUnsafeFFI = unsafeFFI
-            }
-  e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
-  exceptionAsExpected <-
-    case e of
-      Left _ -> return $ hasDuplicateKeys keyValuePairs
-      Right _ -> return . not $ hasDuplicateKeys keyValuePairs
+      -- if writeAppend'
+      --   then
 
-  let keyValuePairsInDb = sort . prefixBeforeDuplicate $ keyValuePairs
-  readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-  let pairsAsExpected = keyValuePairsInDb == readPairsAll
+      --   else -- Only in this case could an exception possibly have occurred.
+      --   -- Four:
+      --   -- overwriteOpts: [OverwriteAllow, OverwriteAllowSame, OverwriteDisallow $ WriteAppend False/True]
 
-  return $ exceptionAsExpected && pairsAsExpected
+      --     undefined
 
--- | Clear the database, write key-value pairs to it using our library with key overwriting
--- disallowed except when attempting to replace an existing key-value pair, and make sure an
--- exception occurs iff we had a duplicate key with different values in our pairs. Furthermore make
--- sure that key-value pairs prior to a such a duplicate key are actually in the database.
-testWriteLMDB_3 :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
-testWriteLMDB_3 res = testProperty "writeLMDB_3" . monadicIO $ do
-  (db, _) <- run res
-  keyValuePairs <- arbitraryKeyValuePairs'
-  run $ clearDatabase db
+      -- Regardless of whether an exception occurred, we now read all key-value pairs back from the
+      -- database and make sure they are as expected.
 
-  chunkSz <- pick arbitrary
-  unsafeFFI <- pick arbitrary
+      -- let keyValuePairsInDb = sort . removeDuplicateKeys $ keyValuePairs
 
-  -- TODO: Run with new "bound" functionality in streamly.
-  let fol' =
-        writeLMDB db $
-          defaultWriteOptions
-            { writeTransactionSize = chunkSz,
-              writeOverwriteOptions = OverwriteAllowSame,
-              writeUnsafeFFI = unsafeFFI
-            }
-  e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
-  exceptionAsExpected <-
-    case e of
-      Left _ -> return $ hasDuplicateKeysWithDiffVals keyValuePairs
-      Right _ -> return . not $ hasDuplicateKeysWithDiffVals keyValuePairs
+      -- readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
 
-  let keyValuePairsInDb =
-        sort . removeDuplicateKeys . prefixBeforeDuplicateWithDiffVal $
-          keyValuePairs
-  readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-  let pairsAsExpected = keyValuePairsInDb == readPairsAll
+      return () -- \$ keyValuePairsInDb == readPairsAll
 
-  return $ exceptionAsExpected && pairsAsExpected
+-- -- | Clear the database, write key-value pairs to it using our library with key overwriting
+-- -- disallowed, and make sure an exception occurs iff we had a duplicate key in our pairs.
+-- -- Furthermore make sure that key-value pairs prior to a duplicate key are actually in the database.
+-- testWriteLMDB_2 :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
+-- testWriteLMDB_2 res = testProperty "writeLMDB_2" . monadicIO $ do
+--   (db, _) <- run res
+--   keyValuePairs <- arbitraryKeyValuePairs'
+--   run $ clearDatabase db
 
-arbitraryKeyValuePairs :: PropertyM IO [(ByteString, ByteString)]
-arbitraryKeyValuePairs =
-  map (\(ws1, ws2) -> (pack ws1, pack ws2))
-    . filter (\(ws1, _) -> not (null ws1)) -- LMDB does not allow empty keys.
-    <$> pick arbitrary
+--   chunkSz <- pick arbitrary
+--   unsafeFFI <- pick arbitrary
 
--- A variation that makes duplicate keys more likely.
-arbitraryKeyValuePairs' :: PropertyM IO [(ByteString, ByteString)]
-arbitraryKeyValuePairs' = do
-  arb <- arbitraryKeyValuePairs
+--   let fol' =
+--         writeLMDB db $
+--           defaultWriteOptions
+--             { writeTransactionSize = chunkSz,
+--               writeOverwriteOptions = OverwriteDisallow,
+--               writeUnsafeFFI = unsafeFFI
+--             }
+--   e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
+--   exceptionAsExpected <-
+--     case e of
+--       Left _ -> return $ hasDuplicateKeys keyValuePairs
+--       Right _ -> return . not $ hasDuplicateKeys keyValuePairs
+
+--   let keyValuePairsInDb = sort . prefixBeforeDuplicate $ keyValuePairs
+--   readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+--   let pairsAsExpected = keyValuePairsInDb == readPairsAll
+
+--   return $ exceptionAsExpected && pairsAsExpected
+
+-- -- | Clear the database, write key-value pairs to it using our library with key overwriting
+-- -- disallowed except when attempting to replace an existing key-value pair, and make sure an
+-- -- exception occurs iff we had a duplicate key with different values in our pairs. Furthermore make
+-- -- sure that key-value pairs prior to a such a duplicate key are actually in the database.
+-- testWriteLMDB_3 :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
+-- testWriteLMDB_3 res = testProperty "writeLMDB_3" . monadicIO $ do
+--   (db, _) <- run res
+--   keyValuePairs <- arbitraryKeyValuePairs'
+--   run $ clearDatabase db
+
+--   chunkSz <- pick arbitrary
+--   unsafeFFI <- pick arbitrary
+
+--   let fol' =
+--         writeLMDB db $
+--           defaultWriteOptions
+--             { writeTransactionSize = chunkSz,
+--               writeOverwriteOptions = OverwriteAllowSame,
+--               writeUnsafeFFI = unsafeFFI
+--             }
+--   e <- run $ try @SomeException $ (asyncBound (S.fold fol' (fromList keyValuePairs)) >>= wait)
+--   exceptionAsExpected <-
+--     case e of
+--       Left _ -> return $ hasDuplicateKeysWithDiffVals keyValuePairs
+--       Right _ -> return . not $ hasDuplicateKeysWithDiffVals keyValuePairs
+
+--   let keyValuePairsInDb =
+--         sort . removeDuplicateKeys . prefixBeforeDuplicateWithDiffVal $
+--           keyValuePairs
+--   readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+--   let pairsAsExpected = keyValuePairsInDb == readPairsAll
+
+--   return $ exceptionAsExpected && pairsAsExpected
+
+-- | A bytestring with a limited random length. (We don’t see much value in testing with longer
+-- bytestring.)
+newtype ShortBS = ShortBS ByteString deriving (Show)
+
+instance Arbitrary ShortBS where
+  arbitrary :: Gen ShortBS
+  arbitrary = do
+    len <- chooseInt (0, 50)
+    ShortBS . B.pack <$> vector len
+
+toByteStrings :: [(ShortBS, ShortBS)] -> [(ByteString, ByteString)]
+toByteStrings = map (\(ShortBS k, ShortBS v) -> (k, v))
+
+arbitraryKeyValuePairs :: Int -> PropertyM IO [(ShortBS, ShortBS)]
+arbitraryKeyValuePairs maxLen = do
+  len <- pick $ chooseInt (0, maxLen)
+  filter (\(ShortBS k, _) -> not $ B.null k) -- LMDB does not allow empty keys.
+    <$> pick (vector len)
+
+-- | A variation that makes duplicate keys more likely. (The idea is to generate more relevant data
+-- for testing writeLMDB with the various writeOverwriteOptions and writeFailureFold possibilities.)
+arbitraryKeyValuePairsDupsMoreLikely :: Int -> PropertyM IO [(ShortBS, ShortBS)]
+arbitraryKeyValuePairsDupsMoreLikely maxLen = do
+  arb <- arbitraryKeyValuePairs maxLen
   b <- pick arbitrary
   if not (null arb) && b
     then do
       let (k, v) = head arb
       b' <- pick arbitrary
-      v' <- if b' then return v else pack <$> pick arbitrary
-      i <- pick $ choose (negate $ length arb, 2 * length arb)
+      v' <- if b' then return v else pick arbitrary
+      i <- pick $ chooseInt (negate $ length arb, 2 * length arb)
       let (arb1, arb2) = splitAt i arb
       let arb' = arb1 ++ [(k, v')] ++ arb2
       return arb'
     else return arb
 
--- A variation that makes more likely keys with same the prefix and a difference of trailing zero
--- bytes.
-arbitraryKeyValuePairs'' :: PropertyM IO [(ByteString, ByteString)]
-arbitraryKeyValuePairs'' = do
-  arb <- arbitraryKeyValuePairs
+-- | A variation that makes more likely keys with the same prefix and a difference of trailing zero
+-- bytes. (The idea is to generate more relevant data for testing readLMDB with the various
+-- readDirection and readStart possibilities.)
+arbitraryKeyValuePairs'' :: Int -> PropertyM IO [(ShortBS, ShortBS)]
+arbitraryKeyValuePairs'' maxLen = do
+  arb <- arbitraryKeyValuePairs maxLen
   if null arb
     then return arb
     else
@@ -210,12 +290,13 @@ arbitraryKeyValuePairs'' = do
           [ (1, return arb),
             ( 3,
               do
-                let (k, v) = head arb
+                let (ShortBS k, v) = head arb
                 b' <- arbitrary
-                v' <- if b' then return v else pack <$> arbitrary
-                i <- choose (0, length arb - 1)
+                v' <- if b' then return v else arbitrary
+                i <- chooseInt (0, length arb - 1)
                 let (arb1, arb2) = splitAt i arb
-                let arb3 = map (\i' -> (k `B.append` B.replicate i' 0, v')) [1 .. (i + 1)]
+                j <- chooseInt (0, 100) -- Remains within the 512 default maximum LMDB key size.
+                let arb3 = map (\j' -> (ShortBS $ k `B.append` B.replicate j' 0, v')) [1 .. j]
                 let arb' = arb1 ++ arb3 ++ arb2
                 return arb'
             )
@@ -278,7 +359,7 @@ testBetween = testProperty "testBetween" $ \ws1 ws2 ->
              Just betw -> smaller < betw && betw < bigger
 
 betweenBs :: ByteString -> ByteString -> Maybe ByteString
-betweenBs bs1 bs2 = between (unpack bs1) (unpack bs2) [] >>= (return . pack)
+betweenBs bs1 bs2 = between (B.unpack bs1) (B.unpack bs2) [] >>= (return . B.pack)
 
 type PairsInDatabase = [(ByteString, ByteString)]
 
@@ -298,13 +379,13 @@ readOptionsAndResults pairsInDb = do
     else
       if len == 0
         then do
-          bs <- arbitrary >>= \(NonEmpty ws) -> return $ pack ws
+          bs <- arbitrary >>= \(NonEmpty ws) -> return $ B.pack ws
           return (ropts {readStart = Just bs}, [])
         else do
           idx <-
             if len < 3
-              then choose (0, len - 1)
-              else frequency [(1, choose (1, len - 2)), (3, elements [0, len - 1])]
+              then chooseInt (0, len - 1)
+              else frequency [(1, chooseInt (1, len - 2)), (3, elements [0, len - 1])]
           let keyAt i = fst $ pairsInDb !! i
           let nextKey
                 | idx + 1 <= len - 1 = betweenBs (keyAt idx) (keyAt $ idx + 1)
@@ -351,7 +432,8 @@ writeChunk (Database penv dbi) noOverwrite' keyValuePairs =
                   marshalOut k $ \k' -> marshalOut v $ \v' -> with k' $ \k'' -> with v' $ \v'' ->
                     mdb_put ptxn dbi k'' v'' flags
               )
-              (mdb_txn_commit ptxn) -- Make sure the key-value pairs we have so far are committed.
+              ( mdb_txn_commit ptxn -- Make sure the key-value pairs we have so far are committed.
+              )
             mdb_txn_commit ptxn
         )
         >>= wait
@@ -360,3 +442,7 @@ writeChunk (Database penv dbi) noOverwrite' keyValuePairs =
 marshalOut :: ByteString -> (MDB_val -> IO ()) -> IO ()
 marshalOut bs f =
   unsafeUseAsCStringLen bs $ \(ptr, len) -> f $ MDB_val (fromIntegral len) (castPtr ptr)
+
+assertMsg :: Monad m => String -> Bool -> PropertyM m ()
+assertMsg _ True = return ()
+assertMsg msg False = fail $ "Assert failed: " ++ msg
