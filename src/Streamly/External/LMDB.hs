@@ -39,6 +39,9 @@ module Streamly.External.LMDB
     clearDatabase,
     closeDatabase,
 
+    -- * Relationship between reading and writing
+    -- $readingWritingRelationship
+
     -- * Reading
     readLMDB,
     unsafeReadLMDB,
@@ -62,6 +65,7 @@ module Streamly.External.LMDB
     defaultWriteOptions,
     OverwriteOptions (..),
     WriteAppend (..),
+    WriteFailureFold,
     writeFailureThrow,
     writeFailureThrowDebug,
     writeFailureStop,
@@ -74,6 +78,7 @@ module Streamly.External.LMDB
 where
 
 import Control.Concurrent
+import Control.Concurrent.STM
 import Control.Exception.Safe
 import Control.Monad
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -170,15 +175,14 @@ openEnvironment path limits = do
   let maxDbs = maxDatabases limits in when (maxDbs /= 0) $ mdb_env_set_maxdbs penv maxDbs
   mdb_env_set_maxreaders penv (maxReaders limits)
 
-  mvars <-
-    if isReadOnlyEnvironment @mode
-      then return Nothing
-      else Just <$> ((,,) <$> newMVar (-1) <*> newEmptyMVar <*> newEmptyMVar)
+  mvars <- (,,,) <$> newTMVarIO 0 <*> newMVar (-1) <*> newEmptyMVar <*> newEmptyMVar
 
-  -- Always use MDB_NOTLS; this is crucial for Haskell applications. (See
-  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L615)
+  -- Always use MDB_NOTLS; this is crucial for Haskell applications; see
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L615
+  --
+  -- Always use MDB_NOLOCK; see comments in writeLMDB.
   let env = Environment penv mvars :: Mode mode => Environment mode
-      flags = mdb_notls : [mdb_rdonly | isReadOnlyEnvironment @mode]
+      flags = mdb_notls : mdb_nolock : [mdb_rdonly | isReadOnlyEnvironment @mode]
 
   let isNotDirectoryError :: LMDB_Error -> Bool
       isNotDirectoryError LMDB_Error {e_code = Left code}
@@ -217,7 +221,7 @@ closeEnvironment :: (Mode mode) => Channel -> Environment mode -> IO ()
 closeEnvironment chan (Environment penv _) =
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787
-  runOnChannel chan $
+  runOnChannel chan . mask_ $
     c_mdb_env_close penv
 
 -- | Gets a database with the given name. When creating a database (i.e., getting it for the first
@@ -236,17 +240,51 @@ closeEnvironment chan (Environment penv _) =
 getDatabase ::
   forall mode.
   (Mode mode) =>
-  Channel ->
   Environment mode ->
   Maybe String ->
   IO (Database mode)
-getDatabase chan env@(Environment penv _) name = runOnChannel chan $ do
-  -- Concurrency requirements:
+getDatabase env@(Environment penv mvars) name = mask_ $ do
+  -- This function will presumably be called relatively rarely; for simplicity we therefore imagine
+  -- for write serialization purposes that we’re always a writer (even though the mode could be
+  -- ReadOnly). This by itself also takes care of lower-level concurrency requirements mentioned at
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118
+  -- (without the need of a channel).
+  --
+  -- The MVar/TMVar logic is similar as in writeLMDB.
+  let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
+  writeCounter <- incrementWriteCounter writeCounterM
+  putMVar writeOwnerM $ WriteOwner writeCounter
+  let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
 
-  ptxn <- mdb_txn_begin penv nullPtr (combineOptions $ [mdb_rdonly | isReadOnlyEnvironment @mode])
-  dbi <- mdb_dbi_open ptxn name (combineOptions $ [mdb_create | not $ isReadOnlyEnvironment @mode])
-  mdb_txn_commit ptxn
+  numReadersReset <-
+    onException
+      (waitForZeroReaders numReadersT)
+      disclaimWriteOwnership
+
+  dbi <-
+    finally
+      ( do
+          ptxn <-
+            finally
+              ( mdb_txn_begin
+                  penv
+                  nullPtr
+                  (combineOptions $ [mdb_rdonly | isReadOnlyEnvironment @mode])
+              )
+              -- Re-allow readers.
+              numReadersReset
+
+          onException
+            ( mdb_dbi_open
+                ptxn
+                name
+                (combineOptions $ [mdb_create | not $ isReadOnlyEnvironment @mode])
+                <* mdb_txn_commit ptxn
+            )
+            (c_mdb_txn_abort ptxn)
+      )
+      disclaimWriteOwnership
+
   return $ Database env dbi
 
 -- | Closes the given database.
@@ -269,7 +307,7 @@ closeDatabase chan (Database (Environment penv _) dbi) =
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200
   -- TODO: Look more into the aforementioned limitation.
-  runOnChannel chan $
+  runOnChannel chan . mask_ $
     c_mdb_dbi_close penv dbi
 
 -- | Creates an unfold with which we can stream key-value pairs from the given database.
@@ -282,16 +320,13 @@ closeDatabase chan (Database (Environment penv _) dbi) =
 -- are not being garbage collected fast enough), consider precreating a transaction and cursor using
 -- 'beginReadOnlyTxn' and 'openCursor'.
 --
--- In any case, bear in mind at all times LMDB’s [caveats regarding long-lived
--- transactions](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L107).
---
 -- If you don’t want the overhead of intermediate @ByteString@s (on your way to your eventual data
 -- structures), use 'unsafeReadLMDB' instead.
 {-# INLINE readLMDB #-}
 readLMDB ::
   (MonadIO m, Mode mode) =>
   Database mode ->
-  Maybe (ReadOnlyTxn, Cursor) ->
+  Maybe (ReadOnlyTxn mode, Cursor) ->
   ReadOptions ->
   Unfold m Void (ByteString, ByteString)
 readLMDB db mtxncurs ropts = unsafeReadLMDB db mtxncurs ropts packCStringLen packCStringLen
@@ -307,12 +342,12 @@ readLMDB db mtxncurs ropts = unsafeReadLMDB db mtxncurs ropts packCStringLen pac
 unsafeReadLMDB ::
   (MonadIO m, Mode mode) =>
   Database mode ->
-  Maybe (ReadOnlyTxn, Cursor) ->
+  Maybe (ReadOnlyTxn mode, Cursor) ->
   ReadOptions ->
   (CStringLen -> IO k) ->
   (CStringLen -> IO v) ->
   Unfold m Void (k, v)
-unsafeReadLMDB (Database (Environment penv _) dbi) mtxncurs ropts kmap vmap =
+unsafeReadLMDB (Database (Environment penv mvars) dbi) mtxncurs ropts kmap vmap =
   let (firstOp, subsequentOp) = case (readDirection ropts, readStart ropts) of
         (Forward, Nothing) -> (mdb_first, mdb_next)
         (Forward, Just _) -> (mdb_set_range, mdb_next)
@@ -379,54 +414,87 @@ unsafeReadLMDB (Database (Environment penv _) dbi) mtxncurs ropts kmap vmap =
                   return Stop
           )
           ( \op -> do
-              (pcurs, pk, pv, ref) <- liftIO $
-                mask_ $ do
-                  (ptxn, pcurs) <- case mtxncurs of
-                    Nothing -> do
-                      ptxn <- txn_begin penv nullPtr mdb_rdonly
-                      pcurs <- cursor_open ptxn dbi
-                      return (ptxn, pcurs)
-                    Just (ReadOnlyTxn ptxn, Cursor pcurs) ->
-                      return (ptxn, pcurs)
-                  pk <- malloc
-                  pv <- malloc
+              let (numReadersT, _, _, _) = mvars
 
-                  _ <- case readStart ropts of
-                    Nothing -> return ()
-                    Just k -> unsafeUseAsCStringLen k $ \(kp, kl) ->
-                      poke pk (MDB_val (fromIntegral kl) kp)
+              (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
+                (ptxn, pcurs) <- case mtxncurs of
+                  Nothing -> do
+                    atomically $ do
+                      -- This is interruptible during brief moments just before and during the
+                      -- beginning of a write transaction. See comments about MDB_NOLOCK in
+                      -- writeLMDB.
+                      n <- takeTMVar numReadersT
+                      putTMVar numReadersT $ n + 1
 
-                  ref <- newIOFinalizer $ do
-                    free pv >> free pk
-                    when (isNothing mtxncurs) $
-                      -- With LMDB, there is ordinarily no need to commit read-only transactions.
-                      -- (The exception is when we want to make databases that were opened during
-                      -- the transaction available later, but that’s not applicable here.) We can
-                      -- therefore abort ptxn, both for failure (exceptions) and success.
-                      --
-                      -- Note furthermore that this should be sound in the face of async exceptions
-                      -- (where this finalizer could get called from a different thread) because
-                      -- LMDB with MDB_NOTLS allows for read-only transactions being used from
-                      -- multiple threads; see
-                      -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
-                      -- (This is also why we don’t need to bother with 'Channel' for reading.)
-                      cursor_close pcurs >> txn_abort ptxn
-                  return (pcurs, pk, pv, ref)
+                    ptxn <- txn_begin penv nullPtr mdb_rdonly
+                    pcurs <- cursor_open ptxn dbi
+                    return (ptxn, pcurs)
+                  Just (ReadOnlyTxn _ ptxn, Cursor pcurs) ->
+                    return (ptxn, pcurs)
+                pk <- malloc
+                pv <- malloc
+
+                _ <- case readStart ropts of
+                  Nothing -> return ()
+                  Just k -> unsafeUseAsCStringLen k $ \(kp, kl) ->
+                    poke pk (MDB_val (fromIntegral kl) kp)
+
+                ref <- newIOFinalizer . mask_ $ do
+                  free pv >> free pk
+                  when (isNothing mtxncurs) $ do
+                    -- With LMDB, there is ordinarily no need to commit read-only transactions. (The
+                    -- exception is when we want to make databases that were opened during the
+                    -- transaction available later, but that’s not applicable here.) We can
+                    -- therefore abort ptxn, both for failure (exceptions) and success.
+                    --
+                    -- Note furthermore that this should be sound in the face of async exceptions
+                    -- (where this finalizer could get called from a different thread) because LMDB
+                    -- with MDB_NOTLS allows for read-only transactions being used from multiple
+                    -- threads; see
+                    -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
+                    cursor_close pcurs >> txn_abort ptxn
+
+                    atomically $ do
+                      -- This should not be interruptible because we are, of course, finishing up a
+                      -- reader that is still known to exist.
+                      n <- takeTMVar numReadersT
+                      putTMVar numReadersT $ n - 1
+
+                return (pcurs, pk, pv, ref)
               return (op, pcurs, pk, pv, ref)
           )
 
-newtype ReadOnlyTxn = ReadOnlyTxn (Ptr MDB_txn)
+data ReadOnlyTxn mode = ReadOnlyTxn !(Environment mode) !(Ptr MDB_txn)
 
 -- | Begins an LMDB read-only transaction for use with 'readLMDB' or 'unsafeReadLMDB'. It is your
 -- responsibility to (a) use the transaction only on databases in the same environment, (b) make
 -- sure that those databases were already obtained before the transaction was begun, and (c) dispose
 -- of the transaction with 'abortReadOnlyTxn'.
-beginReadOnlyTxn :: Environment mode -> IO ReadOnlyTxn
-beginReadOnlyTxn (Environment penv _) = ReadOnlyTxn <$> mdb_txn_begin penv nullPtr mdb_rdonly
+beginReadOnlyTxn :: Environment mode -> IO (ReadOnlyTxn mode)
+beginReadOnlyTxn env@(Environment penv mvars) = mask_ $ do
+  let (numReadersT, _, _, _) = mvars
+
+  -- Similar comments for NumReaders as in unsafeReadLMDB.
+  atomically $ do
+    n <- takeTMVar numReadersT
+    putTMVar numReadersT $ n + 1
+
+  onException
+    (ReadOnlyTxn env <$> mdb_txn_begin penv nullPtr mdb_rdonly)
+    ( atomically $ do
+        n <- takeTMVar numReadersT
+        putTMVar numReadersT $ n - 1
+    )
 
 -- | Disposes of a read-only transaction created with 'beginReadOnlyTxn'.
-abortReadOnlyTxn :: ReadOnlyTxn -> IO ()
-abortReadOnlyTxn (ReadOnlyTxn ptxn) = c_mdb_txn_abort ptxn
+abortReadOnlyTxn :: ReadOnlyTxn mode -> IO ()
+abortReadOnlyTxn (ReadOnlyTxn (Environment _ mvars) ptxn) = mask_ $ do
+  let (numReadersT, _, _, _) = mvars
+  c_mdb_txn_abort ptxn
+  -- Similar comments for NumReaders as in unsafeReadLMDB.
+  atomically $ do
+    n <- takeTMVar numReadersT
+    putTMVar numReadersT $ n - 1
 
 newtype Cursor = Cursor (Ptr MDB_cursor)
 
@@ -436,8 +504,8 @@ newtype Cursor = Cursor (Ptr MDB_cursor)
 -- (b) make sure the provided database is within the environment on which the provided transaction
 -- was begun, and (c) dispose of the cursor with 'closeCursor' (logically before 'abortReadOnlyTxn',
 -- although the order doesn’t really matter for read-only transactions).
-openCursor :: ReadOnlyTxn -> Database mode -> IO Cursor
-openCursor (ReadOnlyTxn ptxn) (Database _ dbi) =
+openCursor :: ReadOnlyTxn mode -> Database mode -> IO Cursor
+openCursor (ReadOnlyTxn _ ptxn) (Database _ dbi) =
   Cursor <$> mdb_cursor_open ptxn dbi
 
 -- | Disposes of a cursor created with 'openCursor'.
@@ -485,7 +553,9 @@ data OverwriteOptions
 newtype WriteAppend = WriteAppend Bool deriving (Eq, Show)
 
 data WriteOptions a = WriteOptions
-  { -- | The number of key-value pairs per write transaction.
+  { -- | The number of key-value pairs per write transaction. When a write transaction of the
+    -- 'writeLMDB' completes, waiting write transactions of other concurrent 'writeLMDB's on the
+    -- same environment get a chance to begin.
     writeTransactionSize :: !Int,
     writeOverwriteOptions :: !OverwriteOptions,
     -- | Use @unsafe@ FFI calls under the hood. This can increase iteration speed, but one should
@@ -493,7 +563,7 @@ data WriteOptions a = WriteOptions
     -- impact on the performance of the rest of the program.
     writeUnsafeFFI :: !Bool,
     -- | A fold for handling unsuccessful writes.
-    writeFailureFold :: !(Fold IO (LMDB_Error, ByteString, ByteString) a),
+    writeFailureFold :: !(WriteFailureFold a),
     -- | If no activity occurs on the 'writeLMDB' for longer than this timeout (in microseconds),
     -- its transaction gets committed early (to give other concurrent 'writeLMDB's on the same
     -- environment a chance to get in).
@@ -502,7 +572,7 @@ data WriteOptions a = WriteOptions
 
 -- | By default, we use a write transaction size of 1 (one write transaction for each key-value
 -- pair), allow overwriting, don’t use unsafe FFI calls, use 'writeFailureThrow' as the failure
--- fold, and use a timeout of 100,000 microseconds (100 milliseconds).
+-- fold, and use a timeout of 10,000 microseconds (10 milliseconds).
 defaultWriteOptions :: WriteOptions ()
 defaultWriteOptions =
   WriteOptions
@@ -510,17 +580,20 @@ defaultWriteOptions =
       writeOverwriteOptions = OverwriteDisallow (WriteAppend False),
       writeUnsafeFFI = False,
       writeFailureFold = writeFailureThrow,
-      writeTimeout = 100_000
+      writeTimeout = 10_000
     }
 
+-- | A fold for handling unsuccessful writes.
+type WriteFailureFold a = Fold IO (LMDB_Error, ByteString, ByteString) a
+
 -- | Throw an exception upon write failure.
-writeFailureThrow :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureThrow :: WriteFailureFold ()
 writeFailureThrow =
   Fold (\() (e, _, _) -> throw e) (return $ Partial ()) (const $ return ())
 
 -- | Throw an exception upon write failure; and include the offending key-value pair in the
 -- exception’s description.
-writeFailureThrowDebug :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureThrowDebug :: WriteFailureFold ()
 writeFailureThrowDebug =
   Fold
     ( \() (e, k, v) ->
@@ -531,11 +604,11 @@ writeFailureThrowDebug =
     (const $ return ())
 
 -- | Gracefully stop upon write failure.
-writeFailureStop :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureStop :: WriteFailureFold ()
 writeFailureStop = void F.one
 
 -- | Ignore write failures.
-writeFailureIgnore :: Fold IO (LMDB_Error, ByteString, ByteString) ()
+writeFailureIgnore :: WriteFailureFold ()
 writeFailureIgnore = F.drain
 
 newtype StreamlyLMDBError = StreamlyLMDBError String deriving (Show)
@@ -553,11 +626,10 @@ instance Exception StreamlyLMDBError
 {-# INLINE writeLMDB #-}
 writeLMDB ::
   (MonadIO m) =>
-  Channel ->
   Database ReadWrite ->
   WriteOptions a ->
   Fold m (ByteString, ByteString) a
-writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
+writeLMDB (Database (Environment penv mvars) dbi) wopts =
   go (writeFailureFold wopts)
   where
     {-# INLINE go #-}
@@ -604,9 +676,9 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                     else return iter
 
                 -- We use the environment’s owner mvar to make sure only one write transaction is
-                -- active at a time, even when the same environment is used for multiple writeLMDB
-                -- (and other 'ReadWrite'-based functions such as 'clearDatabase'). For more on
-                -- LMDB’s low-level requirements about serial writes, see
+                -- active at a time, even when the same environment is used concurrently for
+                -- multiple writeLMDB (and other 'ReadWrite'-based functions such as
+                -- 'clearDatabase'). More on LMDB’s low-level requirements about serial writes:
                 -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L23.
                 --
                 -- This mvar mechanism allows us to write, into the same environment, incoming
@@ -615,24 +687,26 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                 -- another writeLMDB can fold into the same environment; we can have multiple
                 -- writeLMDB folds active on the same environment at the same time.)
                 --
-                -- (Note that the channel is not important for maintaining LMDB’s requirements about
-                -- serial writes; our mvar mechanism does that already.)
-
-                -- The channel is important for making sure the transaction commits that happen upon
+                -- We used MDB_NOLOCK for the environment to allow write transactions to cross
+                -- thread boundaries. This is necessary because transaction commits that happen upon
                 -- GC following an asynchronous exception (see (3)) and upon timeout (see (4))
-                -- happen on the /same bound thread/ as the other transaction FFI calls.
+                -- happen on a different thread from the other transaction FFI calls. For more on
+                -- the implications of this, see (5) and $readingWritingRelationship. (The only way
+                -- we see around MDB_NOLOCK is passing all writeLMDB FFI calls through a channel,
+                -- which would either be dead-slow or require chunking that reduces the streaming
+                -- nature of the library).
                 --
                 -- (For now, we use mask without restore assuming that the operations are quick
                 -- (e.g., because the user chose a reasonably small 'writeTransactionSize'). TODO:
                 -- Think about introducing mask restore where applicable.)
 
-                (_, owner, ownerData) <-
-                  maybe (throwErr "mvars expected in ReadWrite mode (step)") return mmvars
-                let disclaimOwnership = void . mask_ $ tryTakeMVar owner >> tryTakeMVar ownerData
+                let (numReadersT, _, writeOwnerM, writeOwnerDataM) = mvars
+                let disclaimWriteOwnership =
+                      void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
 
                 liftIO . withMVarMasked ownershipLock $ \() -> do
                   -- Check whether this writeLMDB still owns the environment.
-                  hasOwnership <- fromMaybe False <$> whenOwned owner counter (return True)
+                  hasOwnership <- fromMaybe False <$> whenOwned writeOwnerM counter (return True)
 
                   (chunkSz', mIoFinalizer') <-
                     if hasOwnership
@@ -649,15 +723,31 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                         -- here, another counter might already have claimed ownership.) (Note that
                         -- an async exception could trigger here despite the mask; this is not a
                         -- problem.)
-                        putMVar owner $ WriteOwner counter
+                        putMVar writeOwnerM $ WriteOwner counter
+
+                        -- (5) Due to MDB_NOLOCK, we have to make sure that no readers are active
+                        -- when a write transaction begins; see
+                        -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L619
+                        -- We assume that readers modify numReadersT only with takeTMVar followed by
+                        -- putTMVar, which implies that during the IO actions we perform until the
+                        -- next numReadersReset (i.e., the IO actions to begin the write
+                        -- transaction) there can be no modification of numReadersT.
+                        numReadersReset <-
+                          onException
+                            (waitForZeroReaders numReadersT)
+                            disclaimWriteOwnership
 
                         ptxn <-
-                          onException
-                            (runOnChannel chan $ txn_begin penv nullPtr 0)
-                            disclaimOwnership
+                          finally
+                            ( onException
+                                (txn_begin penv nullPtr 0)
+                                disclaimWriteOwnership
+                            )
+                            -- Re-allow readers.
+                            numReadersReset
 
                         beg <- getCurrentTime
-                        putMVar ownerData (WriteOwnerData {wPtxn = ptxn, wLastPairTime = beg})
+                        putMVar writeOwnerDataM (WriteOwnerData {wPtxn = ptxn, wLastPairTime = beg})
 
                         ioFinalizer' <-
                           newIOFinalizer $ do
@@ -669,17 +759,17 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                             -- To avoid an extraneous transaction commit after a commit (a C
                             -- double-free), we make sure we still have ownership.
                             withMVarMasked ownershipLock $ \() -> do
-                              ownerData' <- tryReadMVar ownerData
+                              ownerData' <- tryReadMVar writeOwnerDataM
                               case ownerData' of
                                 Nothing -> return ()
                                 Just (WriteOwnerData {wPtxn}) ->
-                                  void . whenOwned owner counter $
+                                  void . whenOwned writeOwnerM counter $
                                     -- We also disclaim ownership if the commit fails (and allow
                                     -- future transaction operations to presumably fail). TODO: Can
                                     -- we report the failure directly?
                                     finally
-                                      (runOnChannel chan $ txn_commit wPtxn)
-                                      disclaimOwnership
+                                      (txn_commit wPtxn)
+                                      disclaimWriteOwnership
 
                         -- (4). Spawn a separate thread that commits the transaction upon timeout.
                         -- (This gives other writeLMDB a chance to take over writing after a too
@@ -693,7 +783,7 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                                 threadDelay timeoutMicrosecs
 
                                 shouldStop <- withMVarMasked ownershipLock $ \() -> do
-                                  ownerData' <- tryReadMVar ownerData
+                                  ownerData' <- tryReadMVar writeOwnerDataM
                                   case ownerData' of
                                     Nothing ->
                                       -- No owner.
@@ -701,7 +791,7 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                                     Just (WriteOwnerData {wPtxn, wLastPairTime}) ->
                                       fromMaybe True
                                         <$> whenOwned
-                                          owner
+                                          writeOwnerM
                                           counter
                                           ( do
                                               t <- getCurrentTime
@@ -712,8 +802,8 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                                                   -- presumably fail). TODO: Can we report the
                                                   -- failure directly?
                                                   finally
-                                                    (runOnChannel chan $ txn_commit wPtxn)
-                                                    disclaimOwnership
+                                                    (txn_commit wPtxn)
+                                                    disclaimWriteOwnership
 
                                                   return True
                                                 else do
@@ -734,7 +824,7 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                   -- view (although it could have failed from LMDB’s point of view; see (1)), we get
                   -- a new chunk size. Otherwise, we get the LMDB exception.
                   ptxn <- do
-                    mvarContents' <- tryReadMVar ownerData
+                    mvarContents' <- tryReadMVar writeOwnerDataM
                     case mvarContents' of
                       Nothing -> throwErr "mvar expected"
                       Just (WriteOwnerData {wPtxn}) -> return wPtxn
@@ -742,8 +832,7 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                     unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
                       catch
                         ( do
-                            runOnChannel chan $
-                              put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags
+                            put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags
                             return . Right $ chunkSz' + 1
                         )
                         ( \(e :: LMDB_Error) ->
@@ -751,7 +840,7 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                             -- the error from LMDB was due to the exact same key-value pair already
                             -- existing in the database.
                             with (MDB_val (fromIntegral kl) kp) $ \pk -> alloca $ \pv -> do
-                              rc <- runOnChannel chan $ get ptxn dbi pk pv
+                              rc <- get ptxn dbi pk pv
                               if rc == 0
                                 then do
                                   v' <- peek pv
@@ -772,15 +861,15 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                   -- We consider an attempt to insert a key-value pair (whether or not chunkSz
                   -- increased) to be an engagement worthy of a baseline increase for the timeout.
                   t <- getCurrentTime
-                  modifyMVar_ ownerData (\mv -> return $ mv {wLastPairTime = t})
+                  modifyMVar_ writeOwnerDataM (\mv -> return $ mv {wLastPairTime = t})
 
                   case eChunkSz'' of
                     Right chunkSz'' -> do
                       -- If writeTransactionSize has been reached, commit and disclaim ownership.
                       when (chunkSz'' >= txnSize) $
                         finally
-                          (runOnChannel chan $ txn_commit ptxn)
-                          disclaimOwnership
+                          (txn_commit ptxn)
+                          disclaimWriteOwnership
 
                       return $
                         Partial
@@ -806,8 +895,8 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                             onException
                               (failStep s (e, k, v))
                               ( finally
-                                  (runOnChannel chan $ txn_commit ptxn)
-                                  disclaimOwnership
+                                  (txn_commit ptxn)
+                                  disclaimWriteOwnership
                               )
 
                           case fstep' of
@@ -815,8 +904,8 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                               -- (2) The failure fold completed with Done; complete the outer
                               -- writeLMDB fold with Done as well.
                               finally
-                                (runOnChannel chan $ txn_commit ptxn)
-                                disclaimOwnership
+                                (txn_commit ptxn)
+                                disclaimWriteOwnership
                               return $ Done a
                             Partial _ -> do
                               -- The failure fold did not request completion; continue the outer
@@ -835,12 +924,8 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
             ( do
                 threadId <- liftIO myThreadId
 
-                chanBound <- liftIO $ runOnChannel chan isCurrentThreadBound
-                unless chanBound (throwErr "channel not running on a bound thread")
-
-                (counter', _, _) <-
-                  maybe (throwErr "mvars expected in ReadWrite mode (init)") return mmvars
-                counter <- liftIO $ incrementWriteCounter counter'
+                let (_, writeCounterM, _, _) = mvars
+                counter <- liftIO $ incrementWriteCounter writeCounterM
 
                 -- Avoids conflicts between the main writeLMDB thread, the GC thread (see (3)), and
                 -- the timeout thread (see (4)).
@@ -871,19 +956,19 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                 when (threadId' /= threadId) $
                   throwErr "veered off the original thread at the end"
 
-                (_, owner, ownerData) <-
-                  maybe (throwErr "mvars expected in ReadWrite mode (extract)") return mmvars
-                let disclaimOwnership = void . mask_ $ tryTakeMVar owner >> tryTakeMVar ownerData
+                let (_, _, writeOwnerM, writeOwnerDataM) = mvars
+                let disclaimWriteOwnership =
+                      void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
 
                 withMVarMasked ownershipLock $ \() -> do
-                  void $ whenOwned owner counter $ do
-                    ownerData' <- tryReadMVar ownerData
+                  void $ whenOwned writeOwnerM counter $ do
+                    ownerData' <- tryReadMVar writeOwnerDataM
                     case ownerData' of
                       Nothing -> throwErr "ownerData expected (extract)"
                       Just (WriteOwnerData {wPtxn}) ->
                         finally
-                          (runOnChannel chan $ txn_commit wPtxn)
-                          disclaimOwnership
+                          (txn_commit wPtxn)
+                          disclaimWriteOwnership
 
                   case fstep of
                     Done _ ->
@@ -894,28 +979,38 @@ writeLMDB chan (Database (Environment penv mmvars) dbi) wopts =
                       failExtract s
             )
 
--- | Clears, i.e., removes all key-value pairs from, the given database.
-clearDatabase :: Channel -> Database ReadWrite -> IO ()
-clearDatabase chan (Database (Environment penv mmvars) dbi) = do
-  let throwErr = throwError "clearDatabase"
-  (counter', owner, ownerData) <- maybe (throwErr "mvars expected in ReadWrite mode") return mmvars
-  counter <- incrementWriteCounter counter'
+-- | Clears, i.e., removes all key-value pairs from, the given database. Please note that other
+-- write transactions block until this operation completes.
+clearDatabase :: Database ReadWrite -> IO ()
+clearDatabase (Database (Environment penv mvars) dbi) = mask $ \restore -> do
+  -- The MVar/TMVar logic is similar as in writeLMDB.
+  let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
+  writeCounter <- incrementWriteCounter writeCounterM
+  putMVar writeOwnerM $ WriteOwner writeCounter
+  let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
 
-  chanBound <- liftIO $ runOnChannel chan isCurrentThreadBound
-  unless chanBound (throwErr "channel not running on a bound thread")
+  numReadersReset <-
+    onException
+      (waitForZeroReaders numReadersT)
+      disclaimWriteOwnership
 
-  mask $ \restore -> do
-    -- Wait for the owner to become empty. (The logic is similar as in 'writeLMDB'.)
-    putMVar owner $ WriteOwner counter
+  finally
+    ( do
+        ptxn <-
+          finally
+            (mdb_txn_begin penv nullPtr 0)
+            -- Re-allow readers.
+            numReadersReset
 
-    let disclaimOwnership = void . mask_ $ tryTakeMVar owner >> tryTakeMVar ownerData
-    finally
-      ( runOnChannel chan . restore $ do
-          ptxn <- mdb_txn_begin penv nullPtr 0
-          mdb_clear ptxn dbi
-          mdb_txn_commit ptxn
-      )
-      disclaimOwnership
+        onException
+          -- Unmask a potentially long-running operation.
+          ( restore $ do
+              mdb_clear ptxn dbi
+              mdb_txn_commit ptxn
+          )
+          (c_mdb_txn_abort ptxn) -- TODO: Check if abort could be long-running.
+    )
+    disclaimWriteOwnership
 
 -- | Executes the given IO action when the given counter matches with the WriteOwner.
 whenOwned :: MVar WriteOwner -> WriteCounter -> IO a -> IO (Maybe a)
@@ -934,3 +1029,30 @@ incrementWriteCounter counter = do
         let c' = c + 1
         return (c', c')
     )
+
+-- Due to MDB_NOLOCK, this is needed before beginning read-write transactions. The caller should
+-- wrap this with onException to handle async exception that could happen during STM retry
+-- (regardless of masking).
+waitForZeroReaders :: TMVar NumReaders -> IO (IO ())
+waitForZeroReaders numReadersT = do
+  let throwErr = throwError "waitForZeroReaders"
+  let numReadersReset = atomically $ putTMVar numReadersT 0
+  numReaders <-
+    atomically $ do
+      numReaders <- takeTMVar numReadersT
+      check $ numReaders <= 0 -- Sanity check: use <=0 to catch unexpected negative readers.
+      return numReaders
+  when (numReaders /= 0) $ throwErr "zero numReaders expected"
+  return numReadersReset
+
+-- $readingWritingRelationship
+--
+-- Please note that read-write transactions in this library (e.g., due to 'writeLMDB' and
+-- 'clearDatabase') wait until existing read-only transactions (e.g., due to 'readLMDB' and
+-- 'beginReadOnlyTxn') on the same environment complete. (On the other hand, read-only transactions
+-- can begin while a read-write transaction is active on the same environment.)
+--
+-- (This is required because we use @MDB_NOLOCK@ under the hood for certain low-level reasons. We do
+-- not consider this is a serious limitation because long-lived transactions are [discouraged by
+-- LMDB](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L107)
+-- in any case.)

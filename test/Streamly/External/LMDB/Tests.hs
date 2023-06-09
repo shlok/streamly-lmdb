@@ -23,7 +23,6 @@ import qualified Streamly.Data.Fold as F
 import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
 import qualified Streamly.Data.Stream.Prelude as S
 import Streamly.External.LMDB
-import Streamly.External.LMDB.Channel
 import Streamly.External.LMDB.Internal
 import Streamly.External.LMDB.Internal.Foreign
 import qualified Streamly.Internal.Data.Fold as F
@@ -33,7 +32,7 @@ import Test.Tasty (TestTree)
 import Test.Tasty.QuickCheck
 import Text.Printf
 
-tests :: IO (Database ReadWrite, Environment ReadWrite, Channel) -> [TestTree]
+tests :: IO (Database ReadWrite, Environment ReadWrite) -> [TestTree]
 tests res =
   [ testReadLMDB res,
     testUnsafeReadLMDB res
@@ -65,7 +64,7 @@ withReadOnlyTxnAndCurs ::
   (Mode mode) =>
   Environment mode ->
   Database mode ->
-  ((ReadOnlyTxn, Cursor) -> IO r) ->
+  ((ReadOnlyTxn mode, Cursor) -> IO r) ->
   IO r
 withReadOnlyTxnAndCurs env db =
   bracket
@@ -74,11 +73,11 @@ withReadOnlyTxnAndCurs env db =
 
 -- | Clear the database, write key-value pairs to it in a normal manner, read
 -- them back using our library, and make sure the result is what we wrote.
-testReadLMDB :: IO (Database ReadWrite, Environment ReadWrite, Channel) -> TestTree
+testReadLMDB :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
 testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
-  (db, env, chan) <- run res
+  (db, env) <- run res
   keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
-  run $ clearDatabase chan db
+  run $ clearDatabase db
 
   run $ writeChunk db False keyValuePairs
   let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
@@ -91,11 +90,11 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
   return $ results == expectedResults && resultsTxn == expectedResults
 
 -- | Similar to 'testReadLMDB', except that it tests the unsafe function in a different manner.
-testUnsafeReadLMDB :: IO (Database ReadWrite, Environment ReadWrite, Channel) -> TestTree
+testUnsafeReadLMDB :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
 testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
-  (db, env, chan) <- run res
+  (db, env) <- run res
   keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
-  run $ clearDatabase chan db
+  run $ clearDatabase db
 
   run $ writeChunk db False keyValuePairs
   let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
@@ -118,13 +117,13 @@ data FailureFold = FailureThrow | FailureStop | FailureIgnore deriving (Show)
 testWriteLMDB ::
   OverwriteOptions ->
   FailureFold ->
-  IO (Database ReadWrite, Environment ReadWrite, Channel) ->
+  IO (Database ReadWrite, Environment ReadWrite) ->
   TestTree
 testWriteLMDB overwriteOpts failureFold res =
   testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold)) . monadicIO $
     do
-      (db, _, chan) <- run res
-      run $ clearDatabase chan db
+      (db, _) <- run res
+      run $ clearDatabase db
 
       -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
       -- normally result in bad performance. We therefore base the number of pairs on the chunk
@@ -139,7 +138,7 @@ testWriteLMDB overwriteOpts failureFold res =
             FailureIgnore -> writeFailureIgnore
 
       let fol' =
-            writeLMDB chan db $
+            writeLMDB db $
               defaultWriteOptions
                 { writeTransactionSize = chunkSz,
                   writeOverwriteOptions = overwriteOpts,
@@ -230,13 +229,13 @@ testWriteLMDB overwriteOpts failureFold res =
 -- expected.
 testWriteLMDBToList ::
   OverwriteOptions ->
-  IO (Database ReadWrite, Environment ReadWrite, Channel) ->
+  IO (Database ReadWrite, Environment ReadWrite) ->
   TestTree
 testWriteLMDBToList overwriteOpts res =
   testProperty (printf "writeLMDBToList (%s)" (show overwriteOpts)) . monadicIO $
     do
-      (db, _, chan) <- run res
-      run $ clearDatabase chan db
+      (db, _) <- run res
+      run $ clearDatabase db
 
       -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
       -- normally result in bad performance. We therefore base the number of pairs on the chunk
@@ -246,7 +245,7 @@ testWriteLMDBToList overwriteOpts res =
       unsafeFFI <- pick arbitrary
 
       let fol' =
-            writeLMDB chan db $
+            writeLMDB db $
               defaultWriteOptions
                 { writeTransactionSize = chunkSz,
                   writeOverwriteOptions = overwriteOpts,
@@ -296,13 +295,13 @@ testWriteLMDBToList overwriteOpts res =
 -- from the database using our library (already covered by 'testReadLMDB'), and make sure they are
 -- as expected.
 testWriteLMDBConcurrent ::
-  IO (Database ReadWrite, Environment ReadWrite, Channel) ->
+  IO (Database ReadWrite, Environment ReadWrite) ->
   TestTree
 testWriteLMDBConcurrent res =
   testProperty "testWriteLMDBConcurrent" . monadicIO $
     do
-      (db, _, chan) <- run res
-      run $ clearDatabase chan db
+      (db, _) <- run res
+      run $ clearDatabase db
 
       -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than
       -- the chunk size on some threads but less than the chunk size on other threads. Our test
@@ -353,18 +352,11 @@ testWriteLMDBConcurrent res =
             )
           & S.fold F.toList
 
-      -- Use a random number of channels.
-      numChans <- pick $ chooseInt (1, numThreads)
-      chans <- run $ replicateM numChans $ do
-        c <- createChannel defaultChannelOptions
-        startChannel c
-        return c
-
       run $
-        forConcurrently_ (zip pairss $ cycle chans) $
-          \((threadIdx, pairs, failureFold, unsafeFFI), chan') -> do
+        forConcurrently_ pairss $
+          \(threadIdx, pairs, failureFold, unsafeFFI) -> do
             let fol =
-                  writeLMDB @IO chan' db $
+                  writeLMDB @IO db $
                     defaultWriteOptions
                       { writeTransactionSize = chunkSz,
                         writeOverwriteOptions = OverwriteAllow,

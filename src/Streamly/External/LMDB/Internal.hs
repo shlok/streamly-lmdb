@@ -3,6 +3,7 @@
 module Streamly.External.LMDB.Internal where
 
 import Control.Concurrent
+import Control.Concurrent.STM
 import Data.Time.Clock
 import Foreign
 import Streamly.External.LMDB.Internal.Foreign
@@ -23,18 +24,20 @@ instance Mode ReadOnly where isReadOnlyMode _ = True
 data Environment mode
   = Environment
       !(Ptr MDB_env)
-      -- 'Just' for 'ReadWrite' (for use with the various 'ReadWrite'-based functions); 'Nothing'
-      -- for 'ReadOnly'.
-      !(Maybe (MVar WriteCounter, MVar WriteOwner, MVar WriteOwnerData))
+      !(TMVar NumReaders, MVar WriteCounter, MVar WriteOwner, MVar WriteOwnerData)
 
--- An increasing counter for the various 'ReadWrite'-based functions using the same environment.
-newtype WriteCounter = WriteCounter Int deriving (Bounded, Eq, Num, Ord)
+-- The number of current readers. This needs to be kept track of due to MDB_NOLOCK; see comments in
+-- writeLMDB.
+newtype NumReaders = NumReaders Int deriving (Eq, Num, Ord)
 
--- The counter that currently owns the environment.
+-- An increasing counter for various write-related functions using the same environment.
+newtype WriteCounter = WriterCounter Int deriving (Bounded, Eq, Num, Ord)
+
+-- The counter that currently owns the environment when it comes to writing.
 newtype WriteOwner = WriteOwner WriteCounter
 
--- Various data that the current owner keeps track of. (This needs to be separate from 'WriteOwner'
--- because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
+-- Various data that the current 'WriteOwner' keeps track of. (This needs to be separate from
+-- 'WriteOwner' because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
 data WriteOwnerData = WriteOwnerData
   { wPtxn :: !(Ptr MDB_txn),
     wLastPairTime :: !UTCTime

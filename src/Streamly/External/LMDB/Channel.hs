@@ -15,8 +15,8 @@ import Control.Concurrent (forkOS)
 import Control.Monad
 import qualified Streamly.External.LMDB.Internal.Channel as I
 
--- | A channel for use with the write-related functionality in this library. (This is needed to
--- maintain certain low-level LMDB requirements.)
+-- | A channel for use with certain functionality in this library. (This is needed to maintain
+-- certain low-level LMDB requirements.)
 --
 -- We suggest simply creating a single channel (e.g., in @main@) and reusing it for the remainder of
 -- the program’s execution:
@@ -27,7 +27,7 @@ import qualified Streamly.External.LMDB.Internal.Channel as I
 -- @
 --
 -- You are however welcome to create more channels, as long as you heed the documented caveats that
--- may accompany some of the write-related functions.
+-- may accompany some of the functions.
 type Channel = I.Channel
 
 newtype ChannelOptions = ChannelOptions
