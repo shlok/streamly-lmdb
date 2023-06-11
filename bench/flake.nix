@@ -29,7 +29,12 @@
                           final.haskell.lib.compose.addBuildDepends
                           [final.pkgs.lmdb]
                           (hfinal.callCabal2nix "streamly-lmdb" ../. {
-                            streamly = hfinal.streamly_0_9_0;
+                            streamly = hprev.streamly_0_9_0.overrideAttrs (old: {
+                              buildInputs =
+                                if system == "x86_64-darwin"
+                                  then [final.pkgs.darwin.apple_sdk.frameworks.Cocoa]
+                                  else [];
+                            });
                           });
                       });
                 };
