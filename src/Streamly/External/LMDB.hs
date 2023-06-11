@@ -85,7 +85,6 @@ import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString, packCStringLen)
 import Data.ByteString.Unsafe (unsafePackCStringLen, unsafeUseAsCStringLen)
 import Data.Maybe
-import Data.Time.Clock
 import Data.Void (Void)
 import Foreign (Ptr, alloca, free, malloc, nullPtr, peek)
 import Foreign.C (Errno (Errno), eNOTDIR)
@@ -563,24 +562,19 @@ data WriteOptions a = WriteOptions
     -- impact on the performance of the rest of the program.
     writeUnsafeFFI :: !Bool,
     -- | A fold for handling unsuccessful writes.
-    writeFailureFold :: !(WriteFailureFold a),
-    -- | If no activity occurs on the 'writeLMDB' for longer than this timeout (in microseconds),
-    -- its transaction gets committed early (to give other concurrent 'writeLMDB's on the same
-    -- environment a chance to get in).
-    writeTimeout :: !Int
+    writeFailureFold :: !(WriteFailureFold a)
   }
 
 -- | By default, we use a write transaction size of 1 (one write transaction for each key-value
--- pair), allow overwriting, don’t use unsafe FFI calls, use 'writeFailureThrow' as the failure
--- fold, and use a timeout of 10,000 microseconds (10 milliseconds).
+-- pair), allow overwriting, don’t use unsafe FFI calls, and use 'writeFailureThrow' as the failure
+-- fold.
 defaultWriteOptions :: WriteOptions ()
 defaultWriteOptions =
   WriteOptions
     { writeTransactionSize = 1,
       writeOverwriteOptions = OverwriteDisallow (WriteAppend False),
       writeUnsafeFFI = False,
-      writeFailureFold = writeFailureThrow,
-      writeTimeout = 10_000
+      writeFailureFold = writeFailureThrow
     }
 
 -- | A fold for handling unsuccessful writes.
@@ -689,12 +683,11 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                 --
                 -- We used MDB_NOLOCK for the environment to allow write transactions to cross
                 -- thread boundaries. This is necessary because transaction commits that happen upon
-                -- GC following an asynchronous exception (see (3)) and upon timeout (see (4))
-                -- happen on a different thread from the other transaction FFI calls. For more on
-                -- the implications of this, see (5) and $readingWritingRelationship. (The only way
-                -- we see around MDB_NOLOCK is passing all writeLMDB FFI calls through a channel,
-                -- which would either be dead-slow or require chunking that reduces the streaming
-                -- nature of the library).
+                -- GC following an asynchronous exception (see (3)) happen on a different thread
+                -- from the other transaction FFI calls. For more on the implications of this, see
+                -- (4) and $readingWritingRelationship. (The only way we see around MDB_NOLOCK is
+                -- passing all writeLMDB FFI calls through a channel, which would either be
+                -- dead-slow or require chunking that reduces the streaming nature of the library).
                 --
                 -- (For now, we use mask without restore assuming that the operations are quick
                 -- (e.g., because the user chose a reasonably small 'writeTransactionSize'). TODO:
@@ -711,8 +704,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                   (chunkSz', mIoFinalizer') <-
                     if hasOwnership
                       then -- The environment is still owned by this writeLMDB. The same IOFinalizer
-                      -- (and timeout loop) is in effect. We continue writing to the same
-                      -- transaction.
+                      -- is in effect. We continue writing to the same transaction.
                       do
                         return (chunkSz, mIoFinalizer)
                       else do
@@ -725,7 +717,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                         -- problem.)
                         putMVar writeOwnerM $ WriteOwner counter
 
-                        -- (5) Due to MDB_NOLOCK, we have to make sure that no readers are active
+                        -- (4) Due to MDB_NOLOCK, we have to make sure that no readers are active
                         -- when a write transaction begins; see
                         -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L619
                         -- We assume that readers modify numReadersT only with takeTMVar followed by
@@ -746,8 +738,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                             -- Re-allow readers.
                             numReadersReset
 
-                        beg <- getCurrentTime
-                        putMVar writeOwnerDataM (WriteOwnerData {wPtxn = ptxn, wLastPairTime = beg})
+                        putMVar writeOwnerDataM (WriteOwnerData {wPtxn = ptxn})
 
                         ioFinalizer' <-
                           newIOFinalizer $ do
@@ -771,53 +762,13 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                                       (txn_commit wPtxn)
                                       disclaimWriteOwnership
 
-                        -- (4). Spawn a separate thread that commits the transaction upon timeout.
-                        -- (This gives other writeLMDB a chance to take over writing after a too
-                        -- long inactivity on the current writeLMDB.) TODO: Try stopping the thread
-                        -- as early as possible by capturing the returned threadId and calling
-                        -- throwTo as appropriate.
-                        _ <-
-                          let go' = do
-                                let timeoutMicrosecs = writeTimeout wopts
-                                    timeSecs = fromIntegral timeoutMicrosecs / 1_000_000
-                                threadDelay timeoutMicrosecs
 
-                                shouldStop <- withMVarMasked ownershipLock $ \() -> do
-                                  ownerData' <- tryReadMVar writeOwnerDataM
-                                  case ownerData' of
-                                    Nothing ->
-                                      -- No owner.
-                                      return True
-                                    Just (WriteOwnerData {wPtxn, wLastPairTime}) ->
-                                      fromMaybe True
-                                        <$> whenOwned
-                                          writeOwnerM
-                                          counter
-                                          ( do
-                                              t <- getCurrentTime
-                                              if diffUTCTime t wLastPairTime > timeSecs
-                                                then do
-                                                  -- We also disclaim ownership if the commit fails
-                                                  -- (and allow future transaction operations to
-                                                  -- presumably fail). TODO: Can we report the
-                                                  -- failure directly?
-                                                  finally
-                                                    (txn_commit wPtxn)
-                                                    disclaimWriteOwnership
-
-                                                  return True
-                                                else do
-                                                  return False
-                                          )
-
-                                unless shouldStop go'
-                           in forkIO go'
 
                         return (0, Just ioFinalizer')
 
                   -- Note: We commit and disclaim ownership upon synchronous exceptions and success
-                  -- because this should be done as early as possible. (Although the GC finalizer or
-                  -- timeout loop would eventually get to it, this might be unexpectedly late from
+                  -- because this should be done as early as possible. (Although the GC finalizer
+                  -- would eventually get to it, this might be unexpectedly late from
                   -- the client’s point of view.)
 
                   -- Insert the incoming key-value pair. If the insert succeeds from our point of
@@ -857,11 +808,6 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                                 else do
                                   return $ Left e
                         )
-
-                  -- We consider an attempt to insert a key-value pair (whether or not chunkSz
-                  -- increased) to be an engagement worthy of a baseline increase for the timeout.
-                  t <- getCurrentTime
-                  modifyMVar_ writeOwnerDataM (\mv -> return $ mv {wLastPairTime = t})
 
                   case eChunkSz'' of
                     Right chunkSz'' -> do
@@ -927,8 +873,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                 let (_, writeCounterM, _, _) = mvars
                 counter <- liftIO $ incrementWriteCounter writeCounterM
 
-                -- Avoids conflicts between the main writeLMDB thread, the GC thread (see (3)), and
-                -- the timeout thread (see (4)).
+                -- Avoids conflicts between the main writeLMDB thread and the GC thread (see (3)).
                 ownershipLock <- liftIO $ newMVar ()
 
                 fstep <- liftIO failInit
