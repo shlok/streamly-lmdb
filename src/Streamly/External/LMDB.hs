@@ -70,6 +70,7 @@ module Streamly.External.LMDB
     writeFailureThrowDebug,
     writeFailureStop,
     writeFailureIgnore,
+    waitWriters,
 
     -- * Error types
     LMDB_Error (..),
@@ -103,6 +104,7 @@ import Streamly.Internal.Data.IOFinalizer
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
 import Streamly.Internal.Data.Unfold (lmap)
 import Streamly.Internal.Data.Unfold.Type (Unfold (Unfold))
+import System.Mem
 import Text.Printf
 
 isReadOnlyEnvironment :: forall mode. (Mode mode) => Bool
@@ -234,9 +236,6 @@ closeEnvironment chan (Environment penv _) =
 -- the environment’s limits should have been adjusted accordingly. The unnamed database will in this
 -- case contain the names of the named databases as keys, which one is allowed to read but not
 -- write.
---
--- To satisfy certain low-level LMDB requirements, please use the same 'Channel' for all calls to
--- this function.
 getDatabase ::
   forall mode.
   (Mode mode) =>
@@ -254,7 +253,7 @@ getDatabase env@(Environment penv mvars) name = mask_ $ do
   let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
   writeCounter <- incrementWriteCounter writeCounterM
   putMVar writeOwnerM $ WriteOwner writeCounter
-  let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
+  let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
 
   numReadersReset <-
     onException
@@ -296,11 +295,9 @@ getDatabase env@(Environment penv mvars) name = mask_ $ do
 -- To satisfy certain low-level LMDB requirements:
 --
 -- * Please use the same 'Channel' for all calls to this function.
--- * Before calling this function, make sure all write transactions that have modified the database
---   have already been committed or aborted. (An unfortunate current state of affairs: If
---   'writeLMDB' encounters an asynchronous exception, an internal finalizer commits/aborts the
---   active transaction upon garbage collection. It should be possible to manually trigger garbage
---   collection and wait a long enough time (e.g., 100 microseconds) for the finalizer to execute.)
+-- * Before calling this function, make sure all read-write transactions that have modified the
+--   database have already been committed or aborted. (See the 'writeLMDB' documentation on how to
+--   handle asynchronous exceptions.)
 -- * After calling this function, do not use the database or any of its cursors again.
 closeDatabase :: (Mode mode) => Channel -> Database mode -> IO ()
 closeDatabase chan (Database (Environment penv _) dbi) =
@@ -421,7 +418,7 @@ unsafeReadLMDB (Database (Environment penv mvars) dbi) mtxncurs ropts kmap vmap 
                   Nothing -> do
                     atomically $ do
                       -- This is interruptible during brief moments just before and during the
-                      -- beginning of a write transaction. See comments about MDB_NOLOCK in
+                      -- beginning of a read-write transaction. See comments about MDB_NOLOCK in
                       -- writeLMDB.
                       n <- takeTMVar numReadersT
                       putTMVar numReadersT $ n + 1
@@ -553,9 +550,9 @@ data OverwriteOptions
 newtype WriteAppend = WriteAppend Bool deriving (Eq, Show)
 
 data WriteOptions a = WriteOptions
-  { -- | The number of key-value pairs per write transaction. When a write transaction of the
-    -- 'writeLMDB' completes, waiting write transactions of other concurrent 'writeLMDB's on the
-    -- same environment get a chance to begin.
+  { -- | The number of key-value pairs per read-write transaction. When a read-write transaction of
+    -- the 'writeLMDB' completes, waiting read-write transactions of other concurrent 'writeLMDB's
+    -- on the same environment can begin (in FIFO order).
     writeTransactionSize :: !Int,
     writeOverwriteOptions :: !OverwriteOptions,
     -- | Use @unsafe@ FFI calls under the hood. This can increase iteration speed, but one should
@@ -566,9 +563,9 @@ data WriteOptions a = WriteOptions
     writeFailureFold :: !(WriteFailureFold a)
   }
 
--- | By default, we use a write transaction size of 1 (one write transaction for each key-value
--- pair), allow overwriting, don’t use unsafe FFI calls, and use 'writeFailureThrow' as the failure
--- fold.
+-- | By default, we use a read-write transaction size of 1 (one read-write transaction for each
+-- key-value pair), allow overwriting, don’t use unsafe FFI calls, and use 'writeFailureThrow' as
+-- the failure fold.
 defaultWriteOptions :: WriteOptions ()
 defaultWriteOptions =
   WriteOptions
@@ -618,6 +615,10 @@ instance Exception StreamlyLMDBError
 -- Please specify a suitable transaction size in the write options; the default of 1 (one write
 -- transaction for each key-value pair) could yield suboptimal performance. One could try, e.g., 100
 -- KB chunks and benchmark from there.
+--
+-- If 'writeLMDB' encounters an asynchronous exception, an internal finalizer commits the active
+-- transaction upon garbage collection. To handle this in a timely fashion, consider using
+-- 'waitWriters'.
 {-# INLINE writeLMDB #-}
 writeLMDB ::
   (MonadIO m) =>
@@ -670,8 +671,8 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                       return $ iter + 1
                     else return iter
 
-                -- We use the environment’s owner mvar to make sure only one write transaction is
-                -- active at a time, even when the same environment is used concurrently for
+                -- We use the environment’s owner mvar to make sure only one read-write transaction
+                -- is active at a time, even when the same environment is used concurrently for
                 -- multiple writeLMDB (and other 'ReadWrite'-based functions such as
                 -- 'clearDatabase'). More on LMDB’s low-level requirements about serial writes:
                 -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L23.
@@ -682,7 +683,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                 -- another writeLMDB can fold into the same environment; we can have multiple
                 -- writeLMDB folds active on the same environment at the same time.)
                 --
-                -- We used MDB_NOLOCK for the environment to allow write transactions to cross
+                -- We used MDB_NOLOCK for the environment to allow read-write transactions to cross
                 -- thread boundaries. This is necessary because transaction commits that happen upon
                 -- GC following an asynchronous exception (see (3)) happen on a different thread
                 -- from the other transaction FFI calls. For more on the implications of this, see
@@ -696,7 +697,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
 
                 let (numReadersT, _, writeOwnerM, writeOwnerDataM) = mvars
                 let disclaimWriteOwnership =
-                      void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
+                      void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
 
                 -- Check whether this writeLMDB still owns the environment.
                 hasOwnership <- fromMaybe False <$> whenOwned writeOwnerM counter (return True)
@@ -717,12 +718,12 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                       putMVar writeOwnerM $ WriteOwner counter
 
                       -- (4) Due to MDB_NOLOCK, we have to make sure that no readers are active when
-                      -- a write transaction begins; see
+                      -- a read-write transaction begins; see
                       -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L619
                       -- We assume that readers modify numReadersT only with takeTMVar followed by
                       -- putTMVar, which implies that during the IO actions we perform until the
-                      -- next numReadersReset (i.e., the IO actions to begin the write transaction)
-                      -- there can be no modification of numReadersT.
+                      -- next numReadersReset (i.e., the IO actions to begin the read-write
+                      -- transaction) there can be no modification of numReadersT.
                       numReadersReset <-
                         onException
                           (waitForZeroReaders numReadersT)
@@ -894,15 +895,28 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                     failExtract s
             )
 
+-- | Waits for the active and queued read-write transactions on the given environment to finish.
+-- Note: This triggers garbage collection.
+waitWriters :: Environment ReadWrite -> IO ()
+waitWriters (Environment _ mvars) = do
+  let (_, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
+  writeCounter <- incrementWriteCounter writeCounterM
+  performGC
+  mask_ $ do
+    putMVar writeOwnerM $ WriteOwner writeCounter
+    let disclaimWriteOwnership =
+          void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
+    disclaimWriteOwnership
+
 -- | Clears, i.e., removes all key-value pairs from, the given database. Please note that other
--- write transactions block until this operation completes.
+-- read-write transactions wait until this operation completes.
 clearDatabase :: Database ReadWrite -> IO ()
 clearDatabase (Database (Environment penv mvars) dbi) = mask $ \restore -> do
   -- The MVar/TMVar logic is similar as in writeLMDB.
   let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
   writeCounter <- incrementWriteCounter writeCounterM
   putMVar writeOwnerM $ WriteOwner writeCounter
-  let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
+  let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
 
   numReadersReset <-
     onException

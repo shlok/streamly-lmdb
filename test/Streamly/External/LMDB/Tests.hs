@@ -121,7 +121,7 @@ testWriteLMDB ::
 testWriteLMDB overwriteOpts failureFold res =
   testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold)) . monadicIO $
     do
-      (db, _) <- run res
+      (db, env) <- run res
       run $ clearDatabase db
 
       -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
@@ -155,11 +155,11 @@ testWriteLMDB overwriteOpts failureFold res =
 
       -- If we comment out the cleanup code in writeLMDB at synchronous exceptions or normal
       -- completion (which we shouldn’t normally do), we need this for the tests to pass.
-      -- run performGC
-      -- run $ threadDelay 10000
+      -- run $ waitWriters env
+      let removeUnusedWarning = env
 
       -- Make sure exceptions occurred as expected from the written key-value pairs.
-      let assert1 s = assertMsg $ "assert (first checks) failure " ++ s
+      let assert1 s = assertMsg $ "assert (first checks) failure " ++ const s removeUnusedWarning
       case failureFold of
         FailureStop -> assert1 "(1)" (isRight e)
         FailureIgnore -> assert1 "(2)" (isRight e)
@@ -233,7 +233,7 @@ testWriteLMDBToList ::
 testWriteLMDBToList overwriteOpts res =
   testProperty (printf "writeLMDBToList (%s)" (show overwriteOpts)) . monadicIO $
     do
-      (db, _) <- run res
+      (db, env) <- run res
       run $ clearDatabase db
 
       -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
@@ -258,10 +258,10 @@ testWriteLMDBToList overwriteOpts res =
 
       -- If we comment out the cleanup code in writeLMDB at synchronous exceptions or normal
       -- completion (which we shouldn’t normally do), we need this for the tests to pass.
-      -- run performGC
-      -- run $ threadDelay 10000
+      -- run $ waitWriters env
+      let removeUnusedWarning = env
 
-      case e of
+      case const e removeUnusedWarning of
         Left _ ->
           -- Make sure no exceptions occurred (since the failures are merely collected to a list).
           assertMsg "unexpected exception" (isRight e)
@@ -299,7 +299,7 @@ testWriteLMDBConcurrent ::
 testWriteLMDBConcurrent res =
   testProperty "testWriteLMDBConcurrent" . monadicIO $
     do
-      (db, _) <- run res
+      (db, env) <- run res
       run $ clearDatabase db
 
       -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than
@@ -373,6 +373,18 @@ testWriteLMDBConcurrent res =
                     return $ const pair removeUnusedWarning
                 )
               & S.fold fol
+
+            -- If we comment out the commit/disclaimOwnership code in writeLMDB at synchronous
+            -- exceptions or normal completion (which we shouldn’t normally do), we need this for
+            -- the tests to pass.
+            -- waitWriters env
+            let removeUnusedWarning = env
+            return $ const () removeUnusedWarning
+
+      -- (Instead of putting waitWriters above, we can also do it here; but then the test takes much
+      -- longer to execute, presumably because the last transaction of each of the above threads
+      -- cannot begin until GC and finalization has committed a last transaction of another thread.)
+      -- run $ waitWriters env
 
       let expectedPairs = sort . concatMap (\(_, pairs, _, _) -> pairs) $ pairss
       readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
