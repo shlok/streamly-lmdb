@@ -1,10 +1,12 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Streamly.External.LMDB.Tests where
 
+import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Exception hiding (assert)
 import Control.Monad
@@ -16,6 +18,7 @@ import Data.Function
 import Data.List
 import qualified Data.Map.Strict as M
 import Data.Serialize.Put
+import qualified Data.Set as Set
 import Data.Word
 import Foreign
 import qualified Streamly.Data.Fold as F
@@ -59,6 +62,7 @@ tests res =
            return $ testWriteLMDBToList overwriteOpts res
        )
     ++ [ testWriteLMDBConcurrent res,
+         testAsyncExceptionsConcurrent res,
          testBetween
        ]
 
@@ -306,7 +310,7 @@ testWriteLMDBToList overwriteOpts res =
 -- expected.
 testWriteLMDBConcurrent :: IO Channel -> TestTree
 testWriteLMDBConcurrent res =
-  testProperty "testWriteLMDBConcurrent" . monadicIO . withEnvDb res $ \env db -> do
+  testProperty "writeLMDBConcurrent" . monadicIO . withEnvDb res $ \env db -> do
     -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than the
     -- chunk size on some threads but less than the chunk size on other threads. Our test being
     -- successful (esp. combined with the (*) below) means that writeLMDB’s concurrency mechanism
@@ -319,46 +323,10 @@ testWriteLMDBConcurrent res =
     -- let numThreads = 3
     -- let chunkSz = 5
 
-    -- We need to make the keys unique; otherwise the result is unpredictable.
-    pairss <-
-      S.fromList [0 :: Word64 ..] -- Increasing Word64s for uniqueness.
-        & S.foldMany
-          ( F.Fold
-              ( \(totalNumPairs, pairsSoFar, !accPairs) w ->
-                  if pairsSoFar >= totalNumPairs
-                    then return $ F.Done accPairs
-                    else do
-                      let k = runPut $ putWord64be w
-                      ShortBS v <- pick arbitrary
-                      return $ F.Partial (totalNumPairs, pairsSoFar + 1, (k, v) : accPairs)
-              )
-              ( do
-                  -- Low chunk sizes (e.g., 1) normally result in bad performance. We therefore base
-                  -- the number of pairs on the chunk size.
-                  totalNumPairs <- pick $ chooseInt (0, chunkSz * 4)
-                  return $ F.Partial (totalNumPairs, 0, [])
-              )
-              (\_ -> error "unreachable")
-          )
-        & S.take numThreads
-        & S.indexed -- threadIdx.
-        & S.mapM
-          ( \(threadIdx, pairs) -> do
-              -- These settings should make no difference to the result.
-              x <- pick $ elements [0 :: Int, 1, 2]
-              let failureFold
-                    | x == 0 = writeFailureThrow
-                    | x == 1 = writeFailureStop
-                    | x == 2 = writeFailureIgnore
-                    | otherwise = error "unreachable"
-              unsafeFFI :: Bool <- pick arbitrary
-              return (threadIdx, pairs, failureFold, unsafeFFI)
-          )
-        & S.fold F.toList
-
+    pairss <- generateConcurrentPairs numThreads chunkSz
     run $
       forConcurrently_ pairss $
-        \(threadIdx, pairs, failureFold, unsafeFFI) -> do
+        \(ThreadIdx threadIdx, pairs, failureFold, unsafeFFI) -> do
           let fol =
                 writeLMDB @IO db $
                   defaultWriteOptions
@@ -372,7 +340,7 @@ testWriteLMDBConcurrent res =
             & S.indexed
             & S.mapM
               ( \(pairIdx, pair) -> do
-                  let removeUnusedWarning = threadIdx + pairIdx
+                  let removeUnusedWarning = pairIdx + threadIdx
                   -- (*) Check whether our writeLMDB folds get interleaved (as opposed to the folds
                   -- executing one after another).
                   -- putStrLn $ printf "(threadIdx, pairIdx) = (%d, %d)" threadIdx pairIdx
@@ -395,6 +363,71 @@ testWriteLMDBConcurrent res =
     let expectedPairs = sort . concatMap (\(_, pairs, _, _) -> pairs) $ pairss
     readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
     assertMsg "assert failure" $ expectedPairs == readPairsAll
+
+-- | Perform reads and writes on a database concurrently, throwTo threads at random, and read all
+-- key-value pairs back from the database using our library (already covered by 'testReadLMDB') and
+-- make sure they are as expected.
+testAsyncExceptionsConcurrent :: IO Channel -> TestTree
+testAsyncExceptionsConcurrent res =
+  testProperty "asyncExceptionsConcurrent" . monadicIO . withEnvDb res $ \env db -> do
+    numThreads <- pick $ chooseInt (1, 10)
+    chunkSz <- pick $ chooseInt (1, 5)
+
+    pairss <- generateConcurrentPairs numThreads chunkSz
+
+    -- Whether we will kill the thread.
+    shouldKills :: [Bool] <- replicateM numThreads $ pick arbitrary
+
+    -- Whether we will perform read on the thread instead of writing. (This read/write interleaving
+    -- is to ascertain that the locking across readers and writers is working as expected.)
+    shouldReads :: [Bool] <- replicateM numThreads $ pick arbitrary
+
+    threads <- run $
+      forConcurrently (zip shouldReads pairss) $
+        \(shouldRead, (threadIdx, pairs, failureFold, unsafeFFI)) ->
+          (threadIdx,)
+            <$> asyncBound
+              ( if shouldRead
+                  then do
+                    _ <- toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+                    return ()
+                  else do
+                    onException
+                      ( S.fromList @IO pairs
+                          & S.fold
+                            ( writeLMDB @IO db $
+                                defaultWriteOptions
+                                  { writeTransactionSize = chunkSz,
+                                    writeOverwriteOptions = OverwriteAllow,
+                                    writeUnsafeFFI = unsafeFFI,
+                                    writeFailureFold = failureFold
+                                  }
+                            )
+                      )
+                      ( -- Handle asynchronous exception. Without this, improper closing of the
+                        -- environment and/or database can crash the test (as expected).
+                        waitWriters env
+                      )
+              )
+
+    delay <- pick $ chooseInt (0, 10)
+    run $ threadDelay delay
+
+    run $ forConcurrently_ (zip shouldKills threads) $ \(shouldKill, (_, as)) ->
+      if shouldKill
+        then cancel as
+        else wait as
+
+    let expectedSubset =
+          Set.fromList
+            . concatMap (\(_, _, (_, pairs, _, _)) -> pairs)
+            . filter (\(shouldRead, shouldKill, _) -> not shouldRead && not shouldKill)
+            $ zip3 shouldReads shouldKills pairss
+
+    readPairsAll <-
+      Set.fromList <$> (run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
+
+    assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairsAll
 
 -- | A bytestring with a limited random length. (We don’t see much value in testing with longer
 -- bytestrings.)
@@ -630,6 +663,53 @@ readOptionsAndResults pairsInDb = do
             (LT, Backward) -> case prevKey of
               Nothing -> backwEq
               Just prevKey' -> (ropts {readStart = Just prevKey'}, reverse $ take idx pairsInDb)
+
+newtype ThreadIdx = ThreadIdx Int deriving (Show)
+
+-- | Generates pairs meant to be originating from multiple threads.
+--
+-- We make the keys unique; otherwise the result would be unpredictable (since we wouldn’t know
+-- which values for duplicate keys would end up in the final database).
+generateConcurrentPairs ::
+  Monad m =>
+  Int ->
+  Int ->
+  PropertyM m [(ThreadIdx, [(ByteString, ByteString)], WriteFailureFold (), Bool)]
+generateConcurrentPairs numThreads chunkSz =
+  S.fromList [0 :: Word64 ..] -- Increasing Word64s for uniqueness.
+    & S.foldMany
+      ( F.Fold
+          ( \(totalNumPairs, pairsSoFar, !accPairs) w ->
+              if pairsSoFar >= totalNumPairs
+                then return $ F.Done accPairs
+                else do
+                  let k = runPut $ putWord64be w
+                  ShortBS v <- pick arbitrary
+                  return $ F.Partial (totalNumPairs, pairsSoFar + 1, (k, v) : accPairs)
+          )
+          ( do
+              -- Low chunk sizes (e.g., 1) normally result in bad performance. We therefore base
+              -- the number of pairs on the chunk size.
+              totalNumPairs <- pick $ chooseInt (0, chunkSz * 4)
+              return $ F.Partial (totalNumPairs, 0, [])
+          )
+          (\_ -> error "unreachable")
+      )
+    & S.take numThreads
+    & S.indexed -- threadIdx.
+    & S.mapM
+      ( \(threadIdx, pairs) -> do
+          -- These settings should make no difference to the result.
+          x <- pick $ elements [0 :: Int, 1, 2]
+          let failureFold
+                | x == 0 = writeFailureThrow
+                | x == 1 = writeFailureStop
+                | x == 2 = writeFailureIgnore
+                | otherwise = error "unreachable"
+          unsafeFFI :: Bool <- pick arbitrary
+          return (ThreadIdx threadIdx, pairs, failureFold, unsafeFFI)
+      )
+    & S.fold F.toList
 
 -- Writes the given key-value pairs to the given database.
 writeChunk ::
