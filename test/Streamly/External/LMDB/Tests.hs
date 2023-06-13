@@ -22,16 +22,19 @@ import qualified Streamly.Data.Fold as F
 import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
 import qualified Streamly.Data.Stream.Prelude as S
 import Streamly.External.LMDB
+import Streamly.External.LMDB.Channel
 import Streamly.External.LMDB.Internal
 import Streamly.External.LMDB.Internal.Foreign
 import qualified Streamly.Internal.Data.Fold as F
-import Test.QuickCheck
+import System.Directory
+import System.IO.Temp
+import Test.QuickCheck hiding (mapSize)
 import Test.QuickCheck.Monadic
 import Test.Tasty (TestTree)
-import Test.Tasty.QuickCheck
+import Test.Tasty.QuickCheck hiding (mapSize)
 import Text.Printf
 
-tests :: IO (Database ReadWrite, Environment ReadWrite) -> [TestTree]
+tests :: IO Channel -> [TestTree]
 tests res =
   [ testReadLMDB res,
     testUnsafeReadLMDB res
@@ -59,6 +62,26 @@ tests res =
          testBetween
        ]
 
+withEnvDb ::
+  IO Channel ->
+  (Environment ReadWrite -> Database ReadWrite -> PropertyM IO a) ->
+  PropertyM IO a
+withEnvDb res f = do
+  -- TODO: bracket for PropertyM?
+  (tmpDir, chan, db, env) <- run $ do
+    chan <- res
+    tmpParent <- getCanonicalTemporaryDirectory
+    tmpDir <- createTempDirectory tmpParent "streamly-lmdb-tests"
+    env <- openEnvironment tmpDir $ defaultLimits {mapSize = tebibyte}
+    db <- getDatabase env Nothing
+    return (tmpDir, chan, db, env)
+  a <- f env db
+  run $ do
+    closeDatabase chan db
+    closeEnvironment chan env
+    removeDirectoryRecursive tmpDir
+  return a
+
 withReadOnlyTxnAndCurs ::
   (Mode mode) =>
   Environment mode ->
@@ -70,13 +93,11 @@ withReadOnlyTxnAndCurs env db =
     (beginReadOnlyTxn env >>= \txn -> openCursor txn db >>= \curs -> return (txn, curs))
     (\(txn, curs) -> closeCursor curs >> abortReadOnlyTxn txn)
 
--- | Clear the database, write key-value pairs to it in a normal manner, read
--- them back using our library, and make sure the result is what we wrote.
-testReadLMDB :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
-testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
-  (db, env) <- run res
+-- | Write key-value pairs to a database in a normal manner, read them back using our library, and
+-- make sure the result is what we wrote.
+testReadLMDB :: IO Channel -> TestTree
+testReadLMDB res = testProperty "readLMDB" . monadicIO . withEnvDb res $ \env db -> do
   keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
-  run $ clearDatabase db
 
   run $ writeChunk db False keyValuePairs
   let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
@@ -89,11 +110,9 @@ testReadLMDB res = testProperty "readLMDB" . monadicIO $ do
   return $ results == expectedResults && resultsTxn == expectedResults
 
 -- | Similar to 'testReadLMDB', except that it tests the unsafe function in a different manner.
-testUnsafeReadLMDB :: IO (Database ReadWrite, Environment ReadWrite) -> TestTree
-testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
-  (db, env) <- run res
+testUnsafeReadLMDB :: IO Channel -> TestTree
+testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO . withEnvDb res $ \env db -> do
   keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
-  run $ clearDatabase db
 
   run $ writeChunk db False keyValuePairs
   let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
@@ -110,20 +129,15 @@ testUnsafeReadLMDB res = testProperty "unsafeReadLMDB" . monadicIO $ do
 
 data FailureFold = FailureThrow | FailureStop | FailureIgnore deriving (Show)
 
--- | Clear the database, write key-value pairs to it using our library with various options, read
--- all key-value pairs back from the database using our library (already covered by 'testReadLMDB'),
--- and make sure they are as expected.
-testWriteLMDB ::
-  OverwriteOptions ->
-  FailureFold ->
-  IO (Database ReadWrite, Environment ReadWrite) ->
-  TestTree
+-- | Write key-value pairs to a database using our library with various options, read all key-value
+-- pairs back from the database using our library (already covered by 'testReadLMDB'), and make sure
+-- they are as expected.
+testWriteLMDB :: OverwriteOptions -> FailureFold -> IO Channel -> TestTree
 testWriteLMDB overwriteOpts failureFold res =
-  testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold)) . monadicIO $
-    do
-      (db, env) <- run res
-      run $ clearDatabase db
-
+  testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold))
+    . monadicIO
+    . withEnvDb res
+    $ \env db -> do
       -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
       -- normally result in bad performance. We therefore base the number of pairs on the chunk
       -- size.
@@ -220,175 +234,167 @@ testWriteLMDB overwriteOpts failureFold res =
             OverwriteDisallow (WriteAppend False) ->
               assert2 "(11)" $ readPairsAll == sort (prefixBeforeDuplicate keyValuePairs)
             OverwriteDisallow (WriteAppend True) ->
-              assert2 "(12)" $ readPairsAll == sort (prefixBeforeStrictlySortedKeysEnd keyValuePairs)
+              assert2 "(12)" $
+                readPairsAll == sort (prefixBeforeStrictlySortedKeysEnd keyValuePairs)
 
--- | Clear the database, write key-value pairs to it using our library with various options while
--- collecting failures into a list, read all key-value pairs back from the database using our
--- library (already covered by 'testReadLMDB'), and make sure they and the list of failures are as
--- expected.
-testWriteLMDBToList ::
-  OverwriteOptions ->
-  IO (Database ReadWrite, Environment ReadWrite) ->
-  TestTree
+-- | Write key-value pairs to a database using our library with various options while collecting
+-- failures into a list, read all key-value pairs back from the database using our library (already
+-- covered by 'testReadLMDB'), and make sure they and the list of failures are as expected.
+testWriteLMDBToList :: OverwriteOptions -> IO Channel -> TestTree
 testWriteLMDBToList overwriteOpts res =
-  testProperty (printf "writeLMDBToList (%s)" (show overwriteOpts)) . monadicIO $
-    do
-      (db, env) <- run res
-      run $ clearDatabase db
+  testProperty (printf "writeLMDBToList (%s)" (show overwriteOpts))
+    . monadicIO
+    . withEnvDb res
+    $ \env db -> do
+      do
+        -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
+        -- normally result in bad performance. We therefore base the number of pairs on the chunk
+        -- size.
+        chunkSz <- pick $ chooseInt (1, 100)
+        let maxPairs = chunkSz * 5
+        unsafeFFI <- pick arbitrary
 
-      -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
-      -- normally result in bad performance. We therefore base the number of pairs on the chunk
-      -- size.
-      chunkSz <- pick $ chooseInt (1, 100)
-      let maxPairs = chunkSz * 5
-      unsafeFFI <- pick arbitrary
+        let fol' =
+              writeLMDB db $
+                defaultWriteOptions
+                  { writeTransactionSize = chunkSz,
+                    writeOverwriteOptions = overwriteOpts,
+                    writeUnsafeFFI = unsafeFFI,
+                    writeFailureFold = F.toList
+                  }
 
-      let fol' =
-            writeLMDB db $
-              defaultWriteOptions
-                { writeTransactionSize = chunkSz,
-                  writeOverwriteOptions = overwriteOpts,
-                  writeUnsafeFFI = unsafeFFI,
-                  writeFailureFold = F.toList
-                }
+        -- Write key-value pairs to the database.
+        keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairsDupsMoreLikely maxPairs
+        e <- run . try @SomeException $ S.fold fol' $ fromList keyValuePairs
 
-      -- Write key-value pairs to the database.
-      keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairsDupsMoreLikely maxPairs
-      e <- run . try @SomeException $ S.fold fol' $ fromList keyValuePairs
+        -- If we comment out the cleanup code in writeLMDB at synchronous exceptions or normal
+        -- completion (which we shouldn’t normally do), we need this for the tests to pass.
+        -- run $ waitWriters env
+        let removeUnusedWarning = env
 
-      -- If we comment out the cleanup code in writeLMDB at synchronous exceptions or normal
-      -- completion (which we shouldn’t normally do), we need this for the tests to pass.
-      -- run $ waitWriters env
-      let removeUnusedWarning = env
+        case const e removeUnusedWarning of
+          Left _ ->
+            -- Make sure no exceptions occurred (since the failures are merely collected to a list).
+            assertMsg "unexpected exception" (isRight e)
+          Right errors -> do
+            --  Read all key-value pairs back from the database and make sure that they, as well as
+            --  the collected offending key-value pairs, are as expected.
+            readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+            let offendingPairs = map (\(_, k, v) -> (k, v)) errors
+            let theAssert s = assertMsg $ "assert failure " ++ s
+            case overwriteOpts of
+              -- The readPairsAll parts are the same as in the FailureIgnore case in testWriteLMDB.
+              OverwriteAllow ->
+                theAssert "(1)" $
+                  null offendingPairs
+                    && readPairsAll == sort (removeDuplicateKeysRetainLast keyValuePairs)
+              OverwriteAllowSameValue ->
+                theAssert "(2)" $
+                  offendingPairs == getRepeatingKeys True keyValuePairs
+                    && readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
+              OverwriteDisallow (WriteAppend False) ->
+                theAssert "(3)" $
+                  offendingPairs == getRepeatingKeys False keyValuePairs
+                    && readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
+              OverwriteDisallow (WriteAppend True) ->
+                theAssert "(4)" $
+                  offendingPairs == snd (filterGreaterThan keyValuePairs)
+                    && readPairsAll == fst (filterGreaterThan keyValuePairs)
 
-      case const e removeUnusedWarning of
-        Left _ ->
-          -- Make sure no exceptions occurred (since the failures are merely collected to a list).
-          assertMsg "unexpected exception" (isRight e)
-        Right errors -> do
-          --  Read all key-value pairs back from the database and make sure that they, as well as
-          --  the collected offending key-value pairs, are as expected.
-          readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-          let offendingPairs = map (\(_, k, v) -> (k, v)) errors
-          let theAssert s = assertMsg $ "assert failure " ++ s
-          case overwriteOpts of
-            -- The readPairsAll parts are the same as in the FailureIgnore case in testWriteLMDB.
-            OverwriteAllow ->
-              theAssert "(1)" $
-                null offendingPairs
-                  && readPairsAll == sort (removeDuplicateKeysRetainLast keyValuePairs)
-            OverwriteAllowSameValue ->
-              theAssert "(2)" $
-                offendingPairs == getRepeatingKeys True keyValuePairs
-                  && readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
-            OverwriteDisallow (WriteAppend False) ->
-              theAssert "(3)" $
-                offendingPairs == getRepeatingKeys False keyValuePairs
-                  && readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
-            OverwriteDisallow (WriteAppend True) ->
-              theAssert "(4)" $
-                offendingPairs == snd (filterGreaterThan keyValuePairs)
-                  && readPairsAll == fst (filterGreaterThan keyValuePairs)
-
--- | Clear the database, write key-value pairs to it concurrently, read all key-value pairs back
--- from the database using our library (already covered by 'testReadLMDB'), and make sure they are
--- as expected.
-testWriteLMDBConcurrent ::
-  IO (Database ReadWrite, Environment ReadWrite) ->
-  TestTree
+-- | Write key-value pairs to a database concurrently, read all key-value pairs back from the
+-- database using our library (already covered by 'testReadLMDB'), and make sure they are as
+-- expected.
+testWriteLMDBConcurrent :: IO Channel -> TestTree
 testWriteLMDBConcurrent res =
-  testProperty "testWriteLMDBConcurrent" . monadicIO $
-    do
-      (db, env) <- run res
-      run $ clearDatabase db
+  testProperty "testWriteLMDBConcurrent" . monadicIO . withEnvDb res $ \env db -> do
+    -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than the
+    -- chunk size on some threads but less than the chunk size on other threads. Our test being
+    -- successful (esp. combined with the (*) below) means that writeLMDB’s concurrency mechanism
+    -- has to be working.
+    numThreads <- pick $ chooseInt (1, 10)
+    chunkSz <- pick $ chooseInt (1, 5)
 
-      -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than
-      -- the chunk size on some threads but less than the chunk size on other threads. Our test
-      -- being successful (esp. combined with the (*) below) means that writeLMDB’s concurrency
-      -- mechanism has to be working.
-      numThreads <- pick $ chooseInt (1, 10)
-      chunkSz <- pick $ chooseInt (1, 5)
+    -- (*) More predictability for manual sanity checks; see also the other (*) below. TODO: Bring
+    -- more of these manual sanity checks into the test itself.
+    -- let numThreads = 3
+    -- let chunkSz = 5
 
-      -- (*) More predictability for manual sanity checks; see also the other (*) below. TODO: Bring
-      -- more of these manual sanity checks into the test itself.
-      -- let numThreads = 3
-      -- let chunkSz = 5
+    -- We need to make the keys unique; otherwise the result is unpredictable.
+    pairss <-
+      S.fromList [0 :: Word64 ..] -- Increasing Word64s for uniqueness.
+        & S.foldMany
+          ( F.Fold
+              ( \(totalNumPairs, pairsSoFar, !accPairs) w ->
+                  if pairsSoFar >= totalNumPairs
+                    then return $ F.Done accPairs
+                    else do
+                      let k = runPut $ putWord64be w
+                      ShortBS v <- pick arbitrary
+                      return $ F.Partial (totalNumPairs, pairsSoFar + 1, (k, v) : accPairs)
+              )
+              ( do
+                  -- Low chunk sizes (e.g., 1) normally result in bad performance. We therefore base
+                  -- the number of pairs on the chunk size.
+                  totalNumPairs <- pick $ chooseInt (0, chunkSz * 4)
+                  return $ F.Partial (totalNumPairs, 0, [])
+              )
+              (\_ -> error "unreachable")
+          )
+        & S.take numThreads
+        & S.indexed -- threadIdx.
+        & S.mapM
+          ( \(threadIdx, pairs) -> do
+              -- These settings should make no difference to the result.
+              x <- pick $ elements [0 :: Int, 1, 2]
+              let failureFold
+                    | x == 0 = writeFailureThrow
+                    | x == 1 = writeFailureStop
+                    | x == 2 = writeFailureIgnore
+                    | otherwise = error "unreachable"
+              unsafeFFI :: Bool <- pick arbitrary
+              return (threadIdx, pairs, failureFold, unsafeFFI)
+          )
+        & S.fold F.toList
 
-      -- We need to make the keys unique; otherwise the result is unpredictable.
-      pairss <-
-        S.fromList [0 :: Word64 ..] -- Increasing Word64s for uniqueness.
-          & S.foldMany
-            ( F.Fold
-                ( \(totalNumPairs, pairsSoFar, !accPairs) w ->
-                    if pairsSoFar >= totalNumPairs
-                      then return $ F.Done accPairs
-                      else do
-                        let k = runPut $ putWord64be w
-                        ShortBS v <- pick arbitrary
-                        return $ F.Partial (totalNumPairs, pairsSoFar + 1, (k, v) : accPairs)
-                )
-                ( do
-                    -- Low chunk sizes (e.g., 1) normally result in bad performance. We therefore
-                    -- base the number of pairs on the chunk size.
-                    totalNumPairs <- pick $ chooseInt (0, chunkSz * 4)
-                    return $ F.Partial (totalNumPairs, 0, [])
-                )
-                (\_ -> error "unreachable")
-            )
-          & S.take numThreads
-          & S.indexed -- threadIdx.
-          & S.mapM
-            ( \(threadIdx, pairs) -> do
-                -- These settings should make no difference to the result.
-                x <- pick $ elements [0 :: Int, 1, 2]
-                let failureFold
-                      | x == 0 = writeFailureThrow
-                      | x == 1 = writeFailureStop
-                      | x == 2 = writeFailureIgnore
-                      | otherwise = error "unreachable"
-                unsafeFFI :: Bool <- pick arbitrary
-                return (threadIdx, pairs, failureFold, unsafeFFI)
-            )
-          & S.fold F.toList
+    run $
+      forConcurrently_ pairss $
+        \(threadIdx, pairs, failureFold, unsafeFFI) -> do
+          let fol =
+                writeLMDB @IO db $
+                  defaultWriteOptions
+                    { writeTransactionSize = chunkSz,
+                      writeOverwriteOptions = OverwriteAllow,
+                      writeUnsafeFFI = unsafeFFI,
+                      writeFailureFold = failureFold
+                    }
 
-      run $
-        forConcurrently_ pairss $
-          \(threadIdx, pairs, failureFold, unsafeFFI) -> do
-            let fol =
-                  writeLMDB @IO db $
-                    defaultWriteOptions
-                      { writeTransactionSize = chunkSz,
-                        writeOverwriteOptions = OverwriteAllow,
-                        writeUnsafeFFI = unsafeFFI,
-                        writeFailureFold = failureFold
-                      }
+          S.fromList @IO pairs
+            & S.indexed
+            & S.mapM
+              ( \(pairIdx, pair) -> do
+                  let removeUnusedWarning = threadIdx + pairIdx
+                  -- (*) Check whether our writeLMDB folds get interleaved (as opposed to the folds
+                  -- executing one after another).
+                  -- putStrLn $ printf "(threadIdx, pairIdx) = (%d, %d)" threadIdx pairIdx
+                  return $ const pair removeUnusedWarning
+              )
+            & S.fold fol
 
-            S.fromList @IO pairs
-              & S.indexed
-              & S.mapM
-                ( \(pairIdx, pair) -> do
-                    let removeUnusedWarning = threadIdx + pairIdx
-                    -- (*)
-                    -- putStrLn $ printf "(threadIdx, pairIdx) = (%d, %d)" threadIdx pairIdx
-                    return $ const pair removeUnusedWarning
-                )
-              & S.fold fol
+          -- If we comment out the commit/disclaimOwnership code in writeLMDB at synchronous
+          -- exceptions or normal completion (which we shouldn’t normally do), we need this for the
+          -- tests to pass.
+          -- waitWriters env
+          let removeUnusedWarning = env
+          return $ const () removeUnusedWarning
 
-            -- If we comment out the commit/disclaimOwnership code in writeLMDB at synchronous
-            -- exceptions or normal completion (which we shouldn’t normally do), we need this for
-            -- the tests to pass.
-            -- waitWriters env
-            let removeUnusedWarning = env
-            return $ const () removeUnusedWarning
+    -- (Instead of putting waitWriters above, we can also do it here; but then the test takes much
+    -- longer to execute, presumably because the last transaction of each of the above threads
+    -- cannot begin until GC and finalization has committed a last transaction of another thread.)
+    -- run $ waitWriters env
 
-      -- (Instead of putting waitWriters above, we can also do it here; but then the test takes much
-      -- longer to execute, presumably because the last transaction of each of the above threads
-      -- cannot begin until GC and finalization has committed a last transaction of another thread.)
-      -- run $ waitWriters env
-
-      let expectedPairs = sort . concatMap (\(_, pairs, _, _) -> pairs) $ pairss
-      readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-      assertMsg "assert failure" $ expectedPairs == readPairsAll
+    let expectedPairs = sort . concatMap (\(_, pairs, _, _) -> pairs) $ pairss
+    readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+    assertMsg "assert failure" $ expectedPairs == readPairsAll
 
 -- | A bytestring with a limited random length. (We don’t see much value in testing with longer
 -- bytestrings.)
