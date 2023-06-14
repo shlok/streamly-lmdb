@@ -659,7 +659,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                   c_mdb_get
                 )
        in Fold
-            ( \(threadId, counter, iter, chunkSz, mIoFinalizer, fstep) (k, v) -> liftIO . mask_ $ do
+            ( \(threadId, counter, iter, chunkSz, mIoFinalizer, fstep) (k, v) -> liftIO $ do
                 -- In the first few iterations, ascertain that we are still on the same thread (to
                 -- make sure streamly folds are working as expected).
                 iter' <-
@@ -707,7 +707,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                     -- is in effect. We continue writing to the same transaction.
                     do
                       return (chunkSz, mIoFinalizer)
-                    else do
+                    else mask_ $ do
                       -- If the environment is owned by a different counter or the owner mvar is
                       -- empty (i.e., the environment is not owned by any counter), we wait for the
                       -- owner mvar to become empty. (Note that in the empty mvar case, we still
@@ -740,19 +740,12 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                       putMVar writeOwnerDataM (WriteOwnerData {wPtxn = ptxn})
 
                       ioFinalizer' <-
-                        newIOFinalizer . mask_ $ do
-                          -- (3) This gets called upon GC, after this writeLMDB is going away upon
-                          -- synchronous or asynchronous exception or upon successful fold
-                          -- completion. (It’s not possible to “cancel” an mkWeakIORef finalizer, so
-                          -- this will inevitably get called.)
-                          --
-                          -- To avoid an extraneous transaction commit after a commit (a C
-                          -- double-free), we make sure we still have ownership.
-                          ownerData' <- tryReadMVar writeOwnerDataM
-                          case ownerData' of
-                            Nothing -> return ()
-                            Just (WriteOwnerData {wPtxn}) ->
-                              void . whenOwned writeOwnerM counter $
+                        newIOFinalizer . mask_ $
+                          whenOwned writeOwnerM counter $ do
+                            ownerData <- tryReadMVar writeOwnerDataM
+                            case ownerData of
+                              Nothing -> return ()
+                              Just (WriteOwnerData {wPtxn}) ->
                                 -- We also disclaim ownership if the commit fails (and allow future
                                 -- transaction operations to presumably fail). TODO: Can we report
                                 -- the failure directly?
@@ -826,9 +819,9 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                           mIoFinalizer',
                           fstep
                         )
-                  Left e -> do
+                  Left e ->
                     case fstep of
-                      Done _ -> do
+                      Done _ ->
                         -- When the failure fold completes with Done, the outer writeLMDB fold
                         -- should already have completed with Done as well; see (2). We should
                         -- therefore never arrive here.
@@ -847,7 +840,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                             -- writeLMDB fold with Done as well.
                             commitAndDisclaimOwnership
                             return $ Done a
-                          Partial _ -> do
+                          Partial _ ->
                             -- The failure fold did not request completion; continue the outer
                             -- writeLMDB fold as if nothing happened.
                             return $
@@ -885,7 +878,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                     )
             )
             -- This final part is incompatible with scans.
-            ( \(threadId, _, _, _, mIoFinalizer, fstep) -> liftIO . mask_ $ do
+            ( \(threadId, _, _, _, mIoFinalizer, fstep) -> liftIO $ do
                 threadId' <- myThreadId
                 when (threadId' /= threadId) $
                   throwErr "veered off the original thread at the end"
@@ -897,7 +890,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                     -- As the failure fold completed with Done, the outer writeLMDB fold should have
                     -- completed as well; see (2).
                     throwErr "Unexpected Done (extract)"
-                  Partial s -> do
+                  Partial s ->
                     failExtract s
             )
 
