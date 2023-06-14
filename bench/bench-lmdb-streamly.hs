@@ -9,6 +9,7 @@ import Foreign (Ptr, callocBytes)
 import Foreign.C.Types (CChar)
 import Foreign.Marshal.Array (advancePtr, pokeArray)
 import Streamly.External.LMDB
+import Streamly.External.LMDB.Channel
 import Streamly.Internal.Data.Fold.Type (Fold (Fold), Step (Partial))
 import Streamly.Internal.Data.Stream.StreamD.Type (Step (Stop, Yield))
 import qualified Streamly.Internal.Data.Unfold as U
@@ -72,7 +73,9 @@ write (UnsafeFFI unsafeFFI) path keyFactor' valueFactor' numPairs' chunkSize' = 
         else do
           createDirectory path
           env <- openEnvironment @ReadWrite path (defaultLimits {mapSize = tebibyte})
-          db <- getDatabase env Nothing
+          chan <- createChannel defaultChannelOptions
+          startChannel chan
+          db <- getDatabase chan env Nothing
 
           let keySize = 8 * keyFactor
           let valSize = 8 * valFactor
@@ -147,6 +150,7 @@ write (UnsafeFFI unsafeFFI) path keyFactor' valueFactor' numPairs' chunkSize' = 
 
           let writeFold =
                 writeLMDB
+                  chan
                   db
                   ( defaultWriteOptions
                       { writeTransactionSize = chunkSz,
@@ -158,7 +162,9 @@ write (UnsafeFFI unsafeFFI) path keyFactor' valueFactor' numPairs' chunkSize' = 
 readCursorUnsafe :: String -> UnsafeFFI -> PrecreatedTxn -> IO ()
 readCursorUnsafe path (UnsafeFFI unsafeFFI) (PrecreatedTxn precreatedTxn) = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
-  db <- getDatabase env Nothing
+  chan <- createChannel defaultChannelOptions
+  startChannel chan
+  db <- getDatabase chan env Nothing
   mtxncurs <-
     if precreatedTxn
       then do
@@ -187,7 +193,9 @@ readCursorUnsafe path (UnsafeFFI unsafeFFI) (PrecreatedTxn precreatedTxn) = do
 readCursorSafe :: String -> UnsafeFFI -> PrecreatedTxn -> IO ()
 readCursorSafe path (UnsafeFFI unsafeFFI) (PrecreatedTxn precreatedTxn) = do
   env <- openEnvironment @ReadOnly path (defaultLimits {mapSize = tebibyte})
-  db <- getDatabase env Nothing
+  chan <- createChannel defaultChannelOptions
+  startChannel chan
+  db <- getDatabase chan env Nothing
   mtxncurs <-
     if precreatedTxn
       then do
