@@ -86,11 +86,12 @@ import Data.ByteString (ByteString, packCStringLen)
 import Data.ByteString.Unsafe (unsafePackCStringLen, unsafeUseAsCStringLen)
 import Data.Maybe
 import Data.Void (Void)
-import Foreign (Ptr, alloca, free, malloc, nullPtr, peek)
+import Foreign (alloca, free, malloc, nullPtr, peek)
 import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
 import Foreign.Marshal.Utils (with)
 import Foreign.Storable (poke)
+import GHC.Exts
 import qualified Streamly.Data.Fold as F
 import Streamly.External.LMDB.Channel (Channel)
 import Streamly.External.LMDB.Internal
@@ -658,13 +659,13 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                   c_mdb_get
                 )
        in Fold
-            ( \(threadId, counter, iter, chunkSz, mIoFinalizer, ownershipLock, fstep) (k, v) -> do
+            ( \(threadId, counter, iter, chunkSz, mIoFinalizer, fstep) (k, v) -> liftIO . mask_ $ do
                 -- In the first few iterations, ascertain that we are still on the same thread (to
                 -- make sure streamly folds are working as expected).
                 iter' <-
                   if iter < 3
                     then do
-                      threadId' <- liftIO myThreadId
+                      threadId' <- myThreadId
                       when (threadId' /= threadId) $ throwErr "veered off the original thread"
                       return $ iter + 1
                     else return iter
@@ -697,186 +698,175 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                 let disclaimWriteOwnership =
                       void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
 
-                liftIO . withMVarMasked ownershipLock $ \() -> do
-                  -- Check whether this writeLMDB still owns the environment.
-                  hasOwnership <- fromMaybe False <$> whenOwned writeOwnerM counter (return True)
+                -- Check whether this writeLMDB still owns the environment.
+                hasOwnership <- fromMaybe False <$> whenOwned writeOwnerM counter (return True)
 
-                  (chunkSz', mIoFinalizer') <-
-                    if hasOwnership
-                      then -- The environment is still owned by this writeLMDB. The same IOFinalizer
-                      -- is in effect. We continue writing to the same transaction.
-                      do
-                        return (chunkSz, mIoFinalizer)
-                      else do
-                        -- If the environment is owned by a different counter or the owner mvar is
-                        -- empty (i.e., the environment is not owned by any counter), we wait for
-                        -- the owner mvar to become empty. (Note that in the empty mvar case, we
-                        -- still wait for the mvar to become empty because by the time we reach
-                        -- here, another counter might already have claimed ownership.) (Note that
-                        -- an async exception could trigger here despite the mask; this is not a
-                        -- problem.)
-                        putMVar writeOwnerM $ WriteOwner counter
+                (chunkSz', mIoFinalizer') <-
+                  if hasOwnership
+                    then -- The environment is still owned by this writeLMDB. The same IOFinalizer
+                    -- is in effect. We continue writing to the same transaction.
+                    do
+                      return (chunkSz, mIoFinalizer)
+                    else do
+                      -- If the environment is owned by a different counter or the owner mvar is
+                      -- empty (i.e., the environment is not owned by any counter), we wait for the
+                      -- owner mvar to become empty. (Note that in the empty mvar case, we still
+                      -- wait for the mvar to become empty because by the time we reach here,
+                      -- another counter might already have claimed ownership.) (Note that an async
+                      -- exception could trigger here despite the mask; this is not a problem.)
+                      putMVar writeOwnerM $ WriteOwner counter
 
-                        -- (4) Due to MDB_NOLOCK, we have to make sure that no readers are active
-                        -- when a write transaction begins; see
-                        -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L619
-                        -- We assume that readers modify numReadersT only with takeTMVar followed by
-                        -- putTMVar, which implies that during the IO actions we perform until the
-                        -- next numReadersReset (i.e., the IO actions to begin the write
-                        -- transaction) there can be no modification of numReadersT.
-                        numReadersReset <-
-                          onException
-                            (waitForZeroReaders numReadersT)
-                            disclaimWriteOwnership
-
-                        ptxn <-
-                          finally
-                            ( onException
-                                (txn_begin penv nullPtr 0)
-                                disclaimWriteOwnership
-                            )
-                            -- Re-allow readers.
-                            numReadersReset
-
-                        putMVar writeOwnerDataM (WriteOwnerData {wPtxn = ptxn})
-
-                        ioFinalizer' <-
-                          newIOFinalizer $ do
-                            -- (3) This gets called upon GC, after this writeLMDB is going away upon
-                            -- synchronous or asynchronous exception or upon successful fold
-                            -- completion. (It’s not possible to “cancel” an mkWeakIORef finalizer,
-                            -- so this will inevitably get called.)
-                            --
-                            -- To avoid an extraneous transaction commit after a commit (a C
-                            -- double-free), we make sure we still have ownership.
-                            withMVarMasked ownershipLock $ \() -> do
-                              ownerData' <- tryReadMVar writeOwnerDataM
-                              case ownerData' of
-                                Nothing -> return ()
-                                Just (WriteOwnerData {wPtxn}) ->
-                                  void . whenOwned writeOwnerM counter $
-                                    -- We also disclaim ownership if the commit fails (and allow
-                                    -- future transaction operations to presumably fail). TODO: Can
-                                    -- we report the failure directly?
-                                    finally
-                                      (txn_commit wPtxn)
-                                      disclaimWriteOwnership
-
-
-
-                        return (0, Just ioFinalizer')
-
-                  -- Note: We commit and disclaim ownership upon synchronous exceptions and success
-                  -- because this should be done as early as possible. (Although the GC finalizer
-                  -- would eventually get to it, this might be unexpectedly late from
-                  -- the client’s point of view.)
-
-                  -- Insert the incoming key-value pair. If the insert succeeds from our point of
-                  -- view (although it could have failed from LMDB’s point of view; see (1)), we get
-                  -- a new chunk size. Otherwise, we get the LMDB exception.
-                  ptxn <- do
-                    mvarContents' <- tryReadMVar writeOwnerDataM
-                    case mvarContents' of
-                      Nothing -> throwErr "mvar expected"
-                      Just (WriteOwnerData {wPtxn}) -> return wPtxn
-                  eChunkSz'' <-
-                    unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
-                      catch
-                        ( do
-                            put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags
-                            return . Right $ chunkSz' + 1
-                        )
-                        ( \(e :: LMDB_Error) ->
-                            -- (1) Discard LMDB error if OverwriteAllowSameValue was specified and
-                            -- the error from LMDB was due to the exact same key-value pair already
-                            -- existing in the database.
-                            with (MDB_val (fromIntegral kl) kp) $ \pk -> alloca $ \pv -> do
-                              rc <- get ptxn dbi pk pv
-                              if rc == 0
-                                then do
-                                  v' <- peek pv
-                                  vbs <-
-                                    unsafePackCStringLen (mv_data v', fromIntegral $ mv_size v')
-                                  let ok =
-                                        overwriteOpt == OverwriteAllowSameValue
-                                          && e_code e == Right MDB_KEYEXIST
-                                          && vbs == v
-                                  return $
-                                    if ok
-                                      then Right chunkSz'
-                                      else Left e
-                                else do
-                                  return $ Left e
-                        )
-
-                  case eChunkSz'' of
-                    Right chunkSz'' -> do
-                      -- If writeTransactionSize has been reached, commit and disclaim ownership.
-                      when (chunkSz'' >= txnSize) $
-                        finally
-                          (txn_commit ptxn)
+                      -- (4) Due to MDB_NOLOCK, we have to make sure that no readers are active when
+                      -- a write transaction begins; see
+                      -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L619
+                      -- We assume that readers modify numReadersT only with takeTMVar followed by
+                      -- putTMVar, which implies that during the IO actions we perform until the
+                      -- next numReadersReset (i.e., the IO actions to begin the write transaction)
+                      -- there can be no modification of numReadersT.
+                      numReadersReset <-
+                        onException
+                          (waitForZeroReaders numReadersT)
                           disclaimWriteOwnership
 
-                      return $
-                        Partial
-                          ( threadId,
-                            counter,
-                            iter',
-                            chunkSz'',
-                            mIoFinalizer',
-                            ownershipLock,
-                            fstep
+                      ptxn <-
+                        finally
+                          ( onException
+                              (txn_begin penv nullPtr 0)
+                              disclaimWriteOwnership
                           )
-                    Left e -> do
-                      case fstep of
-                        Done _ -> do
-                          -- When the failure fold completes with Done, the outer writeLMDB fold
-                          -- should already have completed with Done as well; see (2). We should
-                          -- therefore never arrive here.
-                          throwErr "unexpected Done (step)"
-                        Partial s -> do
-                          -- Feed the offending key-value pair into the failure fold. (This could
-                          -- throw a synchronous exception.)
-                          fstep' <-
-                            onException
-                              (failStep s (e, k, v))
-                              ( finally
-                                  (txn_commit ptxn)
-                                  disclaimWriteOwnership
-                              )
+                          -- Re-allow readers.
+                          numReadersReset
 
-                          case fstep' of
-                            Done a -> do
-                              -- (2) The failure fold completed with Done; complete the outer
-                              -- writeLMDB fold with Done as well.
-                              finally
-                                (txn_commit ptxn)
-                                disclaimWriteOwnership
-                              return $ Done a
-                            Partial _ -> do
-                              -- The failure fold did not request completion; continue the outer
-                              -- writeLMDB fold as if nothing happened.
-                              return $
-                                Partial
-                                  ( threadId,
-                                    counter,
-                                    iter',
-                                    chunkSz',
-                                    mIoFinalizer',
-                                    ownershipLock,
-                                    fstep'
-                                  )
+                      putMVar writeOwnerDataM (WriteOwnerData {wPtxn = ptxn})
+
+                      ioFinalizer' <-
+                        newIOFinalizer . mask_ $ do
+                          -- (3) This gets called upon GC, after this writeLMDB is going away upon
+                          -- synchronous or asynchronous exception or upon successful fold
+                          -- completion. (It’s not possible to “cancel” an mkWeakIORef finalizer, so
+                          -- this will inevitably get called.)
+                          --
+                          -- To avoid an extraneous transaction commit after a commit (a C
+                          -- double-free), we make sure we still have ownership.
+                          ownerData' <- tryReadMVar writeOwnerDataM
+                          case ownerData' of
+                            Nothing -> return ()
+                            Just (WriteOwnerData {wPtxn}) ->
+                              void . whenOwned writeOwnerM counter $
+                                -- We also disclaim ownership if the commit fails (and allow future
+                                -- transaction operations to presumably fail). TODO: Can we report
+                                -- the failure directly?
+                                finally
+                                  (txn_commit wPtxn)
+                                  disclaimWriteOwnership
+
+                      return (0, Just ioFinalizer')
+
+                -- Note: We commit and disclaim ownership upon synchronous exceptions and success
+                -- because this should be done as early as possible. (Although the IOFinalizer would
+                -- eventually get to it, this might be unexpectedly late from the client’s point of
+                -- view.)
+                --
+                -- We do this by running the IOFinalizer itself; otherwise we would have a dangling
+                -- finalizer that could, if the next transaction is for the same writeLMDB, perform
+                -- an unwanted commit on that next transaction.
+                let commitAndDisclaimOwnership =
+                      maybe (return ()) runIOFinalizer mIoFinalizer'
+
+                -- Insert the incoming key-value pair. If the insert succeeds from our point of view
+                -- (although it could have failed from LMDB’s point of view; see (1)), we get a new
+                -- chunk size. Otherwise, we get the LMDB exception.
+                ptxn <- do
+                  mvarContents' <- tryReadMVar writeOwnerDataM
+                  case mvarContents' of
+                    Nothing -> throwErr "mvar expected"
+                    Just (WriteOwnerData {wPtxn}) -> return wPtxn
+                eChunkSz'' <-
+                  unsafeUseAsCStringLen k $ \(kp, kl) -> unsafeUseAsCStringLen v $ \(vp, vl) ->
+                    catch
+                      ( do
+                          put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) flags
+                          return . Right $ chunkSz' + 1
+                      )
+                      ( \(e :: LMDB_Error) ->
+                          -- (1) Discard LMDB error if OverwriteAllowSameValue was specified and the
+                          -- error from LMDB was due to the exact same key-value pair already
+                          -- existing in the database.
+                          with (MDB_val (fromIntegral kl) kp) $ \pk -> alloca $ \pv -> do
+                            rc <- get ptxn dbi pk pv
+                            if rc == 0
+                              then do
+                                v' <- peek pv
+                                vbs <-
+                                  unsafePackCStringLen (mv_data v', fromIntegral $ mv_size v')
+                                let ok =
+                                      overwriteOpt == OverwriteAllowSameValue
+                                        && e_code e == Right MDB_KEYEXIST
+                                        && vbs == v
+                                return $
+                                  if ok
+                                    then Right chunkSz'
+                                    else Left e
+                              else do
+                                return $ Left e
+                      )
+
+                case eChunkSz'' of
+                  Right chunkSz'' -> do
+                    -- If writeTransactionSize has been reached, commit and disclaim ownership.
+                    when (chunkSz'' >= txnSize) $
+                      commitAndDisclaimOwnership
+
+                    return $
+                      Partial
+                        ( threadId,
+                          counter,
+                          iter',
+                          chunkSz'',
+                          mIoFinalizer',
+                          fstep
+                        )
+                  Left e -> do
+                    case fstep of
+                      Done _ -> do
+                        -- When the failure fold completes with Done, the outer writeLMDB fold
+                        -- should already have completed with Done as well; see (2). We should
+                        -- therefore never arrive here.
+                        throwErr "unexpected Done (step)"
+                      Partial s -> do
+                        -- Feed the offending key-value pair into the failure fold. (This could
+                        -- throw a synchronous exception.)
+                        fstep' <-
+                          onException
+                            (failStep s (e, k, v))
+                            commitAndDisclaimOwnership
+
+                        case fstep' of
+                          Done a -> do
+                            -- (2) The failure fold completed with Done; complete the outer
+                            -- writeLMDB fold with Done as well.
+                            commitAndDisclaimOwnership
+                            return $ Done a
+                          Partial _ -> do
+                            -- The failure fold did not request completion; continue the outer
+                            -- writeLMDB fold as if nothing happened.
+                            return $
+                              Partial
+                                ( threadId,
+                                  counter,
+                                  iter',
+                                  chunkSz',
+                                  mIoFinalizer',
+                                  fstep'
+                                )
             )
-            ( do
-                threadId <- liftIO myThreadId
+            ( liftIO $ do
+                threadId <- myThreadId
 
                 let (_, writeCounterM, _, _) = mvars
-                counter <- liftIO $ incrementWriteCounter writeCounterM
+                counter <- incrementWriteCounter writeCounterM
 
-                -- Avoids conflicts between the main writeLMDB thread and the GC thread (see (3)).
-                ownershipLock <- liftIO $ newMVar ()
-
-                fstep <- liftIO failInit
+                fstep <- failInit
                 case fstep of
                   Done _ -> throwErr "writeFailureFold should begin with Partial"
                   Partial _ -> return ()
@@ -890,38 +880,25 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                       -- Chunk size.
                       0 :: Int,
                       Nothing :: Maybe IOFinalizer,
-                      ownershipLock,
                       -- Step of failure fold.
                       fstep
                     )
             )
             -- This final part is incompatible with scans.
-            ( \(threadId, counter, _, _, _, ownershipLock, fstep) -> liftIO $ do
+            ( \(threadId, _, _, _, mIoFinalizer, fstep) -> liftIO . mask_ $ do
                 threadId' <- myThreadId
                 when (threadId' /= threadId) $
                   throwErr "veered off the original thread at the end"
 
-                let (_, _, writeOwnerM, writeOwnerDataM) = mvars
-                let disclaimWriteOwnership =
-                      void . mask_ $ tryTakeMVar writeOwnerM >> tryTakeMVar writeOwnerDataM
+                maybe (return ()) runIOFinalizer mIoFinalizer
 
-                withMVarMasked ownershipLock $ \() -> do
-                  void $ whenOwned writeOwnerM counter $ do
-                    ownerData' <- tryReadMVar writeOwnerDataM
-                    case ownerData' of
-                      Nothing -> throwErr "ownerData expected (extract)"
-                      Just (WriteOwnerData {wPtxn}) ->
-                        finally
-                          (txn_commit wPtxn)
-                          disclaimWriteOwnership
-
-                  case fstep of
-                    Done _ ->
-                      -- As the failure fold completed with Done, the outer writeLMDB fold should
-                      -- have completed as well; see (2).
-                      throwErr "Unexpected Done (extract)"
-                    Partial s -> do
-                      failExtract s
+                case fstep of
+                  Done _ ->
+                    -- As the failure fold completed with Done, the outer writeLMDB fold should have
+                    -- completed as well; see (2).
+                    throwErr "Unexpected Done (extract)"
+                  Partial s -> do
+                    failExtract s
             )
 
 -- | Clears, i.e., removes all key-value pairs from, the given database. Please note that other
