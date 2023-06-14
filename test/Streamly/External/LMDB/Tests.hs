@@ -63,6 +63,7 @@ tests res =
        )
     ++ [ testWriteLMDBConcurrent res,
          testAsyncExceptionsConcurrent res,
+         testClearDatabaseConcurrent res,
          testBetween
        ]
 
@@ -428,6 +429,56 @@ testAsyncExceptionsConcurrent res =
       Set.fromList <$> (run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
 
     assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairsAll
+
+data TestAction = ActionRead | ActionWrite | ActionClear deriving (Show)
+
+instance Arbitrary TestAction where
+  arbitrary = oneof [return ActionRead, return ActionWrite, return ActionClear]
+
+-- | Perform reads, writes, and clearing on a database concurrently, read all key-value pairs back
+-- from the database using our library (already covered by 'testReadLMDB') and make sure they are as
+-- expected.
+testClearDatabaseConcurrent :: IO Channel -> TestTree
+testClearDatabaseConcurrent res =
+  testProperty "clearDatabaseConcurrent" . monadicIO . withEnvDb res $ \_ db -> do
+    numThreads <- pick $ chooseInt (1, 10)
+    chunkSz <- pick $ chooseInt (1, 5)
+    pairss <- generateConcurrentPairs numThreads chunkSz
+
+    actions :: [TestAction] <- replicateM numThreads $ pick arbitrary
+    lastActionM <- run $ newMVar ActionRead
+
+    _ <- run $
+      forConcurrently (zip actions pairss) $
+        \(action, (_, pairs, failureFold, unsafeFFI)) ->
+          case action of
+            ActionRead -> do
+              _ <- toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
+              modifyMVar_ lastActionM (\_ -> return ActionRead)
+            ActionWrite -> do
+              S.fromList @IO pairs
+                & S.fold
+                  ( writeLMDB @IO db $
+                      defaultWriteOptions
+                        { writeTransactionSize = chunkSz,
+                          writeOverwriteOptions = OverwriteAllow,
+                          writeUnsafeFFI = unsafeFFI,
+                          writeFailureFold = failureFold
+                        }
+                  )
+              modifyMVar_ lastActionM (\_ -> return ActionWrite)
+            ActionClear -> do
+              clearDatabase db
+              modifyMVar_ lastActionM (\_ -> return ActionClear)
+
+    readPairsAll <-
+      Set.fromList <$> (run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
+
+    lastAction' <- run $ readMVar lastActionM
+    assertMsg "assert failure" $
+      case lastAction' of
+        ActionClear -> null readPairsAll
+        _ -> True
 
 -- | A bytestring with a limited random length. (We don’t see much value in testing with longer
 -- bytestrings.)
