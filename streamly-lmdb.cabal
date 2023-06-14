@@ -48,6 +48,7 @@ library
     , base >=4.7 && <5
     , bytestring >=0.10.10.0 && <0.12
     , safe-exceptions >=0.1.7.3 && <0.2
+    , stm >=2.5.0.2 && <2.6
     , streamly ==0.9.*
     , streamly-core ==0.1.*
     , time >=1.11.1.1 && <1.12

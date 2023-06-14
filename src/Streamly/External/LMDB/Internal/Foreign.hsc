@@ -200,6 +200,9 @@ mdb_rdonly = #const MDB_RDONLY
 mdb_notls :: CUInt
 mdb_notls = #const MDB_NOTLS
 
+mdb_nolock :: CUInt
+mdb_nolock = #const MDB_NOLOCK
+
 mdb_nosubdir :: CUInt
 mdb_nosubdir = #const MDB_NOSUBDIR
 
