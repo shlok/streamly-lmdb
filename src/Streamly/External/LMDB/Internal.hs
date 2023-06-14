@@ -4,7 +4,6 @@ module Streamly.External.LMDB.Internal where
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Data.Time.Clock
 import Foreign
 import Streamly.External.LMDB.Internal.Foreign
 
@@ -36,11 +35,8 @@ newtype WriteCounter = WriterCounter Int deriving (Bounded, Eq, Num, Ord)
 -- The counter that currently owns the environment when it comes to writing.
 newtype WriteOwner = WriteOwner WriteCounter
 
--- Various data that the current 'WriteOwner' keeps track of. (This needs to be separate from
--- 'WriteOwner' because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
-data WriteOwnerData = WriteOwnerData
-  { wPtxn :: !(Ptr MDB_txn),
-    wLastPairTime :: !UTCTime
-  }
+-- Data that the current 'WriteOwner' keeps track of. (This needs to be separate from 'WriteOwner'
+-- because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
+newtype WriteOwnerData = WriteOwnerData { wPtxn :: Ptr MDB_txn }
 
 data Database mode = Database !(Environment mode) !MDB_dbi_t

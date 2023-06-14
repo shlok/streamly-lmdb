@@ -5,7 +5,6 @@
 
 module Streamly.External.LMDB.Tests where
 
-import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Exception hiding (assert)
 import Control.Monad
@@ -361,25 +360,11 @@ testWriteLMDBConcurrent res =
                       { writeTransactionSize = chunkSz,
                         writeOverwriteOptions = OverwriteAllow,
                         writeUnsafeFFI = unsafeFFI,
-                        writeFailureFold = failureFold,
-                        -- (*) At 100, but not at 1000, we saw the timeout routinely occurring
-                        -- before a chunkSz=5 got a chance to complete.
-                        writeTimeout = 100000
+                        writeFailureFold = failureFold
                       }
 
             S.fromList @IO pairs
               & S.indexed
-              & S.mapM
-                ( \x@(pairIdx, _) -> do
-                    -- (*) Uncommenting the condition below confirmed that having a larger
-                    -- threadDelay than writeTimeout does indeed cause other threads to get in at
-                    -- (threadIdx,pairIdx)=(1,3), as opposed to the threadIdx=1 transaction having
-                    -- to fully complete (i.e., get to chunkSz) first.
-                    let removeUnusedWarning = pairIdx
-                    let condition = False -- threadIdx == 1 && pairIdx == 3
-                    when condition (threadDelay 200000)
-                    return $ const x removeUnusedWarning
-                )
               & S.mapM
                 ( \(pairIdx, pair) -> do
                     let removeUnusedWarning = threadIdx + pairIdx
