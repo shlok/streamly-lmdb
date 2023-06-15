@@ -448,28 +448,33 @@ testClearDatabaseConcurrent res =
     actions :: [TestAction] <- replicateM numThreads $ pick arbitrary
     lastActionM <- run $ newMVar ActionRead
 
+    -- Fixes rare issues with lastAction inconsistency.
+    writeLockM <- run $ newMVar ()
+
     _ <- run $
       forConcurrently (zip actions pairss) $
         \(action, (_, pairs, failureFold, unsafeFFI)) ->
           case action of
             ActionRead -> do
               _ <- toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-              modifyMVar_ lastActionM (\_ -> return ActionRead)
-            ActionWrite -> do
-              S.fromList @IO pairs
-                & S.fold
-                  ( writeLMDB @IO db $
-                      defaultWriteOptions
-                        { writeTransactionSize = chunkSz,
-                          writeOverwriteOptions = OverwriteAllow,
-                          writeUnsafeFFI = unsafeFFI,
-                          writeFailureFold = failureFold
-                        }
-                  )
-              modifyMVar_ lastActionM (\_ -> return ActionWrite)
-            ActionClear -> do
-              clearDatabase db
-              modifyMVar_ lastActionM (\_ -> return ActionClear)
+              return () -- Only the last write action should matter.
+            ActionWrite ->
+              withMVar writeLockM $ \() -> do
+                S.fromList @IO pairs
+                  & S.fold
+                    ( writeLMDB @IO db $
+                        defaultWriteOptions
+                          { writeTransactionSize = chunkSz,
+                            writeOverwriteOptions = OverwriteAllow,
+                            writeUnsafeFFI = unsafeFFI,
+                            writeFailureFold = failureFold
+                          }
+                    )
+                modifyMVar_ lastActionM (\_ -> return ActionWrite)
+            ActionClear ->
+              withMVar writeLockM $ \() -> do
+                clearDatabase db
+                modifyMVar_ lastActionM (\_ -> return ActionClear)
 
     readPairsAll <-
       Set.fromList <$> (run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
