@@ -616,9 +616,14 @@ instance Exception StreamlyLMDBError
 -- transaction for each key-value pair) could yield suboptimal performance. One could try, e.g., 100
 -- KB chunks and benchmark from there.
 --
--- If 'writeLMDB' encounters an asynchronous exception, an internal finalizer commits the active
+-- If @writeLMDB@ encounters an asynchronous exception, an internal finalizer commits the active
 -- transaction upon garbage collection. To handle this in a timely fashion, consider using
 -- 'waitWriters'.
+-- 
+-- If you want to 'Streamly.Data.Fold.demux' to multiple @writeLMDB@s, make sure they are on
+-- different LMDB environments; since LMDB writers are serialized for each environment, you will
+-- otherwise encounter a deadlock (unless you leave 'writeTransactionSize' at 1). The same concern
+-- holds for 'writeFailureFold's if they themselves are @writeLMDB@s.
 {-# INLINE writeLMDB #-}
 writeLMDB ::
   (MonadIO m) =>
