@@ -1,0 +1,5 @@
+builds:
+  exclude: []
+  include:
+  - 'packages.x86_64-linux.streamly-lmdb-ci'
+  - 'packages.aarch64-darwin.streamly-lmdb-ci'
