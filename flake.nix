@@ -24,7 +24,7 @@
                     hfinal.callCabal2nix packageName ./. {
                       streamly = hprev.streamly_0_9_0.overrideAttrs (old: {
                           buildInputs =
-                            if system == "x86_64-darwin"
+                            if system == "x86_64-darwin" || system == "aarch64-darwin"
                               then [final.pkgs.darwin.apple_sdk.frameworks.Cocoa]
                               else [];
                         });
