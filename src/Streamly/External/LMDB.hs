@@ -303,7 +303,6 @@ closeDatabase :: (Mode mode) => Channel -> Database mode -> IO ()
 closeDatabase chan (Database (Environment penv _) dbi) =
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200
-  -- TODO: Look more into the aforementioned limitation.
   runOnChannel chan . mask_ $
     c_mdb_dbi_close penv dbi
 
@@ -747,6 +746,10 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
 
                       ioFinalizer' <-
                         newIOFinalizer . mask_ $
+                          -- (3) Upon ordinary transaction completion (during the writeLMDB, upon
+                          -- the writeLMDB’s normal completion, or upon synchronous exceptions), we
+                          -- call this ourselves with runIOFinalizer. Upon asynchronous exceptions,
+                          -- this gets called upon GC.
                           whenOwned writeOwnerM counter $ do
                             ownerData <- tryReadMVar writeOwnerDataM
                             case ownerData of
