@@ -45,6 +45,7 @@ module Streamly.External.LMDB
     -- * Reading
     readLMDB,
     unsafeReadLMDB,
+    waitReaders,
 
     -- ** Read-only transactions and cursors
     ReadOnlyTxn,
@@ -207,16 +208,13 @@ openEnvironment path limits = do
 -- To satisfy certain low-level LMDB requirements:
 --
 -- * Please use the same 'Channel' for all calls to this function.
--- * Before calling this function:
---
---     * Call 'closeDatabase' on all databases in the environment.
---     * Close all cursors and commit/abort all transactions on the environment. You can achieve
---       this by passing in a precreated cursor and transaction to 'readLMDB' and 'unsafeReadLMDB',
---       and respectively close and commit/abort them afterwards. (Alternatively, if precreated
---       cursor and transaction are really not desired, it should be possible to manually trigger
---       garbage collection and wait a long enough time (e.g., 100 microseconds) for certain
---       internal finalizers to execute.)
---
+-- * Before calling this function, call 'closeDatabase' on all databases in the environment.
+-- * Before calling this function, close all cursors and commit/abort all transactions on the
+--   environment. To make sure this requirement is satisified for read-only transactions, either (a)
+--   call 'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and
+--   'unsafeReadLMDB' and make sure they have already been closed/aborted. To make sure this
+--   requirement is satisified for read-write transactions, see the 'writeLMDB' documentation on how
+--   to handle asynchronous exceptions.
 -- * After calling this function, do not use the environment or any related databases, transactions,
 --   and cursors.
 closeEnvironment :: (Mode mode) => Channel -> Environment mode -> IO ()
@@ -296,9 +294,12 @@ getDatabase env@(Environment penv mvars) name = mask_ $ do
 --
 -- * Please use the same 'Channel' for all calls to this function.
 -- * Before calling this function, make sure all read-write transactions that have modified the
---   database have already been committed or aborted. (See the 'writeLMDB' documentation on how to
---   handle asynchronous exceptions.)
--- * After calling this function, do not use the database or any of its cursors again.
+--   database have already been committed or aborted. See the 'writeLMDB' documentation on how to
+--   handle asynchronous exceptions.
+-- * After calling this function, do not use the database or any of its cursors again. To make sure
+--   this requirement is satisfied for cursors on read-only transactions, either (a) call
+--   'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and 'unsafeReadLMDB'
+--   and make sure they have already been closed/aborted.
 closeDatabase :: (Mode mode) => Channel -> Database mode -> IO ()
 closeDatabase chan (Database (Environment penv _) dbi) =
   -- Requirements:
@@ -618,7 +619,7 @@ instance Exception StreamlyLMDBError
 -- If @writeLMDB@ encounters an asynchronous exception, an internal finalizer commits the active
 -- transaction upon garbage collection. To handle this in a timely fashion, consider using
 -- 'waitWriters'.
--- 
+--
 -- If you want to 'Streamly.Data.Fold.demux' to multiple @writeLMDB@s, make sure they are on
 -- different LMDB environments; since LMDB writers are serialized for each environment, you will
 -- otherwise encounter a deadlock (unless you leave 'writeTransactionSize' at 1). The same concern
@@ -916,6 +917,15 @@ waitWriters (Environment _ mvars) = do
           void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
     disclaimWriteOwnership
 
+-- | Waits for active read-only transactions on the given environment to finish. Note: This triggers
+-- garbage collection.
+waitReaders :: (Mode mode) => Environment mode -> IO ()
+waitReaders (Environment _ mvars) = mask_ $ do
+  let (numReadersT, _, _, _) = mvars
+  -- This is a special use-case of waitForZeroReaders, where the goal is not preparation for a write
+  -- transaction.
+  join $ waitForZeroReaders numReadersT
+
 -- | Clears, i.e., removes all key-value pairs from, the given database. Please note that other
 -- read-write transactions wait until this operation completes.
 clearDatabase :: Database ReadWrite -> IO ()
@@ -974,6 +984,7 @@ waitForZeroReaders :: TMVar NumReaders -> IO (IO ())
 waitForZeroReaders numReadersT = do
   let throwErr = throwError "waitForZeroReaders"
   let numReadersReset = atomically $ putTMVar numReadersT 0
+  performGC -- Complete active readers as soon as possible.
   numReaders <-
     atomically $ do
       numReaders <- takeTMVar numReadersT

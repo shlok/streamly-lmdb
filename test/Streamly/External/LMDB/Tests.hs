@@ -112,6 +112,8 @@ withEnvDbN n (ShouldCloseDb shouldClose) res f = do
         )
   a <- f $ V.map (\(_, x, y) -> (x, y)) dirEnvsDbs
   run $ forM_ dirEnvsDbs $ \(dir, env, db) -> do
+    waitReaders env
+
     when shouldClose $ do
       closeDatabase chan db
 
