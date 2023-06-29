@@ -9,7 +9,7 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        ghcVersion = "927";
+        ghcVersion = "928";
         packageName = "streamly-lmdb";
         config = {};
 
