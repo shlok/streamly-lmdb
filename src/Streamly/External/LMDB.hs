@@ -234,19 +234,21 @@ closeEnvironment chan (Environment penv _) =
 -- the environment’s limits should have been adjusted accordingly. The unnamed database will in this
 -- case contain the names of the named databases as keys, which one is allowed to read but not
 -- write.
+--
+-- To satisfy certain low-level LMDB requirements, please use the same 'Channel' for all calls to
+-- this function.
 getDatabase ::
   forall mode.
   (Mode mode) =>
+  Channel ->
   Environment mode ->
   Maybe String ->
   IO (Database mode)
-getDatabase env@(Environment penv mvars) name = mask_ $ do
-  -- This function will presumably be called relatively rarely; for simplicity we therefore imagine
-  -- for write serialization purposes that we’re always a writer (even though the mode could be
-  -- ReadOnly). This by itself also takes care of lower-level concurrency requirements mentioned at
-  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118
-  -- (without the need of a channel).
-  --
+getDatabase chan env@(Environment penv mvars) name = mask_ $ do
+  -- TODO: This function will presumably be called relatively rarely. For simplicity we therefore,
+  -- for now, imagine for write serialization purposes that we’re always a writer (even though the
+  -- mode could be ReadOnly).
+
   -- The MVar/TMVar logic is similar as in writeLMDB.
   let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
   writeCounter <- incrementWriteCounter writeCounterM
@@ -271,14 +273,17 @@ getDatabase env@(Environment penv mvars) name = mask_ $ do
               -- Re-allow readers.
               numReadersReset
 
-          onException
-            ( mdb_dbi_open
-                ptxn
-                name
-                (combineOptions $ [mdb_create | not $ isReadOnlyEnvironment @mode])
-                <* mdb_txn_commit ptxn
-            )
-            (c_mdb_txn_abort ptxn)
+          -- Low-level LMDB concurrency requirements:
+          -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118.
+          runOnChannel chan $
+            onException
+              ( mdb_dbi_open
+                  ptxn
+                  name
+                  (combineOptions $ [mdb_create | not $ isReadOnlyEnvironment @mode])
+                  <* mdb_txn_commit ptxn
+              )
+              (c_mdb_txn_abort ptxn)
       )
       disclaimWriteOwnership
 

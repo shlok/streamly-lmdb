@@ -107,7 +107,7 @@ withEnvDbN n (ShouldCloseDb shouldClose) res f = do
             tmpParent <- getCanonicalTemporaryDirectory
             tmpDir <- createTempDirectory tmpParent "streamly-lmdb-tests"
             env <- openEnvironment tmpDir $ defaultLimits {mapSize = tebibyte}
-            db <- getDatabase env Nothing
+            db <- getDatabase chan env Nothing
             return (tmpDir, env, db)
         )
   a <- f $ V.map (\(_, x, y) -> (x, y)) dirEnvsDbs
