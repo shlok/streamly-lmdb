@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - rare-timeout
   pull_request:
     types:
       - opened
