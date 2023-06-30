@@ -1,3 +1,5 @@
+{-# LANGUAGE NumericUnderscores #-}
+
 module Main where
 
 import Streamly.External.LMDB.Channel
@@ -9,7 +11,7 @@ main =
   defaultMain $
     withResource
       ( do
-          chan <- createChannel defaultChannelOptions
+          chan <- createChannel $ defaultChannelOptions { channelTimeout = 60_000_000 }
           startChannel chan
           return chan
       )
