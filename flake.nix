@@ -54,7 +54,7 @@
           "${packageName}-ci" =
             pkgs.haskell.lib.overrideCabal
               pkgs.${packageName}
-              (drv: { testFlags = ["--quickcheck-tests=200"]; });
+              (drv: { testFlags = ["--quickcheck-tests=5000"]; });
         };
 
         devShells.default = pkgs.myDevShell;

@@ -93,6 +93,7 @@ import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
 import Foreign.Marshal.Utils (with)
 import Foreign.Storable (poke)
+import GHC.Conc
 import GHC.Exts
 import qualified Streamly.Data.Fold as F
 import Streamly.External.LMDB.Channel (Channel)
@@ -218,10 +219,11 @@ openEnvironment path limits = do
 -- * After calling this function, do not use the environment or any related databases, transactions,
 --   and cursors.
 closeEnvironment :: (Mode mode) => Channel -> Environment mode -> IO ()
-closeEnvironment chan (Environment penv _) =
+closeEnvironment chan (Environment penv _) = do
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787
-  runOnChannel "closeEnvironment" chan . mask_ $
+  let ctx = printf "closeEnvironment; %d" numCapabilities
+  runOnChannel ctx chan . mask_ $
     c_mdb_env_close penv
 
 -- | Gets a database with the given name. When creating a database (i.e., getting it for the first
@@ -275,7 +277,8 @@ getDatabase chan env@(Environment penv mvars) name = mask_ $ do
 
           -- Low-level LMDB concurrency requirements:
           -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118.
-          runOnChannel "getDatabase" chan . mask_ $
+          let ctx = printf "getDatabase; %d" numCapabilities
+          runOnChannel ctx chan . mask_ $
             onException
               ( mdb_dbi_open
                   ptxn
@@ -306,10 +309,11 @@ getDatabase chan env@(Environment penv mvars) name = mask_ $ do
 --   'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and 'unsafeReadLMDB'
 --   and make sure they have already been closed/aborted.
 closeDatabase :: (Mode mode) => Channel -> Database mode -> IO ()
-closeDatabase chan (Database (Environment penv _) dbi) =
+closeDatabase chan (Database (Environment penv _) dbi) = do
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200
-  runOnChannel "closeDatabase" chan . mask_ $
+  let ctx = printf "closeDatabase; %d" numCapabilities
+  runOnChannel ctx chan . mask_ $
     c_mdb_dbi_close penv dbi
 
 -- | Creates an unfold with which we can stream key-value pairs from the given database.
