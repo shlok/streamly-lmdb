@@ -221,7 +221,7 @@ closeEnvironment :: (Mode mode) => Channel -> Environment mode -> IO ()
 closeEnvironment chan (Environment penv _) =
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787
-  runOnChannel chan . mask_ $
+  runOnChannel "closeEnvironment" chan . mask_ $
     c_mdb_env_close penv
 
 -- | Gets a database with the given name. When creating a database (i.e., getting it for the first
@@ -275,7 +275,7 @@ getDatabase chan env@(Environment penv mvars) name = mask_ $ do
 
           -- Low-level LMDB concurrency requirements:
           -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118.
-          runOnChannel chan $
+          runOnChannel "getDatabase" chan . mask_ $
             onException
               ( mdb_dbi_open
                   ptxn
@@ -309,7 +309,7 @@ closeDatabase :: (Mode mode) => Channel -> Database mode -> IO ()
 closeDatabase chan (Database (Environment penv _) dbi) =
   -- Requirements:
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200
-  runOnChannel chan . mask_ $
+  runOnChannel "closeDatabase" chan . mask_ $
     c_mdb_dbi_close penv dbi
 
 -- | Creates an unfold with which we can stream key-value pairs from the given database.

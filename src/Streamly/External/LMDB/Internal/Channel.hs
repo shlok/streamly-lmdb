@@ -63,8 +63,8 @@ endChannel Channel {cChan, cEnd} = do
 --
 -- The IO action will be executed on the /same thread/ on which 'startChannel' was run. If the IO
 -- action throws a synchronous exception, it is rethrown; the channel keeps running.
-runOnChannel :: Channel -> IO a -> IO a
-runOnChannel Channel {cChan, cRunLock, cTimeout} io =
+runOnChannel :: String -> Channel -> IO a -> IO a
+runOnChannel ctx Channel {cChan, cRunLock, cTimeout} io =
   -- TODO: Consider adding a maxBuffer to 'Channel'.
   withMVar cRunLock $ \() -> do
     -- Create a new result MVar for every 'runOnChannel' to avoid a rigid @Channel a@ type (i.e., to
@@ -84,8 +84,8 @@ runOnChannel Channel {cChan, cRunLock, cTimeout} io =
       Nothing ->
         throwChanErr $
           "runOnChannel timed out; unstarted or ended channel? "
-            ++ "too large LMDB write transaction size? "
-            ++ "a deadlock (caused by a streamly-lmdb bug)?"
+            ++ "a deadlock (caused by a streamly-lmdb bug)? "
+            ++ "ctx: " ++ show ctx
       Just e -> either throwIO return e -- Rethrow synchronous exception from the IO action.
 
 throwChanErr :: String -> m a
