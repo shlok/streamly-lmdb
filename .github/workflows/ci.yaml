@@ -11,7 +11,7 @@ on:
       - opened
       - synchronize
 
-  # Allows you to run this workflow manually from the Actions tab
+  # Allows us to run the workflow manually from the Actions tab.
   workflow_dispatch:
 
   schedule:
@@ -50,7 +50,7 @@ jobs:
           restore-keys: |
             cabal-${{ matrix.cabal }}-${{ matrix.os }}-${{ matrix.ghc }}-
       - run: cabal v2-build $CONFIG
-      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 200'
+      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 20000'
       - run: cabal v2-haddock $CONFIG
       - run: cabal v2-sdist
   stack:
@@ -73,7 +73,6 @@ jobs:
       - run: brew install lmdb
         if: contains(matrix.os, 'macos')
       - uses: actions/cache@v3.3.1
-        # if: contains(matrix.os, 'ubuntu') # Avoid "cannot execute binary file" error on macOS.
         with:
           path: |
             ~/.stack
@@ -82,6 +81,6 @@ jobs:
           restore-keys: |
             stack-${{ matrix.stack }}-${{ matrix.os }}-
       - run: stack build
-      - run: stack test --test-arguments="--quickcheck-tests 200"
+      - run: stack test --test-arguments="--quickcheck-tests 20000"
       - run: stack haddock
       - run: stack sdist
