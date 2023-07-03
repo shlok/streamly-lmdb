@@ -23,7 +23,7 @@ instance Mode ReadOnly where isReadOnlyMode _ = True
 data Environment mode
   = Environment
       !(Ptr MDB_env)
-      !(TMVar NumReaders, MVar WriteCounter, MVar WriteOwner, MVar WriteOwnerData)
+      !(TMVar NumReaders, MVar WriteCounter, MVar WriteOwner, MVar WriteOwnerData, CloseDbLock)
 
 -- The number of current readers. This needs to be kept track of due to MDB_NOLOCK; see comments in
 -- writeLMDB.
@@ -37,6 +37,9 @@ newtype WriteOwner = WriteOwner WriteCounter
 
 -- Data that the current 'WriteOwner' keeps track of. (This needs to be separate from 'WriteOwner'
 -- because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
-newtype WriteOwnerData = WriteOwnerData { wPtxn :: Ptr MDB_txn }
+newtype WriteOwnerData = WriteOwnerData {wPtxn :: Ptr MDB_txn}
+
+-- For closeDatabase serialization.
+newtype CloseDbLock = CloseDbLock (MVar ())
 
 data Database mode = Database !(Environment mode) !MDB_dbi_t

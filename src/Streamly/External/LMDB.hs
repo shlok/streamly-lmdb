@@ -93,12 +93,9 @@ import Foreign.C (Errno (Errno), eNOTDIR)
 import Foreign.C.String (CStringLen)
 import Foreign.Marshal.Utils (with)
 import Foreign.Storable (poke)
-import GHC.Conc
 import GHC.Exts
 import qualified Streamly.Data.Fold as F
-import Streamly.External.LMDB.Channel (Channel)
 import Streamly.External.LMDB.Internal
-import Streamly.External.LMDB.Internal.Channel hiding (Channel)
 import Streamly.External.LMDB.Internal.Error
 import Streamly.External.LMDB.Internal.Foreign
 import Streamly.Internal.Data.Fold (Fold (Fold), Step (..))
@@ -179,7 +176,13 @@ openEnvironment path limits = do
   let maxDbs = maxDatabases limits in when (maxDbs /= 0) $ mdb_env_set_maxdbs penv maxDbs
   mdb_env_set_maxreaders penv (maxReaders limits)
 
-  mvars <- (,,,) <$> newTMVarIO 0 <*> newMVar (-1) <*> newEmptyMVar <*> newEmptyMVar
+  mvars <-
+    (,,,,)
+      <$> newTMVarIO 0
+      <*> newMVar (-1)
+      <*> newEmptyMVar
+      <*> newEmptyMVar
+      <*> (CloseDbLock <$> newMVar ())
 
   -- Always use MDB_NOTLS; this is crucial for Haskell applications; see
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L615
@@ -208,7 +211,6 @@ openEnvironment path limits = do
 --
 -- To satisfy certain low-level LMDB requirements:
 --
--- * Please use the same 'Channel' for all calls to this function.
 -- * Before calling this function, call 'closeDatabase' on all databases in the environment.
 -- * Before calling this function, close all cursors and commit/abort all transactions on the
 --   environment. To make sure this requirement is satisified for read-only transactions, either (a)
@@ -218,13 +220,12 @@ openEnvironment path limits = do
 --   to handle asynchronous exceptions.
 -- * After calling this function, do not use the environment or any related databases, transactions,
 --   and cursors.
-closeEnvironment :: (Mode mode) => Channel -> Environment mode -> IO ()
-closeEnvironment chan (Environment penv _) = do
-  -- Requirements:
-  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787
-  let ctx = printf "closeEnvironment; %d" numCapabilities
-  runOnChannel ctx chan . mask_ $
-    c_mdb_env_close penv
+closeEnvironment :: (Mode mode) => Environment mode -> IO ()
+closeEnvironment (Environment penv _) = do
+  -- An environment should only be closed once, so the low-level concurrency requirements should be
+  -- fulfilled:
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787.
+  c_mdb_env_close penv
 
 -- | Gets a database with the given name. When creating a database (i.e., getting it for the first
 -- time), one must do so in 'ReadWrite' mode.
@@ -236,23 +237,21 @@ closeEnvironment chan (Environment penv _) = do
 -- the environment’s limits should have been adjusted accordingly. The unnamed database will in this
 -- case contain the names of the named databases as keys, which one is allowed to read but not
 -- write.
---
--- To satisfy certain low-level LMDB requirements, please use the same 'Channel' for all calls to
--- this function.
 getDatabase ::
   forall mode.
   (Mode mode) =>
-  Channel ->
   Environment mode ->
   Maybe String ->
   IO (Database mode)
-getDatabase chan env@(Environment penv mvars) name = mask_ $ do
+getDatabase env@(Environment penv mvars) name = mask_ $ do
   -- TODO: This function will presumably be called relatively rarely. For simplicity we therefore,
   -- for now, imagine for write serialization purposes that we’re always a writer (even though the
-  -- mode could be ReadOnly).
+  -- mode could be ReadOnly). This by itself also takes care of lower-level concurrency requirements
+  -- mentioned at
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118.
 
   -- The MVar/TMVar logic is similar as in writeLMDB.
-  let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
+  let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM, _) = mvars
   writeCounter <- incrementWriteCounter writeCounterM
   putMVar writeOwnerM $ WriteOwner writeCounter
   let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
@@ -275,18 +274,14 @@ getDatabase chan env@(Environment penv mvars) name = mask_ $ do
               -- Re-allow readers.
               numReadersReset
 
-          -- Low-level LMDB concurrency requirements:
-          -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118.
-          let ctx = printf "getDatabase; %d" numCapabilities
-          runOnChannel ctx chan . mask_ $
-            onException
-              ( mdb_dbi_open
-                  ptxn
-                  name
-                  (combineOptions $ [mdb_create | not $ isReadOnlyEnvironment @mode])
-                  <* mdb_txn_commit ptxn
-              )
-              (c_mdb_txn_abort ptxn)
+          onException
+            ( mdb_dbi_open
+                ptxn
+                name
+                (combineOptions $ [mdb_create | not $ isReadOnlyEnvironment @mode])
+                <* mdb_txn_commit ptxn
+            )
+            (c_mdb_txn_abort ptxn)
       )
       disclaimWriteOwnership
 
@@ -300,7 +295,6 @@ getDatabase chan env@(Environment penv mvars) name = mask_ $ do
 --
 -- To satisfy certain low-level LMDB requirements:
 --
--- * Please use the same 'Channel' for all calls to this function.
 -- * Before calling this function, make sure all read-write transactions that have modified the
 --   database have already been committed or aborted. See the 'writeLMDB' documentation on how to
 --   handle asynchronous exceptions.
@@ -308,12 +302,12 @@ getDatabase chan env@(Environment penv mvars) name = mask_ $ do
 --   this requirement is satisfied for cursors on read-only transactions, either (a) call
 --   'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and 'unsafeReadLMDB'
 --   and make sure they have already been closed/aborted.
-closeDatabase :: (Mode mode) => Channel -> Database mode -> IO ()
-closeDatabase chan (Database (Environment penv _) dbi) = do
-  -- Requirements:
+closeDatabase :: (Mode mode) => Database mode -> IO ()
+closeDatabase (Database (Environment penv mvars) dbi) = do
+  -- We need to serialize the closing; see
   -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200
-  let ctx = printf "closeDatabase; %d" numCapabilities
-  runOnChannel ctx chan . mask_ $
+  let (_, _, _, _, CloseDbLock lock) = mvars
+  withMVar lock $ \() ->
     c_mdb_dbi_close penv dbi
 
 -- | Creates an unfold with which we can stream key-value pairs from the given database.
@@ -420,7 +414,7 @@ unsafeReadLMDB (Database (Environment penv mvars) dbi) mtxncurs ropts kmap vmap 
                   return Stop
           )
           ( \op -> do
-              let (numReadersT, _, _, _) = mvars
+              let (numReadersT, _, _, _, _) = mvars
 
               (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
                 (ptxn, pcurs) <- case mtxncurs of
@@ -478,7 +472,7 @@ data ReadOnlyTxn mode = ReadOnlyTxn !(Environment mode) !(Ptr MDB_txn)
 -- of the transaction with 'abortReadOnlyTxn'.
 beginReadOnlyTxn :: Environment mode -> IO (ReadOnlyTxn mode)
 beginReadOnlyTxn env@(Environment penv mvars) = mask_ $ do
-  let (numReadersT, _, _, _) = mvars
+  let (numReadersT, _, _, _, _) = mvars
 
   -- Similar comments for NumReaders as in unsafeReadLMDB.
   atomically $ do
@@ -495,7 +489,7 @@ beginReadOnlyTxn env@(Environment penv mvars) = mask_ $ do
 -- | Disposes of a read-only transaction created with 'beginReadOnlyTxn'.
 abortReadOnlyTxn :: ReadOnlyTxn mode -> IO ()
 abortReadOnlyTxn (ReadOnlyTxn (Environment _ mvars) ptxn) = mask_ $ do
-  let (numReadersT, _, _, _) = mvars
+  let (numReadersT, _, _, _, _) = mvars
   c_mdb_txn_abort ptxn
   -- Similar comments for NumReaders as in unsafeReadLMDB.
   atomically $ do
@@ -709,7 +703,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
                 -- (e.g., because the user chose a reasonably small 'writeTransactionSize'). TODO:
                 -- Think about introducing mask restore where applicable.)
 
-                let (numReadersT, _, writeOwnerM, writeOwnerDataM) = mvars
+                let (numReadersT, _, writeOwnerM, writeOwnerDataM, _) = mvars
                 let disclaimWriteOwnership =
                       void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM
 
@@ -875,7 +869,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
             ( liftIO $ do
                 threadId <- myThreadId
 
-                let (_, writeCounterM, _, _) = mvars
+                let (_, writeCounterM, _, _, _) = mvars
                 counter <- incrementWriteCounter writeCounterM
 
                 fstep <- failInit
@@ -917,7 +911,7 @@ writeLMDB (Database (Environment penv mvars) dbi) wopts =
 -- Note: This triggers garbage collection.
 waitWriters :: Environment ReadWrite -> IO ()
 waitWriters (Environment _ mvars) = do
-  let (_, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
+  let (_, writeCounterM, writeOwnerM, writeOwnerDataM, _) = mvars
   writeCounter <- incrementWriteCounter writeCounterM
   performGC
   mask_ $ do
@@ -930,7 +924,7 @@ waitWriters (Environment _ mvars) = do
 -- garbage collection.
 waitReaders :: (Mode mode) => Environment mode -> IO ()
 waitReaders (Environment _ mvars) = mask_ $ do
-  let (numReadersT, _, _, _) = mvars
+  let (numReadersT, _, _, _, _) = mvars
   -- This is a special use-case of waitForZeroReaders, where the goal is not preparation for a write
   -- transaction.
   join $ waitForZeroReaders numReadersT
@@ -940,7 +934,7 @@ waitReaders (Environment _ mvars) = mask_ $ do
 clearDatabase :: Database ReadWrite -> IO ()
 clearDatabase (Database (Environment penv mvars) dbi) = mask $ \restore -> do
   -- The MVar/TMVar logic is similar as in writeLMDB.
-  let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM) = mvars
+  let (numReadersT, writeCounterM, writeOwnerM, writeOwnerDataM, _) = mvars
   writeCounter <- incrementWriteCounter writeCounterM
   putMVar writeOwnerM $ WriteOwner writeCounter
   let disclaimWriteOwnership = void . mask_ $ tryTakeMVar writeOwnerDataM >> tryTakeMVar writeOwnerM

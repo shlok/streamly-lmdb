@@ -107,7 +107,7 @@ withEnvDbN n (ShouldCloseDb shouldClose) res f = do
             tmpParent <- getCanonicalTemporaryDirectory
             tmpDir <- createTempDirectory tmpParent "streamly-lmdb-tests"
             env <- openEnvironment tmpDir $ defaultLimits {mapSize = tebibyte}
-            db <- getDatabase chan env Nothing
+            db <- getDatabase env Nothing
             return (tmpDir, env, db)
         )
   a <- f $ V.map (\(_, x, y) -> (x, y)) dirEnvsDbs
@@ -115,13 +115,13 @@ withEnvDbN n (ShouldCloseDb shouldClose) res f = do
     waitReaders env
 
     when shouldClose $ do
-      closeDatabase chan db
+      closeDatabase db
 
     -- If we don’t close the database, we still need this to avoid certain “too many open files”
     -- errors. (Since we will not use any transactions/databases/cursors after this call, this
     -- should be safe; see
     -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L788)
-    closeEnvironment chan env
+    closeEnvironment env
 
     removeDirectoryRecursive dir
   return a
