@@ -23,9 +23,7 @@ source-repository head
 library
   exposed-modules:
       Streamly.External.LMDB
-      Streamly.External.LMDB.Channel
       Streamly.External.LMDB.Internal
-      Streamly.External.LMDB.Internal.Channel
       Streamly.External.LMDB.Internal.Error
       Streamly.External.LMDB.Internal.Foreign
   other-modules:
@@ -44,8 +42,7 @@ library
   extra-libraries:
       lmdb
   build-depends:
-      async >=2.2.2 && <2.3
-    , base >=4.7 && <5
+      base >=4.7 && <5
     , bytestring >=0.10.10.0 && <0.12
     , safe-exceptions >=0.1.7.3 && <0.2
     , stm >=2.5.0.2 && <2.6

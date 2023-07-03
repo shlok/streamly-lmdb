@@ -3,6 +3,9 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Use <$>" #-}
 
 module Streamly.External.LMDB.Tests where
 
@@ -27,7 +30,6 @@ import qualified Streamly.Data.Fold as F
 import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
 import qualified Streamly.Data.Stream.Prelude as S
 import Streamly.External.LMDB
-import Streamly.External.LMDB.Channel
 import Streamly.External.LMDB.Internal
 import Streamly.External.LMDB.Internal.Foreign
 import qualified Streamly.Internal.Data.Fold as F
@@ -40,10 +42,10 @@ import Test.Tasty (TestTree)
 import Test.Tasty.QuickCheck hiding (mapSize)
 import Text.Printf
 
-tests :: IO Channel -> [TestTree]
-tests res =
-  [ testReadLMDB res,
-    testUnsafeReadLMDB res
+tests :: [TestTree]
+tests =
+  [ testReadLMDB,
+    testUnsafeReadLMDB
   ]
     ++ ( do
            overwriteOpts <-
@@ -53,7 +55,7 @@ tests res =
                OverwriteDisallow $ WriteAppend True
                ]
            failureFold <- [FailureThrow, FailureStop, FailureIgnore]
-           return $ testWriteLMDB overwriteOpts failureFold res
+           return $ testWriteLMDB overwriteOpts failureFold
        )
     ++ ( do
            overwriteOpts <-
@@ -62,13 +64,13 @@ tests res =
                OverwriteDisallow $ WriteAppend False,
                OverwriteDisallow $ WriteAppend True
                ]
-           return $ testWriteLMDBToList overwriteOpts res
+           return $ testWriteLMDBToList overwriteOpts
        )
-    ++ [ testWriteLMDBConcurrent res,
-         testWriteLMDBDemux res,
-         testWriteLMDBDemuxSameDb res,
-         testAsyncExceptionsConcurrent res,
-         testClearDatabaseConcurrent res,
+    ++ [ testWriteLMDBConcurrent,
+         testWriteLMDBDemux,
+         testWriteLMDBDemuxSameDb,
+         testAsyncExceptionsConcurrent,
+         testClearDatabaseConcurrent,
          testBetween
        ]
 
@@ -78,14 +80,12 @@ newtype ShouldCloseDb = ShouldCloseDb Bool
 
 withEnvDb ::
   ShouldCloseDb ->
-  IO Channel ->
   (Environment ReadWrite -> Database ReadWrite -> PropertyM IO a) ->
   PropertyM IO a
-withEnvDb shouldClose res f =
+withEnvDb shouldClose f =
   withEnvDbN
     1
     shouldClose
-    res
     ( \v -> case V.toList v of
         [(env, db)] -> f env db
         _ -> error "withEnvDb: unreachable"
@@ -94,11 +94,9 @@ withEnvDb shouldClose res f =
 withEnvDbN ::
   Int ->
   ShouldCloseDb ->
-  IO Channel ->
   (V.Vector (Environment ReadWrite, Database ReadWrite) -> PropertyM IO a) ->
   PropertyM IO a
-withEnvDbN n (ShouldCloseDb shouldClose) res f = do
-  chan <- run res
+withEnvDbN n (ShouldCloseDb shouldClose) f = do
   -- TODO: bracket for PropertyM?
   dirEnvsDbs <-
     V.fromList
@@ -139,9 +137,9 @@ withReadOnlyTxnAndCurs env db =
 
 -- | Write key-value pairs to a database in a normal manner, read them back using our library, and
 -- make sure the result is what we wrote.
-testReadLMDB :: IO Channel -> TestTree
-testReadLMDB res =
-  testProperty "readLMDB" . monadicIO . withEnvDb (ShouldCloseDb True) res $ \env db -> do
+testReadLMDB :: TestTree
+testReadLMDB =
+  testProperty "readLMDB" . monadicIO . withEnvDb (ShouldCloseDb True) $ \env db -> do
     keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
 
     run $ writeChunk db False keyValuePairs
@@ -155,9 +153,9 @@ testReadLMDB res =
     return $ results == expectedResults && resultsTxn == expectedResults
 
 -- | Similar to 'testReadLMDB', except that it tests the unsafe function in a different manner.
-testUnsafeReadLMDB :: IO Channel -> TestTree
-testUnsafeReadLMDB res =
-  testProperty "unsafeReadLMDB" . monadicIO . withEnvDb (ShouldCloseDb True) res $ \env db -> do
+testUnsafeReadLMDB :: TestTree
+testUnsafeReadLMDB =
+  testProperty "unsafeReadLMDB" . monadicIO . withEnvDb (ShouldCloseDb True) $ \env db -> do
     keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
 
     run $ writeChunk db False keyValuePairs
@@ -178,11 +176,11 @@ data FailureFold = FailureThrow | FailureStop | FailureIgnore deriving (Show)
 -- | Write key-value pairs to a database using our library with various options, read all key-value
 -- pairs back from the database using our library (already covered by 'testReadLMDB'), and make sure
 -- they are as expected.
-testWriteLMDB :: OverwriteOptions -> FailureFold -> IO Channel -> TestTree
-testWriteLMDB overwriteOpts failureFold res =
+testWriteLMDB :: OverwriteOptions -> FailureFold -> TestTree
+testWriteLMDB overwriteOpts failureFold =
   testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold))
     . monadicIO
-    . withEnvDb (ShouldCloseDb True) res
+    . withEnvDb (ShouldCloseDb True)
     $ \env db -> do
       -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
       -- normally result in bad performance. We therefore base the number of pairs on the chunk
@@ -286,11 +284,11 @@ testWriteLMDB overwriteOpts failureFold res =
 -- | Write key-value pairs to a database using our library with various options while collecting
 -- failures into a list, read all key-value pairs back from the database using our library (already
 -- covered by 'testReadLMDB'), and make sure they and the list of failures are as expected.
-testWriteLMDBToList :: OverwriteOptions -> IO Channel -> TestTree
-testWriteLMDBToList overwriteOpts res =
+testWriteLMDBToList :: OverwriteOptions -> TestTree
+testWriteLMDBToList overwriteOpts =
   testProperty (printf "writeLMDBToList (%s)" (show overwriteOpts))
     . monadicIO
-    . withEnvDb (ShouldCloseDb True) res
+    . withEnvDb (ShouldCloseDb True)
     $ \env db -> do
       do
         -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
@@ -350,9 +348,9 @@ testWriteLMDBToList overwriteOpts res =
 -- | Write key-value pairs to a database concurrently, read all key-value pairs back from the
 -- database using our library (already covered by 'testReadLMDB'), and make sure they are as
 -- expected.
-testWriteLMDBConcurrent :: IO Channel -> TestTree
-testWriteLMDBConcurrent res =
-  testProperty "writeLMDBConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) res $ \env db -> do
+testWriteLMDBConcurrent :: TestTree
+testWriteLMDBConcurrent =
+  testProperty "writeLMDBConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) $ \env db -> do
     -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than the
     -- chunk size on some threads but less than the chunk size on other threads. Our test being
     -- successful (esp. combined with the (*) below) means that writeLMDB’s concurrency mechanism
@@ -409,11 +407,11 @@ testWriteLMDBConcurrent res =
 -- | Write key-value pairs using multiple demuxed writeLMDBs with separate environments, read all
 -- key-value pairs back using our library (already covered by 'testReadLMDB'), and make sure they
 -- are as expected.
-testWriteLMDBDemux :: IO Channel -> TestTree
-testWriteLMDBDemux res =
+testWriteLMDBDemux :: TestTree
+testWriteLMDBDemux =
   testProperty "writeLMDBDemux" . monadicIO $ do
     numDemux <- pick $ chooseInt (1, 5)
-    withEnvDbN numDemux (ShouldCloseDb True) res $ \envDbs -> do
+    withEnvDbN numDemux (ShouldCloseDb True) $ \envDbs -> do
       chunkSzs <- V.generateM numDemux $ \_ -> pick $ chooseInt (1, 5)
 
       -- We use unique keys because we (at least for now) don’t want to worry about the order in
@@ -467,15 +465,14 @@ testWriteLMDBDemux res =
 -- | Write key-value pairs using multiple demuxed writeLMDBs into the same database with a write
 -- transaction size of 1, read all key-value pairs back using our library (already covered by
 -- 'testReadLMDB'), and make sure they are as expected.
-testWriteLMDBDemuxSameDb :: IO Channel -> TestTree
-testWriteLMDBDemuxSameDb res =
+testWriteLMDBDemuxSameDb :: TestTree
+testWriteLMDBDemuxSameDb =
   testProperty "writeLMDBDemuxSameDb"
     . monadicIO
     . withEnvDb
       -- We could not safely close the database when a deadlock leaves an active write transaction.
       -- (We leave this here in case we want to revisit our attempts to cover deadlocks.)
       (ShouldCloseDb False)
-      res
     $ \_ db -> do
       numDemux <- pick $ chooseInt (2, 5) -- Use at least 2 writeLMDBs for the demux.
 
@@ -533,9 +530,9 @@ testWriteLMDBDemuxSameDb res =
 -- | Perform reads and writes on a database concurrently, throwTo threads at random, and read all
 -- key-value pairs back from the database using our library (already covered by 'testReadLMDB') and
 -- make sure they are as expected.
-testAsyncExceptionsConcurrent :: IO Channel -> TestTree
-testAsyncExceptionsConcurrent res =
-  testProperty "asyncExceptionsConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) res $
+testAsyncExceptionsConcurrent :: TestTree
+testAsyncExceptionsConcurrent =
+  testProperty "asyncExceptionsConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) $
     \env db -> do
       numThreads <- pick $ chooseInt (1, 10)
       chunkSz <- pick $ chooseInt (1, 5)
@@ -605,9 +602,9 @@ instance Arbitrary TestAction where
 -- | Perform reads, writes, and clearing on a database concurrently, read all key-value pairs back
 -- from the database using our library (already covered by 'testReadLMDB') and make sure they are as
 -- expected.
-testClearDatabaseConcurrent :: IO Channel -> TestTree
-testClearDatabaseConcurrent res =
-  testProperty "clearDatabaseConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) res $
+testClearDatabaseConcurrent :: TestTree
+testClearDatabaseConcurrent =
+  testProperty "clearDatabaseConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) $
     \_ db -> do
       numThreads <- pick $ chooseInt (1, 10)
       chunkSz <- pick $ chooseInt (1, 5)
