@@ -211,7 +211,7 @@ openEnvironment path limits = do
 --
 -- To satisfy certain low-level LMDB requirements:
 --
--- * Before calling this function, call 'closeDatabase' on all databases in the environment.
+-- * Before calling this function, please call 'closeDatabase' on all databases in the environment.
 -- * Before calling this function, close all cursors and commit/abort all transactions on the
 --   environment. To make sure this requirement is satisified for read-only transactions, either (a)
 --   call 'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and
@@ -295,9 +295,9 @@ getDatabase env@(Environment penv mvars) name = mask_ $ do
 --
 -- To satisfy certain low-level LMDB requirements:
 --
--- * Before calling this function, make sure all read-write transactions that have modified the
---   database have already been committed or aborted. See the 'writeLMDB' documentation on how to
---   handle asynchronous exceptions.
+-- * Before calling this function, please make sure all read-write transactions that have modified
+--   the database have already been committed or aborted. See the 'writeLMDB' documentation on how
+--   to handle asynchronous exceptions.
 -- * After calling this function, do not use the database or any of its cursors again. To make sure
 --   this requirement is satisfied for cursors on read-only transactions, either (a) call
 --   'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and 'unsafeReadLMDB'
@@ -1003,7 +1003,8 @@ waitForZeroReaders numReadersT = do
 -- 'beginReadOnlyTxn') on the same environment complete. (On the other hand, read-only transactions
 -- can begin while a read-write transaction is active on the same environment.)
 --
--- (This is required because we use @MDB_NOLOCK@ under the hood for certain low-level reasons. We do
--- not consider this is a serious limitation because long-lived transactions are [discouraged by
+-- (This is required because we use @MDB_NOLOCK@ under the hood for certain low-level reasons. At
+-- least for now, we do not consider this is a too serious limitation because long-lived
+-- transactions are [discouraged by
 -- LMDB](https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L107)
 -- in any case.)
