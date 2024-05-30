@@ -1,3 +1,9 @@
+## 0.8.0
+
+* Added concurrency support for `writeLMDB`. (Note: There is no longer a need to execute `writeLMDB` folds on bound threads, and the environment files on disk no longer have accompanying `-lock` files. **TODO:** Remove bad `MDB_NOLOCK` idea before releasing.)
+* Fixed other concurrency issues.
+* Added the ability to stream `writeLMDB` failures into a separate fold.
+
 ## 0.7.0
 
 * Added `readUnsafeFFI` and `writeUnsafeFFI` options.
