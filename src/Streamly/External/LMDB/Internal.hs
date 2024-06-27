@@ -1,14 +1,1187 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneKindSignatures #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
 
 module Streamly.External.LMDB.Internal where
 
 import Control.Concurrent
+import qualified Control.Concurrent.Lifted as LI
 import Control.Concurrent.STM
-import Foreign
+import qualified Control.Exception as E
+import qualified Control.Exception.Lifted as LI
+import Control.Exception.Safe
+import Control.Monad
+import Control.Monad.IO.Class
+import Control.Monad.Trans.Control
+import Data.Bifunctor
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Unsafe as B
+import Data.Foldable
+import Data.Kind
+import Data.Sequence (Seq)
+import qualified Data.Sequence as Seq
+import Data.Void (Void)
+import Foreign hiding (void)
+import Foreign.C
+import GHC.TypeLits
+import Streamly.Data.Fold (Fold)
+import qualified Streamly.Data.Fold as F
+import qualified Streamly.Data.Stream.Prelude as S
+import Streamly.External.LMDB.Internal.Error
 import Streamly.External.LMDB.Internal.Foreign
+import qualified Streamly.Internal.Data.Fold as F
+import Streamly.Internal.Data.IOFinalizer
+import Streamly.Internal.Data.Stream (Stream)
+import Streamly.Internal.Data.Unfold (Unfold)
+import qualified Streamly.Internal.Data.Unfold as U
+import System.Directory
+import System.Mem
+import Text.Printf
 
--- This is in a separate internal module because the tests make use of the Database constructor.
+isReadOnlyEnvironment :: forall emode. (Mode emode) => Bool
+isReadOnlyEnvironment =
+  isReadOnlyMode @emode (error "isReadOnlyEnvironment: unreachable")
 
+-- | LMDB environments have various limits on the size and number of databases and concurrent
+-- readers.
+data Limits = Limits
+  { -- | Memory map size, in bytes (also the maximum size of all databases).
+    mapSize :: !Int,
+    -- | Maximum number of named databases.
+    maxDatabases :: !Int,
+    -- | Maximum number of concurrent 'ReadOnly' transactions
+    --   (also the number of slots in the lock table).
+    maxReaders :: !Int
+  }
+
+-- | The default limits are 1 MiB map size, 0 named databases (see [Databases](#g:databases)), and
+-- 126 concurrent readers. These can be adjusted freely, and in particular the 'mapSize' may be set
+-- very large (limited only by available address space). However, LMDB is not optimized for a large
+-- number of named databases so 'maxDatabases' should be kept to a minimum.
+--
+-- The default 'mapSize' is intentionally small, and should be changed to something appropriate for
+-- your application. It ought to be a multiple of the OS page size, and should be chosen as large as
+-- possible to accommodate future growth of the database(s). Once set for an environment, this limit
+-- cannot be reduced to a value smaller than the space already consumed by the environment; however,
+-- it can later be increased.
+--
+-- If you are going to use any named databases then you will need to change 'maxDatabases' to the
+-- number of named databases you plan to use. However, you do not need to change this field if you
+-- are only going to use the single main (unnamed) database.
+defaultLimits :: Limits
+defaultLimits =
+  Limits
+    { mapSize = mebibyte,
+      maxDatabases = 0,
+      maxReaders = 126
+    }
+
+-- | Open an LMDB environment in either 'ReadWrite' or 'ReadOnly' mode. The 'FilePath' argument may
+-- be either a directory or a regular file, but it must already exist; when creating a new
+-- environment, one should create an empty file or directory beforehand. If a regular file, an
+-- additional file with "-lock" appended to the name is automatically created for the reader lock
+-- table.
+--
+-- Note that an environment must have been opened in 'ReadWrite' mode at least once before it can be
+-- opened in 'ReadOnly' mode.
+--
+-- An environment opened in 'ReadOnly' mode may still modify the reader lock table (except when the
+-- filesystem is read-only, in which case no locks are used).
+--
+-- To satisfy certain low-level LMDB requirements, please do not have opened the same environment
+-- (i.e., the same 'FilePath') more than once in the same process at the same time. Furthermore,
+-- please use the environment in the process that opened it (not after forking a new process).
+openEnvironment :: forall emode. (Mode emode) => FilePath -> Limits -> IO (Environment emode)
+openEnvironment path limits = mask_ $ do
+  -- Low-level requirements:
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L100,
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L102
+
+  penv <- mdb_env_create
+  onException
+    ( do
+        mdb_env_set_mapsize penv limits.mapSize
+        let maxDbs = limits.maxDatabases in when (maxDbs /= 0) $ mdb_env_set_maxdbs penv maxDbs
+        mdb_env_set_maxreaders penv limits.maxReaders
+
+        exists <- doesPathExist path
+        unless exists $
+          throwError
+            "openEnvironment"
+            ( "no file or directory found at the specified path; "
+                ++ "please create an empty file or directory beforehand"
+            )
+
+        isDir <- doesDirectoryExist path
+
+        -- Always use MDB_NOTLS, which is crucial for Haskell applications; see
+        -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L615
+        let isRo = isReadOnlyEnvironment @emode
+            flags = mdb_notls : ([mdb_rdonly | isRo] ++ [mdb_nosubdir | not isDir])
+
+        catchJust
+          ( \case
+              LMDB_Error {e_code = Left code}
+                | Errno (fromIntegral code) == eNOENT && isRo -> Just ()
+              _ -> Nothing
+          )
+          (mdb_env_open penv path (combineOptions flags))
+          ( \() ->
+              -- Provide a friendlier error for a presumably common user mistake.
+              throwError
+                "openEnvironment"
+                ( "mdb_env_open returned 2 (ENOENT); "
+                    ++ "one possibility is that a new empty environment "
+                    ++ "wasn't first opened in ReadWrite mode"
+                )
+          )
+    )
+    -- In particular if mdb_env_open fails, the environment must be closed; see
+    -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L546
+    (c_mdb_env_close penv)
+
+  mvars <-
+    (,,,)
+      <$> newTMVarIO 0
+      <*> (WriteLock <$> newEmptyMVar)
+      <*> (WriteThread <$> newEmptyMVar)
+      <*> (CloseDbLock <$> newMVar ())
+
+  return $ Environment penv mvars
+
+-- | Closes the given environment.
+--
+-- If you have merely a few dozen environments at most, there should be no need for this. (It is a
+-- common practice with LMDB to create one’s environments once and reuse them for the remainder of
+-- the program’s execution.)
+--
+-- To satisfy certain low-level LMDB requirements:
+--
+-- * Before calling this function, please call 'closeDatabase' on all databases in the environment.
+-- * Before calling this function, close all cursors and commit\/abort all transactions on the
+--   environment. To make sure this requirement is satisified for read-only transactions, either (a)
+--   call 'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and
+--   'unsafeReadLMDB'.
+-- * After calling this function, do not use the environment or any related databases, transactions,
+--   and cursors.
+closeEnvironment :: forall emode. (Mode emode) => Environment emode -> IO ()
+closeEnvironment (Environment penv _) = do
+  -- An environment should only be closed once, so the low-level concurrency requirements should be
+  -- fulfilled:
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L787
+  c_mdb_env_close penv
+
+-- | Gets a database with the given name.
+--
+-- If only one database is desired within the environment, the name can be 'Nothing' (known as the
+-- “unnamed database”).
+--
+-- If one or more named databases (a database with a 'Just' name) are desired, the 'maxDatabases' of
+-- the environment’s limits should have been adjusted accordingly. The unnamed database will in this
+-- case contain the names of the named databases as keys, which one is allowed to read but not
+-- write.
+--
+-- /Warning/: When getting a named database for the first time (i.e., creating it), one must do so
+-- in the 'ReadWrite' environment mode. (This restriction does not apply for the unnamed database.)
+-- In this case, this function spawns a bound thread and creates a temporary read-write transaction
+-- under the hood; see [Transactions](#g:transactions).
+getDatabase ::
+  forall emode.
+  (Mode emode) =>
+  Environment emode ->
+  Maybe String ->
+  IO (Database emode)
+getDatabase env@(Environment penv mvars) mName = mask_ $ do
+  -- To satisfy the lower-level concurrency requirements mentioned at
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1118
+  -- we imagine, for simplicity, that everything below is a read-write transaction. Thusly, we also
+  -- satisfy the MDB_NOTLS read-write transaction serialization requirement (for the case where a
+  -- read-write transaction actually occur below). This simplification shouldn’t cause any problems,
+  -- esp. since this function is presumably called relatively rarely in practice.
+
+  let (_, WriteLock lock, _, _) = mvars
+  putMVar lock () -- Interruptible when waiting for other read-write transactions.
+  let disclaimWriteOwnership = takeMVar lock
+
+  dbi <-
+    finally
+      ( case mName of
+          Nothing -> do
+            -- Use a read-only transaction to get the unnamed database. (MDB_CREATE is never needed
+            -- for the unnamed database.)
+            ptxn <- mdb_txn_begin penv nullPtr mdb_rdonly
+            onException
+              (mdb_dbi_open ptxn Nothing 0 <* mdb_txn_commit ptxn)
+              (c_mdb_txn_abort ptxn)
+          Just name -> do
+            mdbi <- getNamedDb env name
+            case mdbi of
+              Just dbi ->
+                return dbi
+              Nothing ->
+                -- The named database was not found.
+                if isReadOnlyEnvironment @emode
+                  then
+                    throwError
+                      "getDatabase"
+                      ( "please use the ReadWrite environment mode for getting a named database "
+                          ++ "for the first time (i.e., for creating a named database)"
+                      )
+                  else
+                    -- Use a read-write transaction to create the named database.
+                    --
+                    -- We run this in a bound thread to make sure the read-write transaction doesn’t
+                    -- cross OS threads. (We do this ourselves instead of putting this burden on the
+                    -- user because this function is presumably called relatively rarely in
+                    -- practice.)
+                    runInBoundThread $ do
+                      ptxn <- mdb_txn_begin penv nullPtr 0
+                      onException
+                        (mdb_dbi_open ptxn (Just name) mdb_create <* mdb_txn_commit ptxn)
+                        (c_mdb_txn_abort ptxn)
+      )
+      disclaimWriteOwnership
+
+  return $ Database env dbi
+
+-- | Closes the given database.
+--
+-- If you have merely a few dozen databases at most, there should be no need for this. (It is a
+-- common practice with LMDB to create one’s databases once and reuse them for the remainder of the
+-- program’s execution.)
+--
+-- To satisfy certain low-level LMDB requirements:
+--
+-- * Before calling this function, please make sure all read-write transactions that have modified
+--   the database have already been committed or aborted.
+-- * After calling this function, do not use the database or any of its cursors again. To make sure
+--   this requirement is satisfied for cursors on read-only transactions, either (a) call
+--   'waitReaders' or (b) pass precreated cursors/transactions to 'readLMDB' and 'unsafeReadLMDB'.
+closeDatabase :: forall emode. (Mode emode) => Database emode -> IO ()
+closeDatabase (Database (Environment penv mvars) dbi) = do
+  -- We need to serialize the closing; see
+  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L1200
+  let (_, _, _, CloseDbLock lock) = mvars
+  withMVar lock $ \() ->
+    c_mdb_dbi_close penv dbi
+
+-- | A type for an optional thing (in our case a transaction and cursor for
+-- 'readLMDB'\/'unsafeReadLMDB' and a transaction for 'getLMDB') where we want to fix the
+-- transaction mode to @ReadOnly@ in the nothing case. (@Maybe@ isn’t powerful enough for this.)
+data MaybeTxn tmode a where
+  NoTxn :: MaybeTxn ReadOnly a
+  JustTxn :: a -> MaybeTxn tmode a
+
+-- | Use @unsafe@ FFI calls under the hood. This can increase iteration speed, but one should
+-- bear in mind that @unsafe@ FFI calls, since they block all other threads, can have an adverse
+-- impact on the performance of the rest of the program.
+--
+-- /Internal/.
+newtype UseUnsafeFFI = UseUnsafeFFI Bool deriving (Show)
+
+-- | Creates an unfold with which we can stream key-value pairs from the given database.
+--
+-- If an existing transaction and cursor are not provided, a read-only transaction and cursor are
+-- automatically created and kept open for the duration of the unfold. We suggest doing this as a
+-- first option. However, if you find this to be a bottleneck (e.g., if you find upon profiling that
+-- a significant time is being spent at @mdb_txn_begin@, or if you find yourself having to increase
+-- 'maxReaders' in the environment’s limits because the transactions and cursors are not being
+-- garbage collected fast enough), consider precreating a transaction and cursor.
+--
+-- If you want to iterate through a large database while avoiding a long-lived transaction (see
+-- [Transactions](#g:transactions)), it is your responsibility to chunk up your usage of 'readLMDB'.
+-- ('readStart' can help with this.)
+--
+-- If you don’t want the overhead of intermediate @ByteString@s (on your way to your eventual data
+-- structures), use 'unsafeReadLMDB' instead.
+{-# INLINE readLMDB #-}
+readLMDB ::
+  forall m emode tmode.
+  (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
+  Database emode ->
+  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
+  ReadOptions ->
+  Unfold m Void (ByteString, ByteString)
+readLMDB =
+  readLMDB' (UseUnsafeFFI False)
+
+-- | Similar to 'readLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
+--
+-- /Internal/.
+{-# INLINE readLMDB' #-}
+readLMDB' ::
+  forall m emode tmode.
+  (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
+  UseUnsafeFFI ->
+  Database emode ->
+  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
+  ReadOptions ->
+  Unfold m Void (ByteString, ByteString)
+readLMDB' useUnsafeFFI db mtxncurs ropts =
+  unsafeReadLMDB' useUnsafeFFI db mtxncurs ropts B.packCStringLen B.packCStringLen
+
+-- | Similar to 'readLMDB', except that the keys and values are not automatically converted into
+-- Haskell @ByteString@s.
+--
+-- To ensure safety, please make sure that the memory pointed to by the 'CStringLen' for each
+-- key/value mapping function call is (a) only read (and not written to); and (b) not used after the
+-- mapping function has returned. One way to transform the 'CStringLen's to your desired data
+-- structures is to use 'Data.ByteString.Unsafe.unsafePackCStringLen'.
+{-# INLINE unsafeReadLMDB #-}
+unsafeReadLMDB ::
+  forall m k v emode tmode.
+  (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
+  Database emode ->
+  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
+  ReadOptions ->
+  (CStringLen -> IO k) ->
+  (CStringLen -> IO v) ->
+  Unfold m Void (k, v)
+unsafeReadLMDB =
+  unsafeReadLMDB' (UseUnsafeFFI False)
+
+-- | Similar to 'unsafeReadLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
+--
+-- /Internal/.
+{-# INLINE unsafeReadLMDB' #-}
+unsafeReadLMDB' ::
+  forall m k v emode tmode.
+  (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
+  UseUnsafeFFI ->
+  Database emode ->
+  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
+  ReadOptions ->
+  (CStringLen -> IO k) ->
+  (CStringLen -> IO v) ->
+  Unfold m Void (k, v)
+unsafeReadLMDB' (UseUnsafeFFI us) (Database (Environment penv mvars) dbi) mtxncurs ropts kmap vmap =
+  let (firstOp, subsequentOp) = case (ropts.readDirection, ropts.readStart) of
+        (Forward, Nothing) -> (mdb_first, mdb_next)
+        (Forward, Just _) -> (mdb_set_range, mdb_next)
+        (Backward, Nothing) -> (mdb_last, mdb_prev)
+        (Backward, Just _) -> (mdb_set_range, mdb_prev)
+      (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
+        if us
+          then
+            ( mdb_txn_begin_unsafe,
+              mdb_cursor_open_unsafe,
+              c_mdb_cursor_get_unsafe,
+              c_mdb_cursor_close_unsafe,
+              c_mdb_txn_abort_unsafe
+            )
+          else
+            ( mdb_txn_begin,
+              mdb_cursor_open,
+              c_mdb_cursor_get,
+              c_mdb_cursor_close,
+              c_mdb_txn_abort
+            )
+
+      supply = U.lmap . const
+   in supply firstOp $
+        U.Unfold
+          ( \(op, pcurs, pk, pv, ref) -> do
+              rc <-
+                liftIO $
+                  if op == mdb_set_range && subsequentOp == mdb_prev
+                    then do
+                      -- A “reverse MDB_SET_RANGE” (i.e., a “less than or equal to”) is not
+                      -- available in LMDB, so we simulate it ourselves.
+                      kfst' <- peek pk
+                      kfst <- B.packCStringLen (kfst'.mv_data, fromIntegral $ kfst'.mv_size)
+                      rc <- cursor_get pcurs pk pv op
+                      if rc /= 0 && rc == mdb_notfound
+                        then cursor_get pcurs pk pv mdb_last
+                        else
+                          if rc == 0
+                            then do
+                              k' <- peek pk
+                              k <- B.unsafePackCStringLen (k'.mv_data, fromIntegral k'.mv_size)
+                              if k /= kfst
+                                then cursor_get pcurs pk pv mdb_prev
+                                else return rc
+                            else return rc
+                    else cursor_get pcurs pk pv op
+
+              found <-
+                liftIO $
+                  if rc /= 0 && rc /= mdb_notfound
+                    then do
+                      runIOFinalizer ref
+                      throwLMDBErrNum "mdb_cursor_get" rc
+                    else return $ rc /= mdb_notfound
+
+              if found
+                then do
+                  !k <- liftIO $ (\x -> kmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pk
+                  !v <- liftIO $ (\x -> vmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pv
+                  return $ U.Yield (k, v) (subsequentOp, pcurs, pk, pv, ref)
+                else do
+                  runIOFinalizer ref
+                  return U.Stop
+          )
+          ( \op -> do
+              let isNoTxnCurs = case mtxncurs of
+                    NoTxn -> True
+                    JustTxn _ -> False
+
+              -- Type-level guarantee.
+              when (isNoTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
+
+              let (numReadersT, _, _, _) = mvars
+
+              (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
+                (ptxn, pcurs, decrReaders) <- case mtxncurs of
+                  NoTxn -> do
+                    atomically $ do
+                      n <- takeTMVar numReadersT
+                      putTMVar numReadersT $ n + 1
+
+                    let decrReaders = atomically $ do
+                          -- This should, when this is called, never be interruptible because we
+                          -- are, of course, finishing up a reader that is still known to exist.
+                          n <- takeTMVar numReadersT
+                          putTMVar numReadersT $ n - 1
+
+                    ptxn <-
+                      onException
+                        (txn_begin penv nullPtr mdb_rdonly)
+                        decrReaders
+                    pcurs <-
+                      onException
+                        (cursor_open ptxn dbi)
+                        (txn_abort ptxn >> decrReaders)
+                    return (ptxn, pcurs, decrReaders)
+                  JustTxn (Transaction _ ptxn, Cursor pcurs) ->
+                    return (ptxn, pcurs, return ())
+
+                -- A utility function to close the cursor, abort the transaction, and decrement
+                -- readers if the caller didn’t supply a transaction and cursor.
+                let finishTxnCursReader =
+                      when isNoTxnCurs $
+                        cursor_close pcurs >> txn_abort ptxn >> decrReaders
+
+                pk <- onException malloc finishTxnCursReader
+                pv <- onException malloc (free pk >> finishTxnCursReader)
+
+                ref <-
+                  flip
+                    onException
+                    (free pv >> free pk >> finishTxnCursReader)
+                    $ do
+                      _ <- case ropts.readStart of
+                        Nothing -> return ()
+                        Just k -> B.unsafeUseAsCStringLen k $ \(kp, kl) ->
+                          poke pk (MDB_val (fromIntegral kl) kp)
+                      newIOFinalizer . mask_ $ do
+                        free pv >> free pk
+                        -- With LMDB, there is ordinarily no need to commit read-only transactions.
+                        -- (The exception is when we want to make databases that were opened during
+                        -- the transaction available later, but that’s not applicable here.) We can
+                        -- therefore abort ptxn, both for failure (exceptions) and success.
+                        --
+                        -- Note furthermore that this should be sound in the face of async
+                        -- exceptions (where this finalizer could get called from a different
+                        -- thread) because LMDB with MDB_NOTLS allows for read-only transactions
+                        -- being used from multiple threads; see
+                        -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
+                        finishTxnCursReader
+
+                return (pcurs, pk, pv, ref)
+              return (op, pcurs, pk, pv, ref)
+          )
+
+-- | Looks up the value for the given key in the given database.
+--
+-- If an existing transaction is not provided, a read-only transaction is automatically created
+-- internally.
+{-# INLINE getLMDB #-}
+getLMDB ::
+  forall emode tmode.
+  (Mode emode, Mode tmode, SubMode emode tmode) =>
+  Database emode ->
+  MaybeTxn tmode (Transaction tmode emode) ->
+  ByteString ->
+  IO (Maybe ByteString)
+getLMDB (Database env@(Environment _ _) dbi) mtxn k =
+  let {-# INLINE brack #-}
+      brack io = case mtxn of
+        NoTxn -> withReadOnlyTransaction env $ \(Transaction _ ptxn) -> io ptxn
+        JustTxn (Transaction _ ptxn) -> io ptxn
+   in B.unsafeUseAsCStringLen k $ \(kp, kl) ->
+        with (MDB_val (fromIntegral kl) kp) $ \pk -> alloca $ \pv ->
+          brack $ \ptxn -> do
+            rc <- c_mdb_get ptxn dbi pk pv
+            if rc == 0
+              then do
+                v' <- peek pv
+                Just <$> B.packCStringLen (v'.mv_data, fromIntegral v'.mv_size)
+              else
+                if rc == mdb_notfound
+                  then return Nothing
+                  else throwLMDBErrNum "mdb_get" rc
+
+-- | A read-only (@tmode@: 'ReadOnly') or read-write (@tmode@: 'ReadWrite') transaction.
+--
+-- @emode@: the environment’s mode. Note: 'ReadOnly' environments can only have 'ReadOnly'
+-- transactions; we enforce this at the type level.
+data Transaction tmode emode = Transaction !(Environment emode) !(Ptr MDB_txn)
+
+-- | Begins an LMDB read-only transaction on the given environment.
+--
+-- For read-only transactions returned from this function, it is your responsibility to (a) make
+-- sure the transaction only gets used by a single 'readLMDB', 'unsafeReadLMDB', or 'getLMDB' at the
+-- same time, (b) use the transaction only on databases in the environment on which the transaction
+-- was begun, (c) make sure that those databases were already obtained before the transaction was
+-- begun, (d) dispose of the transaction with 'abortReadOnlyTransaction', and (e) be aware of the
+-- caveats regarding long-lived transactions; see [Transactions](#g:transactions).
+--
+-- To easily manage a read-only transaction’s lifecycle, we suggest using 'withReadOnlyTransaction'.
+{-# INLINE beginReadOnlyTransaction #-}
+beginReadOnlyTransaction ::
+  forall emode.
+  (Mode emode) =>
+  Environment emode ->
+  IO (Transaction ReadOnly emode)
+beginReadOnlyTransaction env@(Environment penv mvars) = mask_ $ do
+  -- The non-concurrency requirement:
+  -- https://github.com/LMDB/lmdb/blob/mdb.master/libraries/liblmdb/lmdb.h#L614
+  let (numReadersT, _, _, _) = mvars
+
+  -- Similar comments for NumReaders as in unsafeReadLMDB.
+  atomically $ do
+    n <- takeTMVar numReadersT
+    putTMVar numReadersT $ n + 1
+
+  onException
+    (Transaction @ReadOnly env <$> mdb_txn_begin penv nullPtr mdb_rdonly)
+    ( atomically $ do
+        n <- takeTMVar numReadersT
+        putTMVar numReadersT $ n - 1
+    )
+
+-- | Disposes of a read-only transaction created with 'beginReadOnlyTransaction'.
+--
+-- It is your responsibility to not use the transaction or any of its cursors afterwards.
+{-# INLINE abortReadOnlyTransaction #-}
+abortReadOnlyTransaction :: forall emode. (Mode emode) => Transaction ReadOnly emode -> IO ()
+abortReadOnlyTransaction (Transaction (Environment _ mvars) ptxn) = mask_ $ do
+  let (numReadersT, _, _, _) = mvars
+  c_mdb_txn_abort ptxn
+  -- Similar comments for NumReaders as in unsafeReadLMDB.
+  atomically $ do
+    n <- takeTMVar numReadersT
+    putTMVar numReadersT $ n - 1
+
+-- | Creates a temporary read-only transaction on which the provided action is performed, after
+-- which the transaction gets aborted. The transaction also gets aborted upon exceptions.
+--
+-- You have the same responsibilities as documented for 'beginReadOnlyTransaction' (apart from the
+-- transaction disposal).
+{-# INLINE withReadOnlyTransaction #-}
+withReadOnlyTransaction ::
+  forall m a emode.
+  (Mode emode, MonadBaseControl IO m, MonadIO m) =>
+  Environment emode ->
+  (Transaction ReadOnly emode -> m a) ->
+  m a
+withReadOnlyTransaction env =
+  LI.bracket
+    (liftIO $ beginReadOnlyTransaction env)
+    -- Aborting a transaction should never fail (as it merely frees a pointer), so any potential
+    -- issues solved by safe-exceptions (in particular “swallowing asynchronous exceptions via
+    -- failing cleanup handlers”) shouldn’t apply here.
+    (liftIO . abortReadOnlyTransaction)
+
+-- | A cursor.
+newtype Cursor = Cursor (Ptr MDB_cursor)
+
+-- | Opens a cursor for use with 'readLMDB' or 'unsafeReadLMDB'. It is your responsibility to (a)
+-- make sure the cursor only gets used by a single 'readLMDB' or 'unsafeReadLMDB' at the same time,
+-- (b) make sure the provided database is within the environment on which the provided transaction
+-- was begun, and (c) dispose of the cursor with 'closeCursor'.
+--
+-- To easily manage a cursor’s lifecycle, we suggest using 'withCursor'.
+{-# INLINE openCursor #-}
+openCursor ::
+  forall emode tmode.
+  (Mode emode, Mode tmode, SubMode emode tmode) =>
+  Transaction tmode emode ->
+  Database emode ->
+  IO Cursor
+openCursor (Transaction _ ptxn) (Database _ dbi) =
+  Cursor <$> mdb_cursor_open ptxn dbi
+
+-- | Disposes of a cursor created with 'openCursor'.
+{-# INLINE closeCursor #-}
+closeCursor :: Cursor -> IO ()
+closeCursor (Cursor pcurs) =
+  -- (Sidenote: Although a cursor will, at least for users who use brackets, usually be called
+  -- before the transaction gets aborted (read-only/read-write) or committed (read-write), the order
+  -- doesn’t really matter for read-only transactions.)
+  c_mdb_cursor_close pcurs
+
+-- | Creates a temporary cursor on which the provided action is performed, after which the cursor
+-- gets closed. The cursor also gets closed upon exceptions.
+--
+-- You have the same responsibilities as documented for 'openCursor' (apart from the cursor
+-- disposal).
+{-# INLINE withCursor #-}
+withCursor ::
+  forall m a emode tmode.
+  (MonadBaseControl IO m, MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
+  Transaction tmode emode ->
+  Database emode ->
+  (Cursor -> m a) ->
+  m a
+withCursor txn db =
+  LI.bracket
+    (liftIO $ openCursor txn db)
+    -- Closing a cursor should never fail (as it merely frees a pointer), so any potential issues
+    -- solved by safe-exceptions (in particular “swallowing asynchronous exceptions via failing
+    -- cleanup handlers”) shouldn’t apply here.
+    (liftIO . closeCursor)
+
+data ReadOptions = ReadOptions
+  { readDirection :: !ReadDirection,
+    -- | If 'Nothing', a forward [backward] iteration starts at the beginning [end] of the database.
+    -- Otherwise, it starts at the first key that is greater [less] than or equal to the 'Just' key.
+    readStart :: !(Maybe ByteString)
+  }
+  deriving (Show)
+
+-- | By default, we start reading from the beginning of the database (i.e., from the smallest key).
+defaultReadOptions :: ReadOptions
+defaultReadOptions =
+  ReadOptions
+    { readDirection = Forward,
+      readStart = Nothing
+    }
+
+-- | Direction of key iteration.
+data ReadDirection = Forward | Backward deriving (Show)
+
+-- | Begins an LMDB read-write transaction on the given environment.
+--
+-- Unlike read-only transactions, a given read-write transaction is not allowed to stray from the OS
+-- thread on which it was begun, and it is your responsibility to make sure of this. You can achieve
+-- this with, e.g., 'Control.Concurrent.runInBoundThread'.
+--
+-- Additionally, for read-write transactions returned from this function, it is your responsibility
+-- to (a) use the transaction only on databases in the environment on which the transaction was
+-- begun, (b) make sure that those databases were already obtained before the transaction was begun,
+-- (c) commit\/abort the transaction with 'commitReadWriteTransaction'\/'abortReadWriteTransaction',
+-- and (d) be aware of the caveats regarding long-lived transactions; see
+-- [Transactions](#g:transactions).
+--
+-- To easily manage a read-write transaction’s lifecycle, we suggest using
+-- 'withReadWriteTransaction'.
+{-# INLINE beginReadWriteTransaction #-}
+beginReadWriteTransaction :: Environment ReadWrite -> IO (Transaction ReadWrite ReadWrite)
+beginReadWriteTransaction env@(Environment penv mvars) = mask_ $ do
+  isCurrentThreadBound
+    >>= flip
+      unless
+      (throwError "beginReadWriteTransaction" "please call on a bound thread")
+  threadId <- myThreadId
+
+  let (_, WriteLock lock, WriteThread writeThread, _) = mvars
+  putMVar lock () -- Interruptible when waiting for other read-write transactions.
+  tryPutMVar writeThread threadId >>= flip unless (error "unreachable")
+  let disclaimWriteOwnership = mask_ $ tryTakeMVar writeThread >> tryTakeMVar lock
+
+  onException
+    (Transaction @ReadWrite env <$> mdb_txn_begin penv nullPtr 0)
+    disclaimWriteOwnership
+
+-- | Aborts a read-write transaction created with 'beginReadWriteTransaction'.
+--
+-- It is your responsibility to not use the transaction afterwards.
+{-# INLINE abortReadWriteTransaction #-}
+abortReadWriteTransaction :: Transaction ReadWrite ReadWrite -> IO ()
+abortReadWriteTransaction (Transaction (Environment _ mvars) ptxn) = mask_ $ do
+  let throwErr = throwError "abortReadWriteTransaction"
+  let (_, WriteLock lock, WriteThread writeThread, _) = mvars
+  detectUserErrors True writeThread throwErr
+  c_mdb_txn_abort ptxn
+  void $ tryTakeMVar lock
+
+-- | Commits a read-write transaction created with 'beginReadWriteTransaction'.
+--
+-- It is your responsibility to not use the transaction afterwards.
+{-# INLINE commitReadWriteTransaction #-}
+commitReadWriteTransaction :: Transaction ReadWrite ReadWrite -> IO ()
+commitReadWriteTransaction (Transaction (Environment _ mvars) ptxn) = mask_ $ do
+  let throwErr = throwError "commitReadWriteTransaction"
+  let (_, WriteLock lock, WriteThread writeThread, _) = mvars
+  detectUserErrors True writeThread throwErr
+  onException
+    (mdb_txn_commit ptxn)
+    (c_mdb_txn_abort ptxn >> tryTakeMVar lock)
+  void $ tryTakeMVar lock
+
+-- | Spawns a new bound thread and creates a temporary read-write transaction on which the provided
+-- action is performed, after which the transaction gets committed. The transaction gets aborted
+-- upon exceptions.
+--
+-- You have the same responsibilities as documented for 'beginReadWriteTransaction' (apart from
+-- running it on a bound thread and committing/aborting it).
+{-# INLINE withReadWriteTransaction #-}
+withReadWriteTransaction ::
+  forall m a.
+  (MonadBaseControl IO m, MonadIO m) =>
+  Environment ReadWrite ->
+  (Transaction ReadWrite ReadWrite -> m a) ->
+  m a
+withReadWriteTransaction env io =
+  LI.runInBoundThread $
+    -- We need an enhanced bracket. Using the normal bracket and simply committing after running io
+    -- in the “in-between” computation is incorrect because this entire “in-between” computation
+    -- falls under “restore” in bracket’s implementation, so an asynchronous exception can cause a
+    -- commit to be followed by an abort. (Our 'testAsyncExceptionsConcurrent' test exposed this.)
+    liftedBracket2
+      (liftIO $ beginReadWriteTransaction env)
+      -- + Aborting a transaction should never fail (as it merely frees a pointer), so any potential
+      --   issues solved by safe-exceptions (in particular “swallowing asynchronous exceptions via
+      --   failing cleanup handlers”) shouldn’t apply here.
+      -- + Note: We have convinced ourselves that both the abort and commit are uninterruptible. (In
+      --   particular, we presume 'myThreadId' (in 'detectUserErrors') is uninterruptible.)
+      (liftIO . abortReadWriteTransaction)
+      (liftIO . commitReadWriteTransaction)
+      io
+
+-- |
+-- * @OverwriteAllow@: When a key reoccurs, overwrite the value.
+-- * @OverwriteDisallow@: When a key reoccurs, don’t overwrite and hand the maladaptive key-value
+--   pair to the accumulator.
+-- * @OverwriteAppend@: Assume the input data is already increasing, which allows the use of
+--   @MDB_APPEND@ under the hood and substantially improves write performance. Hand arriving
+--   key-value pairs in a maladaptive order to the accumulator.
+data OverwriteOptions m a where
+  OverwriteAllow :: OverwriteOptions m ()
+  OverwriteDisallow :: Either (WriteAccum m a) (WriteAccumWithOld m a) -> OverwriteOptions m a
+  OverwriteAppend :: WriteAccum m a -> OverwriteOptions m a
+
+-- | A fold for @(key, new value)@.
+type WriteAccum m a = Fold m (ByteString, ByteString) a
+
+-- | A fold for @(key, new value, old value)@. This has the overhead of getting the old value.
+type WriteAccumWithOld m a = Fold m (ByteString, ByteString, ByteString) a
+
+newtype WriteOptions m a = WriteOptions
+  { writeOverwriteOptions :: OverwriteOptions m a
+  }
+
+-- | A function that shows a database key.
+type ShowKey = ByteString -> String
+
+-- | A function that shows a database value.
+type ShowValue = ByteString -> String
+
+-- | Throws upon the first maladaptive key. If desired, shows the maladaptive key-value pair in the
+-- exception.
+{-# INLINE writeAccumThrow #-}
+writeAccumThrow :: (Monad m) => Maybe (ShowKey, ShowValue) -> WriteAccum m ()
+writeAccumThrow mshow =
+  F.foldlM'
+    ( \() (k, v) ->
+        throwError "writeLMDB" $
+          "Maladaptive key encountered"
+            ++ maybe
+              ""
+              (\(showk, showv) -> printf "; (key,value)=(%s,%s)" (showk k) (showv v))
+              mshow
+    )
+    (return ())
+
+-- | Throws upon the first maladaptive key where the old value differs from the new value. If
+-- desired, shows the maladaptive key-value pair with the old value in the exception.
+{-# INLINE writeAccumThrowAllowSameValue #-}
+writeAccumThrowAllowSameValue :: (Monad m) => Maybe (ShowKey, ShowValue) -> WriteAccumWithOld m ()
+writeAccumThrowAllowSameValue mshow =
+  F.foldlM'
+    ( \() (k, v, oldv) ->
+        when (v /= oldv) $
+          throwError "writeLMDB" $
+            "Maladaptive key encountered"
+              ++ maybe
+                ""
+                ( \(showk, showv) ->
+                    printf "; (key,value,oldValue)=(%s,%s,%s)" (showk k) (showv v) (showv oldv)
+                )
+                mshow
+    )
+    (return ())
+
+-- | Silently ignores maladaptive keys.
+{-# INLINE writeAccumIgnore #-}
+writeAccumIgnore :: (Monad m) => WriteAccum m ()
+writeAccumIgnore = F.drain
+
+-- | Gracefully stops upon the first maladaptive key.
+{-# INLINE writeAccumStop #-}
+writeAccumStop :: (Monad m) => WriteAccum m ()
+writeAccumStop = void F.one
+
+-- | By default, we allow overwriting.
+defaultWriteOptions :: WriteOptions m ()
+defaultWriteOptions =
+  WriteOptions
+    { writeOverwriteOptions = OverwriteAllow
+    }
+
+-- | A chunk size for use with 'chunkPairs'.
+data ChunkSize
+  = -- | Chunk up key-value pairs by number of pairs. The final chunk can have a fewer number of
+    -- pairs.
+    ChunkNumPairs !Int
+  | -- | Chunk up key-value pairs by number of bytes. As soon as the byte count for the keys and
+    -- values is reached, a new chunk is created (such that each chunk has at least one key-value
+    -- pair and can end up with more than the desired number of bytes). The final chunk can have
+    -- less than the desired number of bytes.
+    ChunkBytes !Int
+
+-- | Chunks up the incoming stream of key-value pairs using the desired chunk size. One can try,
+-- e.g., @ChunkBytes mebibyte@ (1 MiB chunks) and benchmark from there.
+--
+-- The chunks are processed using the desired fold (e.g., 'writeLMDBChunksFold').
+--
+-- /Internal/. (Not exposed because 'chunkPairs' seems far more useful, in particular because it can
+-- handle the chunks in parallel instead of constraining us to a stateful computation on the chunks
+-- one by one.)
+{-# INLINE chunkPairsFold #-}
+chunkPairsFold ::
+  forall m a.
+  (Monad m) =>
+  ChunkSize ->
+  Fold m (Seq (ByteString, ByteString)) a ->
+  Fold m (ByteString, ByteString) a
+chunkPairsFold chunkSz (F.Fold astep ainit aextr afinal) =
+  let {-# INLINE final #-}
+      final sequ as =
+        case sequ of
+          Seq.Empty -> afinal as
+          _ -> do
+            astep' <- astep as sequ
+            case astep' of
+              F.Done b -> return b
+              F.Partial as' -> afinal as'
+   in case chunkSz of
+        ChunkNumPairs numPairs ->
+          F.Fold
+            ( \(!sequ, !as) (k, v) ->
+                let sequ' = sequ Seq.|> (k, v)
+                 in if Seq.length sequ' == numPairs
+                      then
+                        -- The (user-supplied) astep could already be Done here.
+                        first (Seq.empty,) <$> astep as sequ'
+                      else return . F.Partial $ (sequ', as)
+            )
+            -- The (user-supplied) ainit could already be Done here.
+            (first (Seq.empty,) <$> ainit)
+            -- If driven with a scan, the collection fold is assumed to also be compatible with
+            -- scans and will result in the same output repeatedly for a chunk being built. (This
+            -- should already be clear to the user.)
+            (\(_, as) -> aextr as)
+            -- This is the only direct exit point of this outer fold (since elsewhere it yields a
+            -- partial). This is therefore the only place where afinal needs to be called.
+            (uncurry final)
+        ChunkBytes bytes ->
+          -- All the comments for the above case hold here too.
+          F.Fold
+            ( \(!sequ, !byt, !as) (k, v) ->
+                let sequ' = sequ Seq.|> (k, v)
+                    byt' = byt + B.length k + B.length v
+                 in if byt' >= bytes
+                      then
+                        first (Seq.empty,0,) <$> astep as sequ'
+                      else
+                        -- For long streams of empty keys and values, sequ' can also get long; but
+                        -- this should be expected behavior (and is an irrelevant edge case for most
+                        -- users anyway).
+                        return . F.Partial $ (sequ', byt', as)
+            )
+            (first (Seq.empty,0,) <$> ainit)
+            (\(_, _, as) -> aextr as)
+            (\(sequ, _, as) -> final sequ as)
+
+-- | Writes chunks of key-value pairs to the provided database.
+--
+-- Each chunk is written to the database using 'writeLMDB' with the provided 'WriteOptions' (within
+-- a surrounding 'withReadWriteTransaction').
+--
+-- /Internal/. (Not exposed because this was designed with 'chunkPairsFold' in mind.)
+{-# INLINE writeLMDBChunksFold' #-}
+writeLMDBChunksFold' ::
+  forall m b a.
+  (MonadBaseControl IO m, MonadIO m, MonadCatch m) =>
+  UseUnsafeFFI ->
+  WriteOptions m b ->
+  Database ReadWrite ->
+  Fold m b a ->
+  Fold m (Seq (ByteString, ByteString)) a
+writeLMDBChunksFold' useUnsafeFFI wopts db@(Database env _) (F.Fold bstep binit bextr bfinal) =
+  F.Fold
+    ( \bs sequ -> do
+        b <- withReadWriteTransaction env $ \txn ->
+          S.fold (writeLMDB' useUnsafeFFI wopts db txn) . S.fromList . toList $ sequ
+        bstep bs b
+    )
+    binit
+    bextr
+    bfinal
+
+-- | Chunks up the incoming stream of key-value pairs using the desired chunk size. One can try,
+-- e.g., @ChunkBytes mebibyte@ (1 MiB chunks) and benchmark from there.
+{-# INLINE chunkPairs #-}
+chunkPairs ::
+  (Monad m) =>
+  ChunkSize ->
+  Stream m (ByteString, ByteString) ->
+  Stream m (Seq (ByteString, ByteString))
+chunkPairs chunkSz =
+  S.foldMany $
+    case chunkSz of
+      ChunkNumPairs numPairs ->
+        F.Fold
+          ( \(!sequ) (k, v) ->
+              let sequ' = sequ Seq.|> (k, v)
+               in return $
+                    if Seq.length sequ' == numPairs
+                      then F.Done sequ'
+                      else F.Partial sequ'
+          )
+          (return $ F.Partial Seq.empty)
+          (error "unreachable")
+          return
+      ChunkBytes bytes ->
+        F.Fold
+          ( \(!sequ, !byt) (k, v) ->
+              let sequ' = sequ Seq.|> (k, v)
+                  byt' = byt + B.length k + B.length v
+               in return $
+                    if byt' >= bytes
+                      then F.Done sequ'
+                      else F.Partial (sequ', byt')
+          )
+          (return $ F.Partial (Seq.empty, 0))
+          (error "unreachable")
+          (\(sequ, _) -> return sequ)
+
+-- | Writes a chunk of key-value pairs to the given database. Under the hood, it uses 'writeLMDB'
+-- surrounded with a 'withReadWriteTransaction'.
+{-# INLINE writeLMDBChunk #-}
+writeLMDBChunk ::
+  forall m a.
+  (MonadBaseControl IO m, MonadIO m, MonadCatch m) =>
+  WriteOptions m a ->
+  Database ReadWrite ->
+  Seq (ByteString, ByteString) ->
+  m a
+writeLMDBChunk =
+  writeLMDBChunk' (UseUnsafeFFI False)
+
+-- | Similar to 'writeLMDBChunk', except that it has an extra 'UseUnsafeFFI' parameter.
+--
+-- /Internal/.
+{-# INLINE writeLMDBChunk' #-}
+writeLMDBChunk' ::
+  forall m a.
+  (MonadBaseControl IO m, MonadIO m, MonadCatch m) =>
+  UseUnsafeFFI ->
+  WriteOptions m a ->
+  Database ReadWrite ->
+  Seq (ByteString, ByteString) ->
+  m a
+writeLMDBChunk' useUnsafeFFI wopts db@(Database env _) sequ =
+  withReadWriteTransaction env $ \txn ->
+    S.fold (writeLMDB' useUnsafeFFI wopts db txn) . S.fromList . toList $ sequ
+
+-- | Creates a fold that writes a stream of key-value pairs to the provided database using the
+-- provided transaction.
+--
+-- If you have a long stream of key-value pairs that you want to write to an LMDB database while
+-- avoiding a long-lived transaction (see [Transactions](#g:transactions)), you can use
+-- 'chunkPairs'\/'writeLMDBChunk'.
+{-# INLINE writeLMDB #-}
+writeLMDB ::
+  forall m a.
+  (MonadIO m, MonadCatch m, MonadThrow m) =>
+  WriteOptions m a ->
+  Database ReadWrite ->
+  Transaction ReadWrite ReadWrite ->
+  Fold m (ByteString, ByteString) a
+writeLMDB =
+  writeLMDB' (UseUnsafeFFI False)
+
+-- | Similar to 'writeLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
+--
+-- /Internal/.
+{-# INLINE writeLMDB' #-}
+writeLMDB' ::
+  forall m a.
+  (MonadIO m, MonadCatch m, MonadThrow m) =>
+  UseUnsafeFFI ->
+  WriteOptions m a ->
+  Database ReadWrite ->
+  Transaction ReadWrite ReadWrite ->
+  Fold m (ByteString, ByteString) a
+writeLMDB'
+  (UseUnsafeFFI us)
+  wopts
+  (Database env@(Environment _ mvars) dbi)
+  txn@(Transaction _ ptxn) =
+    -- Notes on why writeLMDB relies on the user creating read-write transactions up front, as
+    -- opposed to writeLMDB itself maintaining the write transactions internally (as was the case in
+    -- versions <=0.7.0):
+    --   * The old way was not safe because LMDB read-write transactions are (unless MDB_NOLOCK is
+    --     used) not allowed to cross OS threads; but upon asynchronous exceptions, the read-write
+    --     transaction aborting would happen upon garbage collection (GC), which can occur on a
+    --     different OS thread (even if the user ran the original writeLMDB on a bound thread).
+    --   * We see no way around this but to wrap every read-write transaction in a bona fide bracket
+    --     managed by the user (not a streamly-type bracket, which, again, relies on GC).
+    --   * Two things we investigated: (a) Channels allow us to pass all writing to a specific OS
+    --     thread, but doing this one-by-one for every mdb_put is way too slow; for channels to
+    --     become performant, they need chunking. (b) We can use MDB_NOLOCK to avoid the
+    --     same-OS-thread requirement, but this means other processes can no longer safely interact
+    --     with the LMDB environment.
+    --   * Two benefits of the new way: (a) A stream can be demuxed into writeLMDB folds on the same
+    --     environment. (b) The writeLMDB fold works with scans.
+    let put_ =
+          if us
+            then mdb_put_unsafe_
+            else mdb_put_
+
+        throwErr = throwError "writeLMDB"
+
+        {-# INLINE validate #-}
+        validate = do
+          let (_, _, WriteThread writeThread, _) = mvars
+          liftIO $ detectUserErrors False writeThread throwErr
+
+        {-# INLINE putCatchKeyExists #-}
+        putCatchKeyExists ::
+          ByteString ->
+          ByteString ->
+          s -> -- State of the Accum fold (for the failures).
+          CUInt ->
+          (() -> m (F.Step s d)) ->
+          m (F.Step s d)
+        putCatchKeyExists k v s op =
+          catchJust
+            ( \case
+                LMDB_Error {e_code = Right MDB_KEYEXIST} -> Just ()
+                _ -> Nothing
+            )
+            ( do
+                liftIO $
+                  B.unsafeUseAsCStringLen k $ \(kp, kl) ->
+                    B.unsafeUseAsCStringLen v $ \(vp, vl) ->
+                      put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) op
+                return $ F.Partial s
+            )
+
+        {-# INLINE commonFold #-}
+        commonFold (F.Fold fstep finit fextr ffinal) op =
+          F.Fold @m
+            (\s (k, v) -> putCatchKeyExists k v s op (\() -> fstep s (k, v)))
+            (validate >> finit)
+            fextr
+            ffinal
+     in case writeOverwriteOptions wopts of
+          OverwriteAllow ->
+            F.foldlM' @m @()
+              ( \() (k, v) -> liftIO $
+                  B.unsafeUseAsCStringLen k $ \(kp, kl) -> B.unsafeUseAsCStringLen v $ \(vp, vl) ->
+                    put_ ptxn dbi kp (fromIntegral kl) vp (fromIntegral vl) 0
+              )
+              validate
+          OverwriteDisallow (Left f) ->
+            commonFold f mdb_nooverwrite
+          OverwriteDisallow (Right (F.Fold fstep finit fextr ffinal)) ->
+            F.Fold @m
+              ( \s (k, v) ->
+                  putCatchKeyExists k v s mdb_nooverwrite $ \_ -> do
+                    mVold <- liftIO $ getLMDB (Database env dbi) (JustTxn txn) k
+                    vold <- case mVold of
+                      Nothing -> throwErr "getLMDB; old value not found; this should never happen"
+                      Just vold -> return vold
+                    fstep s (k, v, vold)
+              )
+              (validate >> finit)
+              fextr
+              ffinal
+          OverwriteAppend f ->
+            commonFold f mdb_append
+
+-- | Waits for active read-only transactions on the given environment to finish. Note: This triggers
+-- garbage collection.
+waitReaders :: (Mode emode) => Environment emode -> IO ()
+waitReaders (Environment _ mvars) = do
+  let (numReadersT, _, _, _) = mvars
+  performGC -- Complete active readers as soon as possible.
+  numReaders <-
+    atomically $ do
+      numReaders <- takeTMVar numReadersT
+      check $ numReaders <= 0 -- Sanity check: use <=0 to catch unexpected negative readers.
+      return numReaders
+  when (numReaders /= 0) $ throwError "waitReaders" "zero numReaders expected"
+
+-- | Clears, i.e., removes all key-value pairs from, the given database.
+--
+-- /Warning/: Under the hood, this function spawns a bound thread and creates a potentially
+-- long-lived read-write transaction; see [Transactions](#g:transactions).
+clearDatabase :: Database ReadWrite -> IO ()
+clearDatabase (Database (Environment penv mvars) dbi) = mask $ \restore -> do
+  let (_, WriteLock lock, _, _) = mvars
+  putMVar lock () -- Interruptible when waiting for other read-write transactions.
+  let disclaimWriteOwnership = takeMVar lock
+
+  finally
+    ( runInBoundThread $ do
+        ptxn <- mdb_txn_begin penv nullPtr 0
+        onException
+          -- Unmask a potentially long-running operation.
+          ( restore $ do
+              mdb_clear ptxn dbi
+              mdb_txn_commit ptxn
+          )
+          (c_mdb_txn_abort ptxn) -- TODO: Could abort be long-running?
+    )
+    disclaimWriteOwnership
+
+-- | A convenience constant for obtaining 1 KiB.
+kibibyte :: (Num a) => a
+kibibyte = 1_024
+
+-- | A convenience constant for obtaining 1 MiB.
+mebibyte :: (Num a) => a
+mebibyte = 1_024 * 1_024
+
+-- | A convenience constant for obtaining 1 GiB.
+gibibyte :: (Num a) => a
+gibibyte = 1_024 * 1_024 * 1_024
+
+-- | A convenience constant for obtaining 1 TiB.
+tebibyte :: (Num a) => a
+tebibyte = 1_024 * 1_024 * 1_024 * 1_024
+
+-- | A type class for 'ReadOnly' and 'ReadWrite' environments and transactions.
 class Mode a where
   isReadOnlyMode :: a -> Bool
 
@@ -20,10 +1193,19 @@ instance Mode ReadWrite where isReadOnlyMode _ = False
 
 instance Mode ReadOnly where isReadOnlyMode _ = True
 
-data Environment mode
+-- | Enforces at the type level that @ReadWrite@ environments support both @ReadWrite@ and
+-- @ReadOnly@ transactions, but @ReadOnly@ environments support only @ReadOnly@ transactions.
+type SubMode :: k -> k -> Constraint
+type family SubMode emode tmode where
+  SubMode ReadWrite _ = ()
+  SubMode ReadOnly ReadOnly = ()
+  SubMode ReadOnly ReadWrite =
+    TypeError ('Text "ReadOnly environments only support ReadOnly transactions")
+
+data Environment emode
   = Environment
       !(Ptr MDB_env)
-      !(TMVar NumReaders, MVar WriteCounter, MVar WriteOwner, MVar WriteOwnerData)
+      !(TMVar NumReaders, WriteLock, WriteThread, CloseDbLock)
 
 -- The number of current readers. This needs to be kept track of due to MDB_NOLOCK; see comments in
 -- writeLMDB.
@@ -37,6 +1219,120 @@ newtype WriteOwner = WriteOwner WriteCounter
 
 -- Data that the current 'WriteOwner' keeps track of. (This needs to be separate from 'WriteOwner'
 -- because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
-newtype WriteOwnerData = WriteOwnerData { wPtxn :: Ptr MDB_txn }
+newtype WriteOwnerData = WriteOwnerData {wPtxn :: Ptr MDB_txn}
 
-data Database mode = Database !(Environment mode) !MDB_dbi_t
+-- | Keeps track of the 'ThreadId' of the current read-write transaction.
+newtype WriteThread = WriteThread (MVar ThreadId)
+
+-- For read-write transaction serialization.
+newtype WriteLock = WriteLock (MVar ())
+
+-- For closeDatabase serialization.
+newtype CloseDbLock = CloseDbLock (MVar ())
+
+data Database emode = Database !(Environment emode) !MDB_dbi_t
+
+-- | Utility function for getting a named database with a read-only transaction, returning 'Nothing'
+-- if it was not found.
+--
+-- /Internal/.
+getNamedDb ::
+  forall emode.
+  (Mode emode) =>
+  Environment emode ->
+  String ->
+  IO (Maybe MDB_dbi_t)
+getNamedDb (Environment penv _) name = mask_ $ do
+  -- Use a read-only transaction to try to get the named database.
+  ptxn <- mdb_txn_begin penv nullPtr mdb_rdonly
+  onException
+    ( catchJust
+        ( \case
+            -- Assumption: mdb_txn_commit never returns MDB_NOTFOUND.
+            LMDB_Error {e_code} | e_code == Right MDB_NOTFOUND -> Just ()
+            _ -> Nothing
+        )
+        (Just <$> mdb_dbi_open ptxn (Just name) 0 <* mdb_txn_commit ptxn)
+        ( \() -> do
+            -- The named database was not found.
+            c_mdb_txn_abort ptxn
+            return Nothing
+        )
+    )
+    (c_mdb_txn_abort ptxn)
+
+-- | A utility function for detecting a few user errors.
+--
+-- /Internal/.
+detectUserErrors :: Bool -> MVar ThreadId -> (String -> IO ()) -> IO ()
+detectUserErrors shouldTake writeThread throwErr = do
+  let info = "LMDB transactions might now be in a mangled state"
+      inappr ctx = printf "inappropriately called (%s); %s" ctx info
+      unexpThread = "called on unexpected thread; " ++ info
+      caseShouldTake = "before aborting/committing read-write transaction"
+      caseNotShouldTake = "before starting writeLMDB"
+  threadId <- myThreadId
+  if shouldTake
+    then
+      -- Before aborting/committing read-write transactions.
+      tryTakeMVar writeThread >>= \case
+        Nothing -> throwErr $ inappr caseShouldTake
+        Just tid
+          | tid /= threadId -> throwErr unexpThread
+          | otherwise -> return ()
+    else do
+      -- Before starting a writeLMDB.
+      isEmptyMVar writeThread >>= flip when (throwErr $ inappr caseNotShouldTake)
+      void $ withMVarMasked writeThread $ \tid ->
+        if tid /= threadId
+          then throwErr unexpThread
+          else void $ return tid
+
+-- |
+-- @liftedBracket2 acquire failure success thing@
+--
+-- Same as @Control.Exception.Lifted.bracket@ (from @lifted-base@) except it distinguishes between
+-- failure and success.
+--
+-- Notes:
+--
+-- * When @acquire@, @success@, or @failure@ throw exceptions, any monadic side effects in @m@ will
+--   be discarded.
+-- * When @thing@ throws an exception, any monadic side effects in @m@ produced by @thing@ will be
+--   discarded, but the side effects of @acquire@ and (non-excepting) @failure@ will be retained.
+-- * When (following a @thing@ success) @success@ throws an exception, any monadic side effects in
+--   @m@ produced by @success@ will be discarded, but the side effects of @acquire@, @thing@, and
+--   (non-excepting) @failure@ will be retained.
+--
+-- /Internal/.
+{-# INLINE liftedBracket2 #-}
+liftedBracket2 ::
+  (MonadBaseControl IO m) =>
+  m a ->
+  (a -> m b) ->
+  (a -> m b) ->
+  (a -> m c) ->
+  m c
+liftedBracket2 acquire failure success thing = control $ \runInIO ->
+  bracket2
+    (runInIO acquire)
+    (\st -> runInIO $ restoreM st >>= failure)
+    (\st -> runInIO $ restoreM st >>= success)
+    (\st -> runInIO $ restoreM st >>= thing)
+
+-- | Same as @Control.Exception.bracket@ except it distinguishes between failure and success. (If
+-- the success action throws an exception, the failure action gets called.)
+--
+-- /Internal/.
+{-# INLINE bracket2 #-}
+bracket2 ::
+  IO a ->
+  (a -> IO b) ->
+  (a -> IO b) ->
+  (a -> IO c) ->
+  IO c
+bracket2 acquire failure success thing = mask $ \restore -> do
+  a <- acquire
+  r <- restore (thing a) `E.onException` failure a
+  _ <- success a `E.onException` failure a
+  return r

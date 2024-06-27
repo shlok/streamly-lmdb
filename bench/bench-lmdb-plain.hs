@@ -34,6 +34,8 @@ dispatch _ _ = do
 
 newtype UnsafeFFI = UnsafeFFI Bool
 
+-- | This doesn’t come close to the C program’s performance (microseconds of overhead per
+-- iteration). TODO: Investigate.
 write :: Ptr MDB_env -> UnsafeFFI -> FilePath -> String -> String -> String -> String -> IO ()
 write penv (UnsafeFFI unsafeFFI) path keyFactor' valueFactor' numPairs' chunkSize' = do
   let keyFactor = read keyFactor'

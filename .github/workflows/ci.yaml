@@ -1,14 +1,17 @@
+# Based on https://markkarpov.com/post/github-actions-for-haskell-ci.html.
+
 name: CI
 on:
   push:
     branches:
       - master
+      - rare-timeout
   pull_request:
     types:
       - opened
       - synchronize
 
-  # Allows you to run this workflow manually from the Actions tab
+  # Allows us to run the workflow manually from the Actions tab.
   workflow_dispatch:
 
   schedule:
@@ -18,16 +21,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-22.04", "macos-12"]
-        cabal: ["3.6.2"]
-        ghc: ["8.10.4", "9.2.7"]
+        os: ["ubuntu-latest", "macos-latest"]
+        cabal: ["3.10.1.0"]
+        ghc: ["8.10.7", "9.2.8"]
       fail-fast: false
     name: cabal ${{ matrix.cabal }} - ${{ matrix.os }}, ${{ matrix.ghc }}
     env:
       CONFIG: "--enable-tests --enable-benchmarks"
     steps:
-      - uses: actions/checkout@v2.3.4
-      - uses: haskell/actions/setup@v1.2
+      - uses: actions/checkout@v3.5.3
+      - uses: haskell/actions/setup@v2.3.6
         id: setup-haskell-cabal
         with:
           ghc-version: ${{ matrix.ghc }}
@@ -38,30 +41,30 @@ jobs:
         if: contains(matrix.os, 'macos')
       - run: cabal v2-update
       - run: cabal v2-freeze $CONFIG
-      - uses: actions/cache@v2.1.3
+      - uses: actions/cache@v3.3.1
         with:
           path: |
-            ${{ steps.setup-haskell-cabal.outputs.cabal-store }}
+            ~/.cabal/store
             dist-newstyle
           key: cabal-${{ matrix.cabal }}-${{ matrix.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
           restore-keys: |
             cabal-${{ matrix.cabal }}-${{ matrix.os }}-${{ matrix.ghc }}-
       - run: cabal v2-build $CONFIG
-      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 5000'
+      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 10000'
       - run: cabal v2-haddock $CONFIG
       - run: cabal v2-sdist
   stack:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ["ubuntu-22.04", "macos-12"]
-        stack: ["2.9.3"]
+        os: ["ubuntu-latest", "macos-latest"]
+        stack: ["2.11.1"]
       fail-fast: false
     name: stack ${{ matrix.stack }} - ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v2.3.4
-      - uses: haskell/actions/setup@v1.2
-        id: setup-haskell-cabal
+      - uses: actions/checkout@v3.5.3
+      - uses: haskell/actions/setup@v2.3.6
+        id: setup-haskell-stack
         with:
           enable-stack: true
           stack-version: ${{ matrix.stack }}
@@ -69,16 +72,15 @@ jobs:
         if: contains(matrix.os, 'ubuntu')
       - run: brew install lmdb
         if: contains(matrix.os, 'macos')
-      - uses: actions/cache@v2.1.3
-        if: contains(matrix.os, 'ubuntu') # Avoid "cannot execute binary file" error on macOS.
+      - uses: actions/cache@v3.3.1
         with:
           path: |
-            ${{ steps.setup-haskell-cabal.outputs.stack-root }}
+            ~/.stack
             .stack-work
-          key: stack-${{ matrix.stack }}-${{ matrix.os }}-${{ hashFiles('stack.yaml') }}-${{ hashFiles('package.yaml') }}
+          key: stack-${{ matrix.stack }}-${{ matrix.os }}-${{ hashFiles('stack.yaml') }}-${{ hashFiles('stack.yaml.lock') }}-${{ hashFiles('streamly-lmdb.cabal') }}
           restore-keys: |
             stack-${{ matrix.stack }}-${{ matrix.os }}-
       - run: stack build
-      - run: stack test --test-arguments="--quickcheck-tests 5000"
+      - run: stack test --test-arguments="--quickcheck-tests 10000"
       - run: stack haddock
       - run: stack sdist

@@ -4,12 +4,11 @@ module Streamly.External.LMDB.Internal.Foreign where
 
 #include <lmdb.h>
 
-import Control.Exception (Exception, throwIO)
-import Control.Monad (when)
-import Foreign ((.|.), Ptr, Storable (alignment, peek, peekByteOff,
-                poke, pokeByteOff, sizeOf), Word16, Word32, alloca, nullPtr)
-import Foreign.C.String (CString, peekCString, withCString)
-import Foreign.C.Types (CChar, CInt (CInt), CSize (CSize), CUInt (CUInt))
+import Control.Exception
+import Control.Monad
+import Foreign
+import Foreign.C.String
+import Foreign.C.Types
 
 import qualified Data.List as L
 
@@ -269,33 +268,31 @@ mdb_txn_begin_unsafe penv parent flags =
     alloca $ \pptxn -> c_mdb_txn_begin_unsafe penv parent flags pptxn >>= \rc ->
         if rc /= 0 then throwLMDBErrNum "mdb_txn_begin" rc else peek pptxn
 
--- If the commit fails, aborts the transaction.
 mdb_txn_commit :: Ptr MDB_txn -> IO ()
 mdb_txn_commit ptxn =
     c_mdb_txn_commit ptxn >>= \rc ->
-        when (rc /= 0) $ c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_txn_commit" rc
+        when (rc /= 0) $ throwLMDBErrNum "mdb_txn_commit" rc
 
--- If the commit fails, aborts the transaction.
 mdb_txn_commit_unsafe :: Ptr MDB_txn -> IO ()
 mdb_txn_commit_unsafe ptxn =
     c_mdb_txn_commit_unsafe ptxn >>= \rc ->
-        when (rc /= 0) $ c_mdb_txn_abort_unsafe ptxn >> throwLMDBErrNum "mdb_txn_commit" rc
+        when (rc /= 0) $ throwLMDBErrNum "mdb_txn_commit" rc
 
 mdb_cursor_open :: Ptr MDB_txn -> MDB_dbi_t -> IO (Ptr MDB_cursor)
 mdb_cursor_open ptxn dbi =
     alloca $ \ppcurs -> c_mdb_cursor_open ptxn dbi ppcurs >>= \rc ->
-        if rc /= 0 then c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_cursor_open" rc else peek ppcurs
+        if rc /= 0 then throwLMDBErrNum "mdb_cursor_open" rc else peek ppcurs
 
 mdb_cursor_open_unsafe :: Ptr MDB_txn -> MDB_dbi_t -> IO (Ptr MDB_cursor)
 mdb_cursor_open_unsafe ptxn dbi =
     alloca $ \ppcurs -> c_mdb_cursor_open_unsafe ptxn dbi ppcurs >>= \rc ->
-        if rc /= 0 then c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_cursor_open" rc else peek ppcurs
+        if rc /= 0 then throwLMDBErrNum "mdb_cursor_open" rc else peek ppcurs
 
 mdb_dbi_open :: Ptr MDB_txn -> Maybe String -> CUInt -> IO MDB_dbi_t
 mdb_dbi_open ptxn name flags = do
     withCStringMaybe name $ \cname ->
         alloca $ \pdbi -> c_mdb_dbi_open ptxn cname flags pdbi >>= \rc ->
-            if rc /= 0 then c_mdb_txn_abort ptxn >> throwLMDBErrNum "mdb_dbi_open" rc else peek pdbi
+            if rc /= 0 then throwLMDBErrNum "mdb_dbi_open" rc else peek pdbi
 
 {-# INLINE mdb_put #-}
 mdb_put :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> CUInt -> IO ()

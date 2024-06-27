@@ -2,4 +2,5 @@
 *~
 /tmp/
 /bench-lmdb
+/results/csv/*.gnumeric
 /result

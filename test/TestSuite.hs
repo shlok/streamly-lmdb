@@ -1,25 +1,16 @@
 module Main where
 
-import Streamly.External.LMDB.Channel
 import qualified Streamly.External.LMDB.Tests
 import Test.Tasty
 
 main :: IO ()
-main =
-  defaultMain $
-    withResource
-      ( do
-          chan <- createChannel defaultChannelOptions
-          startChannel chan
-          return chan
-      )
-      endChannel
-      tests
+main = defaultMain tests
 
-tests :: IO Channel -> TestTree
-tests res =
+tests :: TestTree
+tests =
   testGroup
     "Tests"
-    [ testGroup "Streamly.External.LMDB.Tests" $
-        Streamly.External.LMDB.Tests.tests res
+    [ testGroup
+        "Streamly.External.LMDB.Tests"
+        Streamly.External.LMDB.Tests.tests
     ]

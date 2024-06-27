@@ -1,14 +1,17 @@
 #include <dirent.h>
 #include <lmdb.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define E(func, ...)                                                           \
   do {                                                                         \
-    if (func(__VA_ARGS__) != 0) {                                              \
-      printf("%s error (%s:%d)\n", #func, __FILE__, __LINE__);                 \
+    int ret = func(__VA_ARGS__);                                               \
+    if (ret != 0) {                                                            \
+      printf("%s error (%d:%s:%d)\n", #func, ret, __FILE__, __LINE__);         \
       return 1;                                                                \
     }                                                                          \
   } while (0)
@@ -18,11 +21,10 @@ void __attribute__((noinline))
 copy_bytes(char *memory, int factor, int x, int offset);
 
 int main(int argc, char *argv[]) {
-  if (argc <= 2) {
+  if (argc < 2) { // Make sure at least argv[1] is available.
     print_usage();
     return 1;
   }
-  const char *path = argv[2];
   MDB_env *env;
   unsigned long long kb = 1024ULL;
   unsigned long long tb = kb * kb * kb * kb;
@@ -33,6 +35,7 @@ int main(int argc, char *argv[]) {
       print_usage();
       return 1;
     }
+    const char *path = argv[2];
     int key_factor = strtol(argv[3], NULL, 10);
     int value_factor = strtol(argv[4], NULL, 10);
     long long num_pairs = strtoll(argv[5], NULL, 10);
@@ -111,6 +114,7 @@ int main(int argc, char *argv[]) {
       print_usage();
       return 1;
     }
+    const char *path = argv[2];
     E(mdb_env_open, env, path, 0, 0664);
     MDB_txn *txn;
     MDB_dbi dbi;
@@ -157,6 +161,7 @@ int main(int argc, char *argv[]) {
       print_usage();
       return 1;
     }
+    const char *path = argv[2];
     int key_factor = strtol(argv[3], NULL, 10);
 
     E(mdb_env_open, env, path, 0, 0664);
@@ -215,8 +220,16 @@ int main(int argc, char *argv[]) {
     printf("Overflow.\n");
     return 1;
   } else if (strcmp(argv[1], "read-files") == 0) {
-    // Read all files in path (non-recursively), read one byte from each file
-    // (as an int), and output the sum of the integers.
+    if (argc != 4) {
+      print_usage();
+      return 1;
+    }
+    const char *path = argv[2];
+    int n = strtol(argv[3], NULL, 10);
+
+    // Read all files in path (non-recursively), read n bytes from each file (as
+    // ints), and output the sum of the integers. (Note: We’re assuming we
+    // already know there are n bytes in each file.)
     DIR *dir;
     if ((dir = opendir(path)) != NULL) {
       FILE *fp;
@@ -231,8 +244,10 @@ int main(int argc, char *argv[]) {
             return 1;
           };
           fp = fopen(f_path, "r");
-          int byte = fgetc(fp);
-          sum += (long)byte;
+          for (int i = 0; i < n; i++) {
+            int byte = fgetc(fp);
+            sum += (long long)byte;
+          }
           file_count++;
           fclose(fp);
         };
@@ -244,6 +259,44 @@ int main(int argc, char *argv[]) {
       printf("Error: Unable to open directory: %s\n", path);
       return 1;
     }
+  } else if (strcmp(argv[1], "show-bufsiz") == 0) {
+    if (argc != 2) {
+      print_usage();
+      return 1;
+    }
+    printf("%d\n", BUFSIZ);
+  } else if (strcmp(argv[1], "test-memcpy") == 0) {
+    if (argc != 4) {
+      print_usage();
+      return 1;
+    }
+    uint64_t iterations = strtoll(argv[2], NULL, 10);
+    size_t factor = strtoll(argv[3], NULL, 10);
+
+    size_t dest_size =
+        factor * 8; // 8 bytes for each uint64_t in below iteration.
+    uint8_t *volatile dest =
+        (uint8_t *)malloc(dest_size); // volatile prevents optimizations.
+
+    struct timespec start, end;
+    long long elapsed_nanos;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (uint64_t i = 0; i < iterations; ++i) {
+      for (int j = 0; j < factor; j++) {
+        memcpy((void *)(dest + j * 8), (void *)&i, 8);
+      }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    elapsed_nanos = (end.tv_sec - start.tv_sec) * 1000000000LL +
+                    (end.tv_nsec - start.tv_nsec);
+
+    double ns_per_iteration = (double)elapsed_nanos / iterations;
+    double ns_per_byte = ns_per_iteration / dest_size;
+
+    printf("%ld,%zu,%zu,%f,%f\n", iterations, factor, dest_size,
+           ns_per_iteration, ns_per_byte);
   } else {
     print_usage();
     return 1;
@@ -257,7 +310,9 @@ void print_usage() {
             [# key-value pairs] [# pairs in each transaction]\n");
   printf("bench-lmdb read-cursor [path]\n");
   printf("bench-lmdb read-keys [path] [key factor]\n");
-  printf("bench-lmdb read-files [path]\n");
+  printf("bench-lmdb read-files [path] [bytes per file]\n");
+  printf("bench-lmdb test-memcpy [# iterations] [factor]\n");
+  printf("bench-lmdb show-bufsiz\n");
 }
 
 void copy_bytes(char *memory, int factor, int x, int offset) {

@@ -3,6 +3,9 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Use <$>" #-}
 
 module Streamly.External.LMDB.Tests where
 
@@ -10,652 +13,519 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Exception hiding (assert)
 import Control.Monad
+import Data.Bifunctor
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Data.ByteString.Unsafe
 import Data.Either
+import Data.Foldable
 import Data.Function
+import Data.Functor
 import Data.List
 import qualified Data.Map.Strict as M
 import Data.Maybe
+import qualified Data.Sequence as Seq
 import Data.Serialize.Put
 import qualified Data.Set as Set
 import qualified Data.Vector as V
 import Data.Word
 import Foreign
+import GHC.Conc
 import qualified Streamly.Data.Fold as F
-import Streamly.Data.Stream.Prelude (fromList, toList, unfold)
 import qualified Streamly.Data.Stream.Prelude as S
+import qualified Streamly.Data.Unfold as U
 import Streamly.External.LMDB
-import Streamly.External.LMDB.Channel
 import Streamly.External.LMDB.Internal
+import Streamly.External.LMDB.Internal.Error
 import Streamly.External.LMDB.Internal.Foreign
 import qualified Streamly.Internal.Data.Fold as F
-import qualified Streamly.Internal.Data.Fold.Concurrent as F
 import System.Directory
 import System.IO.Temp
+import System.Random
 import Test.QuickCheck hiding (mapSize)
 import Test.QuickCheck.Monadic
 import Test.Tasty (TestTree)
+import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck hiding (mapSize)
 import Text.Printf
 
-tests :: IO Channel -> [TestTree]
-tests res =
-  [ testReadLMDB res,
-    testUnsafeReadLMDB res
+tests :: [TestTree]
+tests =
+  [ testGetDatabase,
+    testReadLMDB,
+    testUnsafeReadLMDB,
+    testWriteLMDBChunked ModeSerial,
+    testWriteLMDBChunked (ModeParallel (ClearDatabase False)),
+    testWriteLMDBChunked (ModeParallel (ClearDatabase True)),
+    testWriteLMDBOneChunk OverwrDisallowThrow,
+    testWriteLMDBOneChunk OverwrDisallowThrowAllowSameVal,
+    testWriteLMDBOneChunk OverwrDisallowIgnore,
+    testWriteLMDBOneChunk OverwrDisallowStop,
+    testWriteLMDBOneChunk OverwrAppendThrow,
+    testWriteLMDBOneChunk OverwrAppendIgnore,
+    testWriteLMDBOneChunk OverwrAppendStop,
+    testAsyncExceptionsConcurrent,
+    testBetween
   ]
-    ++ ( do
-           overwriteOpts <-
-             [ OverwriteAllow,
-               OverwriteAllowSameValue,
-               OverwriteDisallow $ WriteAppend False,
-               OverwriteDisallow $ WriteAppend True
-               ]
-           failureFold <- [FailureThrow, FailureStop, FailureIgnore]
-           return $ testWriteLMDB overwriteOpts failureFold res
-       )
-    ++ ( do
-           overwriteOpts <-
-             [ OverwriteAllow,
-               OverwriteAllowSameValue,
-               OverwriteDisallow $ WriteAppend False,
-               OverwriteDisallow $ WriteAppend True
-               ]
-           return $ testWriteLMDBToList overwriteOpts res
-       )
-    ++ [ testWriteLMDBConcurrent res,
-         testWriteLMDBDemux res,
-         testWriteLMDBDemuxSameDb res,
-         testAsyncExceptionsConcurrent res,
-         testClearDatabaseConcurrent res,
-         testBetween
-       ]
 
--- | Sometimes we don’t want to close the database afterwards (because we happen to know that doing
--- so might not be safe).
-newtype ShouldCloseDb = ShouldCloseDb Bool
+testGetDatabase :: TestTree
+testGetDatabase =
+  testCase "getDatabase" $ do
+    -- Make sure things work concurrently on separate environments.
+    let nenvs = 20
+    replicateConcurrently_ nenvs $ do
+      tmpParent <- getCanonicalTemporaryDirectory
+      tmpDir <- createTempDirectory tmpParent "streamly-lmdb-tests"
 
-withEnvDb ::
-  ShouldCloseDb ->
-  IO Channel ->
-  (Environment ReadWrite -> Database ReadWrite -> PropertyM IO a) ->
+      -- Make sure things work concurrently in the same environment.
+      let ndbs = 20
+
+      let limits = defaultLimits {mapSize = tebibyte, maxDatabases = ndbs}
+          openRoEnv = openEnvironment @ReadOnly tmpDir limits
+          openRwEnv = openEnvironment @ReadWrite tmpDir limits
+
+      -- Prepare environment for the first time using read-write mode.
+      openRwEnv >>= closeEnvironment
+
+      -- Open environment in ReadOnly mode.
+      env1 <- openRoEnv
+
+      -- Can get unnamed database in ReadOnly mode.
+      replicateConcurrently_ ndbs $ do
+        getDatabase @ReadOnly env1 Nothing >>= closeDatabase
+
+      -- Cannot create named databases in ReadOnly mode.
+      forConcurrently_ [1 .. ndbs] $ \i -> do
+        e <- try (getDatabase @ReadOnly env1 (Just $ "name" ++ show i))
+        case e of
+          Left (_ :: SomeException) -> return ()
+          Right _ -> error "getDatabase: should not succeed"
+
+      -- Close read-only environment.
+      closeEnvironment env1
+
+      -- Can create named databases in ReadWrite mode.
+      env2 <- openRwEnv
+      forConcurrently_ [1 .. ndbs] $ \i ->
+        getDatabase @ReadWrite env2 (Just $ "name" ++ show i) >>= closeDatabase
+      closeEnvironment env2
+
+      -- Can get existing named databases in ReadOnly mode.
+      env3 <- openRoEnv
+      forConcurrently_ [1 .. ndbs] $ \i ->
+        getDatabase @ReadOnly env3 (Just $ "name" ++ show i) >>= closeDatabase
+      closeEnvironment env3
+
+      removeDirectoryRecursive tmpDir
+
+-- | Creates a single environment with one unnamed database ('Nothing') or >=1 ('Just') named
+-- databases for which the provided action is run.
+withEnvDbs ::
+  Maybe Int ->
+  ((Environment ReadWrite, V.Vector (Database ReadWrite)) -> PropertyM IO a) ->
   PropertyM IO a
-withEnvDb shouldClose res f =
-  withEnvDbN
-    1
-    shouldClose
-    res
-    ( \v -> case V.toList v of
-        [(env, db)] -> f env db
-        _ -> error "withEnvDb: unreachable"
-    )
-
-withEnvDbN ::
-  Int ->
-  ShouldCloseDb ->
-  IO Channel ->
-  (V.Vector (Environment ReadWrite, Database ReadWrite) -> PropertyM IO a) ->
-  PropertyM IO a
-withEnvDbN n (ShouldCloseDb shouldClose) res f = do
-  chan <- run res
+withEnvDbs mNumDbs f = do
   -- TODO: bracket for PropertyM?
-  dirEnvsDbs <-
-    V.fromList
-      <$> run
-        ( replicateM n $ do
-            tmpParent <- getCanonicalTemporaryDirectory
-            tmpDir <- createTempDirectory tmpParent "streamly-lmdb-tests"
-            env <- openEnvironment tmpDir $ defaultLimits {mapSize = tebibyte}
-            db <- getDatabase chan env Nothing
-            return (tmpDir, env, db)
-        )
-  a <- f $ V.map (\(_, x, y) -> (x, y)) dirEnvsDbs
-  run $ forM_ dirEnvsDbs $ \(dir, env, db) -> do
+  tmpParent <- run getCanonicalTemporaryDirectory
+  tmpDir <- run $ createTempDirectory tmpParent "streamly-lmdb-tests"
+  env <-
+    run $
+      openEnvironment tmpDir $
+        defaultLimits
+          { mapSize = tebibyte,
+            maxDatabases = fromMaybe 0 mNumDbs
+          }
+  dbs <- run $ case mNumDbs of
+    Nothing -> V.singleton <$> getDatabase env Nothing
+    Just numDbs
+      | numDbs >= 1 -> forM (V.fromList [1 .. numDbs]) $ \i ->
+          getDatabase env (Just $ "name" ++ show i)
+      | otherwise -> error "invalid mNumDbs"
+
+  a <- f (env, dbs)
+
+  run $ do
     waitReaders env
-
-    when shouldClose $ do
-      closeDatabase chan db
-
-    -- If we don’t close the database, we still need this to avoid certain “too many open files”
-    -- errors. (Since we will not use any transactions/databases/cursors after this call, this
-    -- should be safe; see
-    -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L788)
-    closeEnvironment chan env
-
-    removeDirectoryRecursive dir
+    forM_ dbs $ \db -> closeDatabase db
+    closeEnvironment env
+    removeDirectoryRecursive tmpDir
   return a
 
-withReadOnlyTxnAndCurs ::
-  (Mode mode) =>
-  Environment mode ->
-  Database mode ->
-  ((ReadOnlyTxn mode, Cursor) -> IO r) ->
-  IO r
-withReadOnlyTxnAndCurs env db =
-  bracket
-    (beginReadOnlyTxn env >>= \txn -> openCursor txn db >>= \curs -> return (txn, curs))
-    (\(txn, curs) -> closeCursor curs >> abortReadOnlyTxn txn)
-
 -- | Write key-value pairs to a database in a normal manner, read them back using our library, and
--- make sure the result is what we wrote.
-testReadLMDB :: IO Channel -> TestTree
-testReadLMDB res =
-  testProperty "readLMDB" . monadicIO . withEnvDb (ShouldCloseDb True) res $ \env db -> do
-    keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
-
+-- make sure the result is what we wrote. Concurrent read transactions are covered.
+testReadLMDB :: TestTree
+testReadLMDB =
+  testProperty "readLMDB" . monadicIO . withEnvDbs Nothing $ \(env, dbs) -> do
+    let db = case V.toList dbs of [x] -> x; _ -> error "unreachable"
+    keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs 200
     run $ writeChunk db False keyValuePairs
     let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
 
-    (readOpts, expectedResults) <- pick $ readOptionsAndResults keyValuePairsInDb
-    let unf txn = toList $ unfold (readLMDB db txn readOpts) undefined
-    results <- run $ unf Nothing
-    resultsTxn <- run $ withReadOnlyTxnAndCurs env db (unf . Just)
+    let nread = 20
+    vec <- V.replicateM nread . pick $ readOptionsAndResults keyValuePairsInDb
+    bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) -> do
+      let unf txn = S.toList $ S.unfold (readLMDB' us db txn readOpts) undefined
+      results <- unf NoTxn
+      resultsTxn <- withReadOnlyTransaction env $ \t -> withCursor t db $ \c -> unf $ JustTxn (t, c)
+      return $ results == expectedResults && resultsTxn == expectedResults
 
-    return $ results == expectedResults && resultsTxn == expectedResults
+    return $ and bs
 
 -- | Similar to 'testReadLMDB', except that it tests the unsafe function in a different manner.
-testUnsafeReadLMDB :: IO Channel -> TestTree
-testUnsafeReadLMDB res =
-  testProperty "unsafeReadLMDB" . monadicIO . withEnvDb (ShouldCloseDb True) res $ \env db -> do
-    keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs'' 500
-
+testUnsafeReadLMDB :: TestTree
+testUnsafeReadLMDB =
+  testProperty "unsafeReadLMDB" . monadicIO . withEnvDbs Nothing $ \(env, dbs) -> do
+    let db = case V.toList dbs of [x] -> x; _ -> error "unreachable"
+    keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs 200
     run $ writeChunk db False keyValuePairs
     let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
 
-    (readOpts, expectedResults) <- pick $ readOptionsAndResults keyValuePairsInDb
-    let expectedLengths = map (\(k, v) -> (B.length k, B.length v)) expectedResults
-    let unf txn =
-          toList $
-            unfold (unsafeReadLMDB db txn readOpts (return . snd) (return . snd)) undefined
-    lengths <- run $ unf Nothing
-    lengthsTxn <- run $ withReadOnlyTxnAndCurs env db (unf . Just)
+    let nread = 20
+    vec <- V.replicateM nread . pick $ readOptionsAndResults keyValuePairsInDb
+    bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) -> do
+      let expectedLengths = map (bimap B.length B.length) expectedResults
+      let unf txn =
+            S.toList $
+              S.unfold (unsafeReadLMDB' us db txn readOpts (return . snd) (return . snd)) undefined
+      lengths <- unf NoTxn
+      lengthsTxn <- withReadOnlyTransaction env $ \t -> withCursor t db $ \c -> unf $ JustTxn (t, c)
+      return $ lengths == expectedLengths && lengthsTxn == expectedLengths
 
-    return $ lengths == expectedLengths && lengthsTxn == expectedLengths
+    return $ and bs
 
-data FailureFold = FailureThrow | FailureStop | FailureIgnore deriving (Show)
+newtype ClearDatabase = ClearDatabase Bool
 
--- | Write key-value pairs to a database using our library with various options, read all key-value
--- pairs back from the database using our library (already covered by 'testReadLMDB'), and make sure
--- they are as expected.
-testWriteLMDB :: OverwriteOptions -> FailureFold -> IO Channel -> TestTree
-testWriteLMDB overwriteOpts failureFold res =
-  testProperty (printf "writeLMDB (%s, %s)" (show overwriteOpts) (show failureFold))
-    . monadicIO
-    . withEnvDb (ShouldCloseDb True) res
-    $ \env db -> do
-      -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
-      -- normally result in bad performance. We therefore base the number of pairs on the chunk
-      -- size.
-      chunkSz <- pick $ chooseInt (1, 100)
-      let maxPairs = chunkSz * 5
-      unsafeFFI <- pick arbitrary
+data ChunkedMode = ModeSerial | ModeParallel !ClearDatabase
 
-      let failureFold' = case failureFold of
-            FailureThrow -> writeFailureThrow
-            FailureStop -> writeFailureStop
-            FailureIgnore -> writeFailureIgnore
+instance Show ChunkedMode where
+  show ModeSerial = "serial"
+  show (ModeParallel (ClearDatabase clear)) =
+    printf
+      "parallel (%s)"
+      (if clear then "with clearDatabase" else "without clearDatabase")
 
-      let fol' =
-            writeLMDB db $
-              defaultWriteOptions
-                { writeTransactionSize = chunkSz,
-                  writeOverwriteOptions = overwriteOpts,
-                  writeUnsafeFFI = unsafeFFI,
-                  writeFailureFold = failureFold'
-                }
+-- | Write key-value pairs to a database using our library in a chunked manner with overwriting
+-- allowed, read all key-value pairs back from the database using our library (already covered by
+-- 'testReadLMDB'), and make sure they are as expected.
+--
+-- When parallelization is enabled: No duplicate keys are written to the database (as we can’t
+-- predict the value order). This test makes sure the read-write transaction serialization mechanism
+-- is working properly. While we’re at it, we also sprinkle in read-only transactions alongside the
+-- read-write ones using 'readLMDB' and 'getLMDB'; and more read-write transactions from
+-- 'clearDatabase'.
+--
+-- In both cases, we use the opportunity to test writing the same data to a single unnamed database
+-- and one or more named databases.
+testWriteLMDBChunked :: ChunkedMode -> TestTree
+testWriteLMDBChunked mode =
+  testProperty (printf "writeLMDBChunked (%s)" (show mode)) . monadicIO $ do
+    numDbs <-
+      (\x -> if x == 0 then Nothing else Just x)
+        <$> pick (chooseInt (0, 3))
+    withEnvDbs numDbs $ \(_, dbs) -> do
+      -- These options should have no effect on the end-result.
+      us <- UseUnsafeFFI <$> pick arbitrary
+      let wopts = defaultWriteOptions
 
-      -- Write key-value pairs to the database.
+      -- The chunk size should also have no effect on the end-result. Note: Low chunk sizes (e.g., 1
+      -- pair or 1 byte) normally result in bad performance. We therefore base the number of pairs
+      -- on the chunk size.
+      chunkByNumPairs <- pick arbitrary
+      (chunkSize, maxPairsBase) <- -- “base”: Not yet multiplied by numThreads (for parallel case).
+        if chunkByNumPairs
+          then do
+            chunkNumPairs <- pick $ chooseInt (1, 50)
+
+            -- Assures both less and more pairs than just a single chunk.
+            let maxPairs = chunkNumPairs * 5
+
+            return (ChunkNumPairs chunkNumPairs, maxPairs)
+          else do
+            -- Compare with the ShortBs max length of 50. (For the longest possible key-value pairs
+            -- (100 bytes), we still have the possibility of up to two pairs per chunk.)
+            chunkBytes <- pick $ chooseInt (1, 200)
+
+            -- Average ShortBs length: 50/2=25; average key-value pair length: 2*25=50.
+            let avgNumKeyValuePairsPerChunk = max 1 (chunkBytes `quot` 50)
+            let maxPairs = avgNumKeyValuePairsPerChunk * 5
+
+            return (ChunkBytes chunkBytes, maxPairs)
+
+      case mode of
+        ModeSerial -> do
+          -- Write key-value pairs to the database. No parallelization is desired, so duplicate keys
+          -- are allowed.
+          keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs maxPairsBase
+          run $
+            S.fromList @IO keyValuePairs
+              & chunkPairs chunkSize
+              -- Assign each chunk to each database and flatten.
+              & fmap (\sequ -> V.toList $ V.map (sequ,) dbs)
+              & S.unfoldMany U.fromList
+              & S.mapM (\(sequ, db) -> writeLMDBChunk' us wopts db sequ)
+              & S.fold F.drain
+
+          -- Read all key-value pairs back from the databases.
+          readPairss <- forM dbs $ \db ->
+            run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+
+          -- And make sure they are as expected.
+          let expectedPairsInEachDb = sort $ removeDuplicateKeysRetainLast keyValuePairs
+          return $ V.all (== expectedPairsInEachDb) readPairss
+        ModeParallel (ClearDatabase clearDb) -> do
+          -- Write key-value pairs to the database. Parallelization is desired, so duplicate keys
+          -- are eliminated up-front.
+          assertEnoughCapabilities
+          numThreads <- pick $ chooseInt (2, 2 * numCapabilities)
+          keyValuePairs <-
+            toByteStrings . removeDuplicateKeysRetainLast
+              <$> arbitraryKeyValuePairs (maxPairsBase * numThreads)
+
+          chunks <-
+            S.fromList keyValuePairs
+              & chunkPairs chunkSize
+              & S.fold F.toList
+
+          -- The chunk we don’t write out but at which we instead clear the database.
+          mClearDbChunkIdx <-
+            if clearDb && not (null chunks)
+              then Just <$> pick (chooseInt (0, length chunks - 1))
+              else return Nothing
+
+          readPairsAlts <- -- Alternative way of reading pairs back from the databases.
+            run $
+              S.fromList @IO chunks
+                & S.indexed
+                -- Assign each chunk to each database and flatten.
+                & fmap (\(chunkIdx, sequ) -> map (chunkIdx,sequ,) [0 .. V.length dbs - 1])
+                & S.unfoldMany U.fromList
+                & S.parMapM
+                  (S.maxThreads numThreads . S.maxBuffer numThreads)
+                  ( \(chunkIdx, sequ, dbIdx) -> do
+                      let db = dbs V.! dbIdx
+
+                      -- Clear or write.
+                      case mClearDbChunkIdx of
+                        Just clearDbChunkIdx | clearDbChunkIdx == chunkIdx -> clearDatabase db
+                        _ -> writeLMDBChunk' us wopts db sequ
+
+                      -- Sprinkle in read-only transactions to make sure those can coexist with
+                      -- read-write transactions. This is also an alternative (inefficient) way of
+                      -- reading back from the database.
+                      b <- randomIO
+                      (chunkIdx,dbIdx,)
+                        <$> if b
+                          then
+                            -- Read entire database using 'readLMDB'. While the database grows as
+                            -- the chunks get written, these read-only transactions get longer
+                            -- lived.
+                            S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+                          else
+                            -- Read using 'getLMDB' (not the entire database but only this chunk).
+                            toList sequ
+                              & S.fromList @IO
+                              & S.mapM
+                                ( \(k, _) ->
+                                    -- The database could have been cleared above, in which case the
+                                    -- key might not exist in the database.
+                                    getLMDB db NoTxn k >>= \mv -> return $ (k,) <$> mv
+                                )
+                              & S.catMaybes
+                              & S.fold F.toList
+                  )
+                & S.fold F.toList
+
+          -- Read all key-value pairs back from the databases.
+          readPairss <- forM dbs $ \db ->
+            run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+
+          -- Make sure they are as expected. (Recall that for readPairsAlts, we sometimes read the
+          -- whole database and sometimes only one chunk.)
+          return $ case mClearDbChunkIdx of
+            Nothing ->
+              -- No clearing took place.
+              let readPairssExpected =
+                    V.fromList
+                      . M.elems
+                      -- Make sure there is at least empty data for each database. (This is for the
+                      -- special case of no key-value pairs.)
+                      . M.unionWith (++) (M.fromList . map (,[]) $ [0 .. V.length dbs - 1])
+                      -- Needed because of the parallel reading.
+                      . M.map (sort . removeDuplicateKeysRetainLast)
+                      . M.fromListWith (++)
+                      $ map (\(_, dbIdx, pairs) -> (dbIdx, pairs)) readPairsAlts
+               in readPairss == readPairssExpected
+                    && all (== V.head readPairss) readPairss
+            Just clearDbChunkIdx ->
+              -- For one of the chunks (clearDbChunkIdx), clearing took place. We know far less
+              -- about the expected data in the database. Data that was written beyond a certain
+              -- chunk should exist in there at least.
+              let readPairssExpectedSubsets =
+                    V.fromList
+                      . M.elems
+                      . M.map Set.fromList
+                      -- Make sure there is at least empty data for each database.
+                      . M.unionWith (++) (M.fromList . map (,[]) $ [0 .. V.length dbs - 1])
+                      -- (No sorting or duplication removal needed because we convert to sets.)
+                      . M.fromListWith (++)
+                      . map (\(_, dbIdx, pairs) -> (dbIdx, pairs))
+                      . filter
+                        ( \(chunkIdx, dbIdx, _) ->
+                            -- For this database (dbIdx), find the chunkIdx beyond which data is
+                            -- known to exist.
+                            let (endChunkIdxTmp, endDbIdx) =
+                                  (clearDbChunkIdx * V.length dbs + dbIdx + numThreads - 1)
+                                    `quotRem` V.length dbs
+                                endChunkIdx =
+                                  if endDbIdx < dbIdx
+                                    then endChunkIdxTmp - 1
+                                    else endChunkIdxTmp
+                             in chunkIdx > endChunkIdx
+                        )
+                      $ readPairsAlts
+               in flip all (V.indexed readPairss) $ \(dbIdx, readPairs) ->
+                    (readPairssExpectedSubsets V.! dbIdx)
+                      `Set.isSubsetOf` Set.fromList readPairs
+
+-- | Choices for the standard writing accumulators.
+data OverwriteOpts
+  = OverwrDisallowThrow
+  | OverwrDisallowThrowAllowSameVal
+  | OverwrDisallowIgnore
+  | OverwrDisallowStop
+  | OverwrAppendThrow
+  | OverwrAppendIgnore
+  | OverwrAppendStop
+  deriving (Show)
+
+-- | Write key-value pairs to a database using our library non-concurrently in one chunk (chunking
+-- and concurrency is already tested with 'testWriteLMDBChunked') with the standard overwriting
+-- options other than “allow,” and make sure the exceptions and written key-value pairs are as
+-- expected. (We see no reason to intermingle this with chunking and concurrency.)
+testWriteLMDBOneChunk :: OverwriteOpts -> TestTree
+testWriteLMDBOneChunk owOpts =
+  testProperty (printf "writeLMDBOneChunk (%s)" (show owOpts)) . monadicIO . withEnvDbs Nothing $
+    \(_, dbs) -> do
+      let db = case V.toList dbs of [x] -> x; _ -> error "unreachable"
+
+          wopts =
+            defaultWriteOptions
+              { writeOverwriteOptions = case owOpts of
+                  OverwrDisallowThrow -> OverwriteDisallow . Left $ writeAccumThrow @IO Nothing
+                  OverwrDisallowThrowAllowSameVal ->
+                    OverwriteDisallow . Right $ writeAccumThrowAllowSameValue Nothing
+                  OverwrDisallowIgnore -> OverwriteDisallow $ Left writeAccumIgnore
+                  OverwrDisallowStop -> OverwriteDisallow $ Left writeAccumStop
+                  OverwrAppendThrow -> OverwriteAppend $ writeAccumThrow Nothing
+                  OverwrAppendIgnore -> OverwriteAppend writeAccumIgnore
+                  OverwrAppendStop -> OverwriteAppend writeAccumStop
+              }
+          maxPairs = 200
+
       keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairsDupsMoreLikely maxPairs
-      let hasDuplicates = hasDuplicateKeys keyValuePairs
-          hasDuplicatesWithDiffVals = hasDuplicateKeysWithDiffVals keyValuePairs
+      let hasDuplicateKeys' = hasDuplicateKeys keyValuePairs
+          hasDuplicateKeysWithDiffVals' = hasDuplicateKeysWithDiffVals keyValuePairs
           isSorted = sort keyValuePairs == keyValuePairs
-          isStrictlySorted = isSorted && not hasDuplicates
-      e <- run . try @SomeException $ S.fold fol' $ fromList keyValuePairs
+          isStrictlySorted = isSorted && not hasDuplicateKeys'
 
-      -- If we comment out the cleanup code in writeLMDB at synchronous exceptions or normal
-      -- completion (which we shouldn’t normally do), we need this for the tests to pass.
-      -- run $ waitWriters env
-      let removeUnusedWarning = env
+      e <- run . try @SomeException $ writeLMDBChunk wopts db (Seq.fromList keyValuePairs)
 
       -- Make sure exceptions occurred as expected from the written key-value pairs.
-      let assert1 s = assertMsg $ "assert (first checks) failure " ++ const s removeUnusedWarning
-      case failureFold of
-        FailureStop -> assert1 "(1)" (isRight e)
-        FailureIgnore -> assert1 "(2)" (isRight e)
-        FailureThrow -> case overwriteOpts of
-          OverwriteAllow -> assert1 "(3)" (isRight e)
-          OverwriteAllowSameValue -> case e of
-            Left _ -> assert1 "(4)" hasDuplicatesWithDiffVals
-            Right _ -> assert1 "(5)" $ not hasDuplicatesWithDiffVals
-          OverwriteDisallow (WriteAppend False) -> case e of
-            Left _ -> assert1 "(6)" hasDuplicates
-            Right _ -> assert1 "(7)" $ not hasDuplicates
-          OverwriteDisallow (WriteAppend True) -> case e of
-            Left _ -> assert1 "(8)" $ not isStrictlySorted
-            Right _ -> assert1 "(9)" isStrictlySorted
+      let assert1 s = assertMsg $ "assert (first checks) failure " ++ s
+      case owOpts of
+        OverwrDisallowThrow -> case e of
+          Left _ -> assert1 "(1)" hasDuplicateKeys'
+          Right _ -> assert1 "(2)" $ not hasDuplicateKeys'
+        OverwrDisallowThrowAllowSameVal -> case e of
+          Left _ -> assert1 "(3)" hasDuplicateKeysWithDiffVals'
+          Right _ -> assert1 "(4)" $ not hasDuplicateKeysWithDiffVals'
+        OverwrDisallowIgnore -> assert1 "(5)" (isRight e)
+        OverwrDisallowStop -> assert1 "(6)" (isRight e)
+        OverwrAppendThrow -> case e of
+          Left _ -> assert1 "(7)" $ not isStrictlySorted
+          Right _ -> assert1 "(8)" isStrictlySorted
+        OverwrAppendIgnore -> assert1 "(9)" (isRight e)
+        OverwrAppendStop -> assert1 "(10)" (isRight e)
 
-      -- Regardless of whether an exception occurred, we now read all key-value pairs back from the
+      -- Regardless of whether an exception occurred, read all key-value pairs back from the
       -- database and make sure they are as expected.
-      readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-      let assert2 s = assertMsg $ "assert (second checks) failure " ++ s
-      case failureFold of
-        FailureStop ->
-          case overwriteOpts of
-            OverwriteAllow ->
-              assert2 "(1)" $ readPairsAll == sort (removeDuplicateKeysRetainLast keyValuePairs)
-            OverwriteAllowSameValue ->
-              assert2 "(2)" $
-                readPairsAll
-                  == sort
-                    ( removeDuplicateKeysRetainLast $
-                        prefixBeforeDuplicateWithDiffVal keyValuePairs
-                    )
-            OverwriteDisallow (WriteAppend False) ->
-              assert2 "(3)" $ readPairsAll == sort (prefixBeforeDuplicate keyValuePairs)
-            OverwriteDisallow (WriteAppend True) ->
-              assert2 "(4)" $ readPairsAll == sort (prefixBeforeStrictlySortedKeysEnd keyValuePairs)
-        FailureIgnore ->
-          case overwriteOpts of
-            OverwriteAllow ->
-              assert2 "(5)" $ readPairsAll == sort (removeDuplicateKeysRetainLast keyValuePairs)
-            OverwriteAllowSameValue ->
-              assert2 "(6)" $ readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
-            OverwriteDisallow (WriteAppend False) ->
-              assert2 "(7)" $ readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
-            OverwriteDisallow (WriteAppend True) ->
-              assert2 "(8)" $ readPairsAll == fst (filterGreaterThan keyValuePairs)
-        FailureThrow ->
-          -- Same as FailureStop.
-          case overwriteOpts of
-            OverwriteAllow ->
-              assert2 "(9)" $ readPairsAll == sort (removeDuplicateKeysRetainLast keyValuePairs)
-            OverwriteAllowSameValue ->
-              assert2 "(10)" $
-                readPairsAll
-                  == sort
-                    ( removeDuplicateKeysRetainLast $
-                        prefixBeforeDuplicateWithDiffVal keyValuePairs
-                    )
-            OverwriteDisallow (WriteAppend False) ->
-              assert2 "(11)" $ readPairsAll == sort (prefixBeforeDuplicate keyValuePairs)
-            OverwriteDisallow (WriteAppend True) ->
-              assert2 "(12)" $
-                readPairsAll == sort (prefixBeforeStrictlySortedKeysEnd keyValuePairs)
-
--- | Write key-value pairs to a database using our library with various options while collecting
--- failures into a list, read all key-value pairs back from the database using our library (already
--- covered by 'testReadLMDB'), and make sure they and the list of failures are as expected.
-testWriteLMDBToList :: OverwriteOptions -> IO Channel -> TestTree
-testWriteLMDBToList overwriteOpts res =
-  testProperty (printf "writeLMDBToList (%s)" (show overwriteOpts))
-    . monadicIO
-    . withEnvDb (ShouldCloseDb True) res
-    $ \env db -> do
-      do
-        -- These options should have no effect on the end-result. Note: Low chunk sizes (e.g., 1)
-        -- normally result in bad performance. We therefore base the number of pairs on the chunk
-        -- size.
-        chunkSz <- pick $ chooseInt (1, 100)
-        let maxPairs = chunkSz * 5
-        unsafeFFI <- pick arbitrary
-
-        let fol' =
-              writeLMDB db $
-                defaultWriteOptions
-                  { writeTransactionSize = chunkSz,
-                    writeOverwriteOptions = overwriteOpts,
-                    writeUnsafeFFI = unsafeFFI,
-                    writeFailureFold = F.toList
-                  }
-
-        -- Write key-value pairs to the database.
-        keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairsDupsMoreLikely maxPairs
-        e <- run . try @SomeException $ S.fold fol' $ fromList keyValuePairs
-
-        -- If we comment out the cleanup code in writeLMDB at synchronous exceptions or normal
-        -- completion (which we shouldn’t normally do), we need this for the tests to pass.
-        -- run $ waitWriters env
-        let removeUnusedWarning = env
-
-        case const e removeUnusedWarning of
-          Left _ ->
-            -- Make sure no exceptions occurred (since the failures are merely collected to a list).
-            assertMsg "unexpected exception" (isRight e)
-          Right errors -> do
-            --  Read all key-value pairs back from the database and make sure that they, as well as
-            --  the collected offending key-value pairs, are as expected.
-            readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-            let offendingPairs = map (\(_, k, v) -> (k, v)) errors
-            let theAssert s = assertMsg $ "assert failure " ++ s
-            case overwriteOpts of
-              -- The readPairsAll parts are the same as in the FailureIgnore case in testWriteLMDB.
-              OverwriteAllow ->
-                theAssert "(1)" $
-                  null offendingPairs
-                    && readPairsAll == sort (removeDuplicateKeysRetainLast keyValuePairs)
-              OverwriteAllowSameValue ->
-                theAssert "(2)" $
-                  offendingPairs == getRepeatingKeys True keyValuePairs
-                    && readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
-              OverwriteDisallow (WriteAppend False) ->
-                theAssert "(3)" $
-                  offendingPairs == getRepeatingKeys False keyValuePairs
-                    && readPairsAll == sort (filterOutReoccurringKeys keyValuePairs)
-              OverwriteDisallow (WriteAppend True) ->
-                theAssert "(4)" $
-                  offendingPairs == snd (filterGreaterThan keyValuePairs)
-                    && readPairsAll == fst (filterGreaterThan keyValuePairs)
-
--- | Write key-value pairs to a database concurrently, read all key-value pairs back from the
--- database using our library (already covered by 'testReadLMDB'), and make sure they are as
--- expected.
-testWriteLMDBConcurrent :: IO Channel -> TestTree
-testWriteLMDBConcurrent res =
-  testProperty "writeLMDBConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) res $ \env db -> do
-    -- The idea: Pick a chunk size. Sometimes the number of key-value pairs will be greater than the
-    -- chunk size on some threads but less than the chunk size on other threads. Our test being
-    -- successful (esp. combined with the (*) below) means that writeLMDB’s concurrency mechanism
-    -- has to be working.
-    numThreads <- pick $ chooseInt (1, 10)
-    chunkSz <- pick $ chooseInt (1, 5)
-
-    -- (*) More predictability for manual sanity checks; see also the other (*) below. TODO: Bring
-    -- more of these manual sanity checks into the test itself.
-    -- let numThreads = 3
-    -- let chunkSz = 5
-
-    pairss <- generateConcurrentPairs numThreads 0 (4 * chunkSz)
-    run $
-      forConcurrently_ pairss $
-        \(ThreadIdx threadIdx, pairs, failureFold, unsafeFFI) -> do
-          let fol =
-                writeLMDB @IO db $
-                  defaultWriteOptions
-                    { writeTransactionSize = chunkSz,
-                      writeOverwriteOptions = OverwriteAllow,
-                      writeUnsafeFFI = unsafeFFI,
-                      writeFailureFold = failureFold
-                    }
-
-          S.fromList @IO pairs
-            & S.indexed
-            & S.mapM
-              ( \(pairIdx, pair) -> do
-                  let removeUnusedWarning = pairIdx + threadIdx
-                  -- (*) Check whether our writeLMDB folds get interleaved (as opposed to the folds
-                  -- executing one after another).
-                  -- putStrLn $ printf "(threadIdx, pairIdx) = (%d, %d)" threadIdx pairIdx
-                  return $ const pair removeUnusedWarning
-              )
-            & S.fold fol
-
-          -- If we comment out the commit/disclaimOwnership code in writeLMDB at synchronous
-          -- exceptions or normal completion (which we shouldn’t normally do), we need this for the
-          -- tests to pass.
-          -- waitWriters env
-          let removeUnusedWarning = env
-          return $ const () removeUnusedWarning
-
-    -- (Instead of putting waitWriters above, we can also do it here; but then the test takes much
-    -- longer to execute, presumably because the last transaction of each of the above threads
-    -- cannot begin until GC and finalization has committed a last transaction of another thread.)
-    -- run $ waitWriters env
-
-    let expectedPairs = concatMap (\(_, pairs, _, _) -> pairs) pairss
-    readPairsAll <- run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-    assertMsg "assert failure" $ expectedPairs == readPairsAll
-
--- | Write key-value pairs using multiple demuxed writeLMDBs with separate environments, read all
--- key-value pairs back using our library (already covered by 'testReadLMDB'), and make sure they
--- are as expected.
-testWriteLMDBDemux :: IO Channel -> TestTree
-testWriteLMDBDemux res =
-  testProperty "writeLMDBDemux" . monadicIO $ do
-    numDemux <- pick $ chooseInt (1, 5)
-    withEnvDbN numDemux (ShouldCloseDb True) res $ \envDbs -> do
-      chunkSzs <- V.generateM numDemux $ \_ -> pick $ chooseInt (1, 5)
-
-      -- We use unique keys because we (at least for now) don’t want to worry about the order in
-      -- which the pairs get demuxed.
-      pairs <-
-        fromMaybe (error "pairs expected")
-          <$> (generatePairsWithUniqueKeys 0 (4 * sum chunkSzs) & S.fold F.one)
-
-      folds <- V.iforM envDbs $ \idx (_, db) -> do
-        let chunkSz = (V.!) chunkSzs idx
-
-        -- These settings should make no difference to the result.
-        x <- pick $ elements [0 :: Int, 1, 2]
-        let failureFold
-              | x == 0 = writeFailureThrow
-              | x == 1 = writeFailureStop
-              | x == 2 = writeFailureIgnore
-              | otherwise = error "unreachable"
-        unsafeFFI :: Bool <- pick arbitrary
-        runPar :: Bool <- pick arbitrary
-        return
-          . (if runPar then F.parEval id else id)
-          . writeLMDB @IO db
-          $ defaultWriteOptions
-            { writeTransactionSize = chunkSz,
-              writeOverwriteOptions = OverwriteAllow,
-              writeUnsafeFFI = unsafeFFI,
-              writeFailureFold = failureFold
-            }
-
-      (demuxIO, _) <-
-        run $
-          S.fromList pairs
-            & S.indexed
-            & S.fold
-              ( F.demuxIO
-                  (\(idx, _) -> idx `rem` numDemux)
-                  (\(idx, _) -> return $ F.lmap snd ((V.!) folds (idx `rem` numDemux)))
-              )
-      _ <- run demuxIO
-
-      let expectedPairs = pairs
-      readPairs <-
-        sort . concat . V.toList
-          <$> forM
-            envDbs
-            (\(_, db) -> run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
-
-      assertMsg "assert failure" $ expectedPairs == readPairs
-
--- | Write key-value pairs using multiple demuxed writeLMDBs into the same database with a write
--- transaction size of 1, read all key-value pairs back using our library (already covered by
--- 'testReadLMDB'), and make sure they are as expected.
-testWriteLMDBDemuxSameDb :: IO Channel -> TestTree
-testWriteLMDBDemuxSameDb res =
-  testProperty "writeLMDBDemuxSameDb"
-    . monadicIO
-    . withEnvDb
-      -- We could not safely close the database when a deadlock leaves an active write transaction.
-      -- (We leave this here in case we want to revisit our attempts to cover deadlocks.)
-      (ShouldCloseDb False)
-      res
-    $ \_ db -> do
-      numDemux <- pick $ chooseInt (2, 5) -- Use at least 2 writeLMDBs for the demux.
-
-      -- Set chunkSz >=2 and minPairs >=2 to observe a deadlock. (Using timeout to cover both cases
-      -- was not reliable enough: If the timeout was high enough to reliably allow chunkSz=1 success
-      -- (around 0.1 seconds), it was already taking too long to complete the deadlock cases.
-      -- Additionally our CI machines might be less powerful.)
-      let chunkSz = 1
-          minPairs = 0
-          maxPairs = max minPairs (4 * numDemux * chunkSz)
-
-      -- We use unique keys because we (at least for now) don’t want to worry about the order in
-      -- which the pairs get demuxed.
-      pairs <-
-        fromMaybe (error "pairs expected")
-          <$> (generatePairsWithUniqueKeys minPairs maxPairs & S.fold F.one)
-
-      folds <- V.replicateM numDemux $ do
-        -- These settings should make no difference to the result.
-        x <- pick $ elements [0 :: Int, 1, 2]
-        let failureFold
-              | x == 0 = writeFailureThrow
-              | x == 1 = writeFailureStop
-              | x == 2 = writeFailureIgnore
-              | otherwise = error "unreachable"
-        unsafeFFI :: Bool <- pick arbitrary
-        runPar :: Bool <- pick arbitrary
-        return
-          . (if runPar then F.parEval id else id)
-          . writeLMDB @IO db
-          $ defaultWriteOptions
-            { writeTransactionSize = chunkSz,
-              writeOverwriteOptions = OverwriteAllow,
-              writeUnsafeFFI = unsafeFFI,
-              writeFailureFold = failureFold
-            }
-
-      (demuxIO, _) <-
-        run $
-          -- In the deadlock case, we get stuck here in an infinite loop. (The deadlock was not
-          -- getting thrown as BlockedIndefinitelyOnMVar or BlockedIndefinitelyOnSTM.)
-          S.fromList pairs
-            & S.indexed
-            & S.fold
-              ( F.demuxIO
-                  (\(idx, _) -> idx `rem` numDemux)
-                  (\(idx, _) -> return $ F.lmap snd ((V.!) folds (idx `rem` numDemux)))
-              )
-      _ <- run demuxIO
-
-      let expectedPairs = pairs
-      readPairs <- toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-      assertMsg "assert failure" $ expectedPairs == readPairs
+      readPairs <- run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+      assertMsg "assert (second checks) failure" $
+        readPairs == case owOpts of
+          OverwrDisallowThrow ->
+            if hasDuplicateKeys' then [] else sort keyValuePairs
+          OverwrDisallowThrowAllowSameVal ->
+            if hasDuplicateKeysWithDiffVals'
+              then []
+              else sort $ removeDuplicateKeysRetainLast keyValuePairs
+          OverwrDisallowIgnore -> sort $ filterOutReoccurringKeys keyValuePairs
+          OverwrDisallowStop -> sort $ prefixBeforeDuplicate keyValuePairs
+          OverwrAppendThrow ->
+            if keysAreStrictlyIncreasing keyValuePairs
+              then keyValuePairs
+              else []
+          OverwrAppendIgnore -> fst $ filterGreaterThan keyValuePairs
+          OverwrAppendStop -> prefixBeforeStrictlySortedKeysEnd keyValuePairs
 
 -- | Perform reads and writes on a database concurrently, throwTo threads at random, and read all
 -- key-value pairs back from the database using our library (already covered by 'testReadLMDB') and
 -- make sure they are as expected.
-testAsyncExceptionsConcurrent :: IO Channel -> TestTree
-testAsyncExceptionsConcurrent res =
-  testProperty "asyncExceptionsConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) res $
-    \env db -> do
-      numThreads <- pick $ chooseInt (1, 10)
-      chunkSz <- pick $ chooseInt (1, 5)
+testAsyncExceptionsConcurrent :: TestTree
+testAsyncExceptionsConcurrent =
+  testProperty "asyncExceptionsConcurrent" . monadicIO . withEnvDbs Nothing $ \(env, dbs) -> do
+    let db = case V.toList dbs of [x] -> x; _ -> error "unreachable"
+    assertEnoughCapabilities
+    numThreads <- pick $ chooseInt (1, 2 * numCapabilities)
 
-      pairss <- generateConcurrentPairs numThreads 0 (4 * chunkSz)
+    pairss <- generateConcurrentPairs numThreads 0 100
 
-      -- Whether we will kill the thread.
-      shouldKills :: [Bool] <- replicateM numThreads $ pick arbitrary
+    -- Whether to kill the thread.
+    shouldKills :: [Bool] <- replicateM numThreads $ pick arbitrary
 
-      -- Whether we will perform read on the thread instead of writing. (This read/write
-      -- interleaving is to ascertain that the locking across readers and writers is working as
-      -- expected.)
-      shouldReads :: [Bool] <- replicateM numThreads $ pick arbitrary
+    -- Delay transactions to increase possibility they will get killed while active.
+    delayss :: [Int] <- replicateM numThreads . pick $ chooseInt (0, 10)
 
-      threads <- run $
-        forConcurrently (zip shouldReads pairss) $
-          \(shouldRead, (threadIdx, pairs, failureFold, unsafeFFI)) ->
-            (threadIdx,)
-              <$> asyncBound
-                ( if shouldRead
-                    then do
-                      _ <- toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-                      return ()
-                    else do
-                      onException
-                        ( S.fromList @IO pairs
-                            & S.fold
-                              ( writeLMDB @IO db $
-                                  defaultWriteOptions
-                                    { writeTransactionSize = chunkSz,
-                                      writeOverwriteOptions = OverwriteAllow,
-                                      writeUnsafeFFI = unsafeFFI,
-                                      writeFailureFold = failureFold
-                                    }
-                              )
-                        )
-                        ( -- Handle asynchronous exception. Without this, improper closing of the
-                          -- environment and/or database can crash the test (as expected).
-                          waitWriters env
-                        )
-                )
-
-      delay <- pick $ chooseInt (0, 10)
-      run $ threadDelay delay
-
-      run $ forConcurrently_ (zip shouldKills threads) $ \(shouldKill, (_, as)) ->
-        if shouldKill
-          then cancel as
-          else wait as
-
-      let expectedSubset =
-            Set.fromList
-              . concatMap (\(_, _, (_, pairs, _, _)) -> pairs)
-              . filter (\(shouldRead, shouldKill, _) -> not shouldRead && not shouldKill)
-              $ zip3 shouldReads shouldKills pairss
-
-      readPairsAll <-
-        Set.fromList <$> (run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
-
-      assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairsAll
-
-data TestAction = ActionRead | ActionWrite | ActionClear deriving (Show)
-
-instance Arbitrary TestAction where
-  arbitrary = oneof [return ActionRead, return ActionWrite, return ActionClear]
-
--- | Perform reads, writes, and clearing on a database concurrently, read all key-value pairs back
--- from the database using our library (already covered by 'testReadLMDB') and make sure they are as
--- expected.
-testClearDatabaseConcurrent :: IO Channel -> TestTree
-testClearDatabaseConcurrent res =
-  testProperty "clearDatabaseConcurrent" . monadicIO . withEnvDb (ShouldCloseDb True) res $
-    \_ db -> do
-      numThreads <- pick $ chooseInt (1, 10)
-      chunkSz <- pick $ chooseInt (1, 5)
-      pairss <- generateConcurrentPairs numThreads 0 (4 * chunkSz)
-
-      actions :: [TestAction] <- replicateM numThreads $ pick arbitrary
-      lastActionM <- run $ newMVar ActionRead
-
-      -- Fixes rare issues with lastAction inconsistency.
-      writeLockM <- run $ newMVar ()
-
-      _ <- run $
-        forConcurrently (zip actions pairss) $
-          \(action, (_, pairs, failureFold, unsafeFFI)) ->
-            case action of
-              ActionRead -> do
-                _ <- toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined
-                return () -- Only the last write action should matter.
-              ActionWrite ->
-                withMVar writeLockM $ \() -> do
+    threads <- run $
+      forConcurrently (zip pairss delayss) $
+        \((threadIdx, pairs), delay) ->
+          (threadIdx,)
+            <$> asyncBound
+              -- Add a surrounding read-only transaction to test it too gets cleaned. (We could be
+              -- adding more possibilities, randomness, etc. here; but the idea is those things were
+              -- already tested elsewhere, esp. by 'testWriteLMDBChunked'.)
+              ( withReadOnlyTransaction env $ \_ -> withReadWriteTransaction env $ \txn -> do
                   S.fromList @IO pairs
-                    & S.fold
-                      ( writeLMDB @IO db $
-                          defaultWriteOptions
-                            { writeTransactionSize = chunkSz,
-                              writeOverwriteOptions = OverwriteAllow,
-                              writeUnsafeFFI = unsafeFFI,
-                              writeFailureFold = failureFold
-                            }
+                    & S.indexed
+                    & S.mapM
+                      ( \(idx, pair) -> do
+                          when (idx == 0) $ threadDelay delay
+                          return pair
                       )
-                  modifyMVar_ lastActionM (\_ -> return ActionWrite)
-              ActionClear ->
-                withMVar writeLockM $ \() -> do
-                  clearDatabase db
-                  modifyMVar_ lastActionM (\_ -> return ActionClear)
+                    & S.fold (writeLMDB @IO defaultWriteOptions db txn)
+              )
 
-      readPairsAll <-
-        Set.fromList <$> (run . toList $ unfold (readLMDB db Nothing defaultReadOptions) undefined)
+    delay <- pick $ chooseInt (0, 20)
+    run $ threadDelay delay
 
-      lastAction' <- run $ readMVar lastActionM
-      assertMsg "assert failure" $
-        case lastAction' of
-          ActionClear -> null readPairsAll
-          _ -> True
+    run $ forConcurrently_ (zip shouldKills threads) $ \(shouldKill, (_, as)) ->
+      if shouldKill
+        then cancel as
+        else wait as
+
+    let expectedSubset =
+          Set.fromList
+            . concatMap (\(_, (_, pairs)) -> pairs)
+            . filter (\(shouldKill, _) -> not shouldKill)
+            $ zip shouldKills pairss
+
+    readPairs <-
+      Set.fromList <$> (run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined)
+
+    assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairs
 
 -- | A bytestring with a limited random length. (We don’t see much value in testing with longer
 -- bytestrings.)
-newtype ShortBS = ShortBS ByteString deriving (Show)
+newtype ShortBS = ShortBS ByteString deriving (Eq, Ord, Show)
 
 instance Arbitrary ShortBS where
   arbitrary :: Gen ShortBS
@@ -673,7 +543,7 @@ arbitraryKeyValuePairs maxLen = do
     <$> pick (vector len)
 
 -- | A variation that makes duplicate keys more likely. (The idea is to generate more relevant data
--- for testing writeLMDB with the various writeOverwriteOptions and writeFailureFold possibilities.)
+-- for testing writeLMDB with the various writeOverwriteOptions.)
 arbitraryKeyValuePairsDupsMoreLikely :: Int -> PropertyM IO [(ShortBS, ShortBS)]
 arbitraryKeyValuePairsDupsMoreLikely maxLen = do
   arb <- arbitraryKeyValuePairs maxLen
@@ -688,32 +558,6 @@ arbitraryKeyValuePairsDupsMoreLikely maxLen = do
       let arb' = arb1 ++ [(k, v')] ++ arb2
       return arb'
     else return arb
-
--- | A variation that makes more likely keys with the same prefix and a difference of trailing zero
--- bytes. (The idea is to generate more relevant data for testing readLMDB with the various
--- readDirection and readStart possibilities.)
-arbitraryKeyValuePairs'' :: Int -> PropertyM IO [(ShortBS, ShortBS)]
-arbitraryKeyValuePairs'' maxLen = do
-  arb <- arbitraryKeyValuePairs maxLen
-  if null arb
-    then return arb
-    else
-      pick $
-        frequency
-          [ (1, return arb),
-            ( 3,
-              do
-                let (ShortBS k, v) = head arb
-                b' <- arbitrary
-                v' <- if b' then return v else arbitrary
-                i <- chooseInt (0, length arb - 1)
-                let (arb1, arb2) = splitAt i arb
-                j <- chooseInt (0, 100) -- Remains within the 512 default maximum LMDB key size.
-                let arb3 = map (\j' -> (ShortBS $ k `B.append` B.replicate j' 0, v')) [1 .. j]
-                let arb' = arb1 ++ arb3 ++ arb2
-                return arb'
-            )
-          ]
 
 -- | This function retains the last encountered value for each key.
 removeDuplicateKeysRetainLast :: (Eq a) => [(a, b)] -> [(a, b)]
@@ -769,6 +613,16 @@ prefixBeforeStrictlySortedKeysEnd xs =
       )
     $ zip xs (Nothing : map Just xs)
 
+keysAreStrictlyIncreasing :: (Ord a) => [(a, b)] -> Bool
+keysAreStrictlyIncreasing xs =
+  all
+    ( \((a, _), mxs) ->
+        case mxs of
+          Nothing -> True
+          Just (aPrev, _) -> a > aPrev
+    )
+    $ zip xs (Nothing : map Just xs)
+
 -- |
 -- @filterGreaterThan [(1,"a"),(2,"b"),(1,"c"),(3, "d")] = ([(1,"a"),(2,"b"),(3,"d")],[(1,"c")])@
 -- @filterGreaterThan [(1,"a"),(2,"b"),(2,"c"),(3, "d")] = [(1,"a"),(2,"b"),(3,"d"),[(2,"c")]]@
@@ -785,33 +639,13 @@ filterGreaterThan =
       )
       ([], [], Nothing)
 
--- | If diffValsOnly is False, collects repeating keys (and corresponding values). Otherwise,
--- collects them only if the value differs from the original value.
---
--- @getRepeatingKeys False [(1,"a"),(2,"b"),(1,"a")] = [(1,"a")]@
--- @getRepeatingKeys True [(1,"a"),(2,"b"),(1,"a")] = []@
--- @getRepeatingKeys False [(1,"a"),(2,"b"),(1,"c")] = [(1,"c")]@
--- @getRepeatingKeys True [(1,"a"),(2,"b"),(1,"c")] = [(1,"c")]@
-getRepeatingKeys :: (Ord a, Eq b) => Bool -> [(a, b)] -> [(a, b)]
-getRepeatingKeys diffValsOnly =
-  reverse
-    . fst
-    . foldl'
-      ( \(accList, keyMap) (a, b) ->
-          case M.lookup a keyMap of
-            Nothing -> (accList, M.insert a b keyMap)
-            Just bPrev ->
-              if diffValsOnly
-                then
-                  if b /= bPrev
-                    then ((a, b) : accList, keyMap)
-                    else (accList, keyMap)
-                else ((a, b) : accList, keyMap)
-      )
-      ([], M.empty)
-
--- Assumes first < second.
+-- |
+-- * @between first second []@ (should be called with the third parameter at @[]@).
+-- * Assumes @first < second@.
+-- * Returns a list in between those two.
 between :: [Word8] -> [Word8] -> [Word8] -> Maybe [Word8]
+-- Idea: Compare the elements from left to right, and collect the equal ones into commonPrefixRev
+-- (in reverse order), until we hit inequality.
 between [] [] _ = error "first = second"
 between _ [] _ = error "first > second"
 between [] (w : ws) commonPrefixRev
@@ -828,32 +662,32 @@ testBetween = testProperty "testBetween" $ \ws1 ws2 ->
   (ws1 == ws2)
     || let (smaller, bigger) = if ws1 < ws2 then (ws1, ws2) else (ws2, ws1)
         in case between smaller bigger [] of
-             Nothing -> drop (length ws1) ws2 == replicate (length ws2 - length ws1) 0
+             Nothing -> drop (length smaller) bigger == replicate (length bigger - length smaller) 0
              Just betw -> smaller < betw && betw < bigger
 
 betweenBs :: ByteString -> ByteString -> Maybe ByteString
-betweenBs bs1 bs2 = between (B.unpack bs1) (B.unpack bs2) [] >>= (return . B.pack)
+betweenBs bs1 bs2 = between (B.unpack bs1) (B.unpack bs2) [] <&> B.pack
 
 type PairsInDatabase = [(ByteString, ByteString)]
 
 type ExpectedReadResult = [(ByteString, ByteString)]
 
 -- | Given database pairs, randomly generates read options and corresponding expected results.
-readOptionsAndResults :: PairsInDatabase -> Gen (ReadOptions, ExpectedReadResult)
+readOptionsAndResults :: PairsInDatabase -> Gen (UseUnsafeFFI, ReadOptions, ExpectedReadResult)
 readOptionsAndResults pairsInDb = do
   forw <- arbitrary
   let dir = if forw then Forward else Backward
-  unsafeFFI <- arbitrary
+  us <- UseUnsafeFFI <$> arbitrary
   let len = length pairsInDb
   readAll <- frequency [(1, return True), (3, return False)]
-  let ropts = defaultReadOptions {readDirection = dir, readUnsafeFFI = unsafeFFI}
+  let ropts = defaultReadOptions {readDirection = dir}
   if readAll
-    then return (ropts {readStart = Nothing}, (if forw then id else reverse) pairsInDb)
+    then return (us, ropts {readStart = Nothing}, (if forw then id else reverse) pairsInDb)
     else
       if len == 0
         then do
           bs <- arbitrary >>= \(NonEmpty ws) -> return $ B.pack ws
-          return (ropts {readStart = Just bs}, [])
+          return (us, ropts {readStart = Just bs}, [])
         else do
           idx <-
             if len < 3
@@ -868,30 +702,34 @@ readOptionsAndResults pairsInDb = do
                 | idx == 0 && keyAt idx /= B.singleton 0 = Just $ B.singleton 0
                 | idx == 0 = Nothing
                 | otherwise = betweenBs (keyAt $ idx - 1) (keyAt idx)
-          let forwEq = (ropts {readStart = Just $ keyAt idx}, drop idx pairsInDb)
-          let backwEq = (ropts {readStart = Just $ keyAt idx}, reverse $ take (idx + 1) pairsInDb)
-          ord <- arbitrary @Ordering -- Proximity to the key at idx (if possible).
+          let forwEq =
+                (us, ropts {readStart = Just $ keyAt idx}, drop idx pairsInDb)
+          let backwEq =
+                (us, ropts {readStart = Just $ keyAt idx}, reverse $ take (idx + 1) pairsInDb)
+
+          -- Test with three possibilities: The chosen readStart is equal to, less than, or greater
+          -- than one of the keys in the database.
+          ord <- arbitrary @Ordering
+
           return $ case (ord, dir) of
             (EQ, Forward) -> forwEq
             (EQ, Backward) -> backwEq
             (GT, Forward) -> case nextKey of
               Nothing -> forwEq
-              Just nextKey' -> (ropts {readStart = Just nextKey'}, drop (idx + 1) pairsInDb)
+              Just nextKey' -> (us, ropts {readStart = Just nextKey'}, drop (idx + 1) pairsInDb)
             (GT, Backward) -> case nextKey of
               Nothing -> backwEq
               Just nextKey' ->
-                (ropts {readStart = Just nextKey'}, reverse $ take (idx + 1) pairsInDb)
+                (us, ropts {readStart = Just nextKey'}, reverse $ take (idx + 1) pairsInDb)
             (LT, Forward) -> case prevKey of
               Nothing -> forwEq
-              Just prevKey' -> (ropts {readStart = Just prevKey'}, drop idx pairsInDb)
+              Just prevKey' -> (us, ropts {readStart = Just prevKey'}, drop idx pairsInDb)
             (LT, Backward) -> case prevKey of
               Nothing -> backwEq
-              Just prevKey' -> (ropts {readStart = Just prevKey'}, reverse $ take idx pairsInDb)
-
-newtype ThreadIdx = ThreadIdx Int deriving (Show)
+              Just prevKey' -> (us, ropts {readStart = Just prevKey'}, reverse $ take idx pairsInDb)
 
 generatePairsWithUniqueKeys ::
-  Monad m => Int -> Int -> S.Stream (PropertyM m) [(ByteString, ByteString)]
+  (Monad m) => Int -> Int -> S.Stream (PropertyM m) [(ByteString, ByteString)]
 generatePairsWithUniqueKeys minPairs maxPairs =
   S.fromList [0 :: Word64 ..] -- Increasing Word64s for uniqueness.
     & S.foldMany
@@ -910,37 +748,39 @@ generatePairsWithUniqueKeys minPairs maxPairs =
               return $ F.Partial (totalNumPairs, 0, [])
           )
           (\_ -> error "unreachable")
+          (\_ -> error "unreachable")
       )
+
+newtype ThreadIdx = ThreadIdx Int deriving (Show)
 
 -- | Generates pairs meant to be originating from multiple threads.
 --
 -- We make the keys unique; otherwise the result would be unpredictable (since we wouldn’t know
 -- which values for duplicate keys would end up in the final database).
 generateConcurrentPairs ::
-  Monad m =>
+  (Monad m) =>
   Int ->
   Int ->
   Int ->
-  PropertyM m [(ThreadIdx, [(ByteString, ByteString)], WriteFailureFold (), Bool)]
+  PropertyM m [(ThreadIdx, [(ByteString, ByteString)])]
 generateConcurrentPairs numThreads minPairs maxPairs =
   generatePairsWithUniqueKeys minPairs maxPairs
     & S.take numThreads
     & S.indexed -- threadIdx.
-    & S.mapM
-      ( \(threadIdx, pairs) -> do
-          -- These settings should make no difference to the result.
-          x <- pick $ elements [0 :: Int, 1, 2]
-          let failureFold
-                | x == 0 = writeFailureThrow
-                | x == 1 = writeFailureStop
-                | x == 2 = writeFailureIgnore
-                | otherwise = error "unreachable"
-          unsafeFFI :: Bool <- pick arbitrary
-          return (ThreadIdx threadIdx, pairs, failureFold, unsafeFFI)
-      )
+    & fmap (first ThreadIdx)
     & S.fold F.toList
 
--- Writes the given key-value pairs to the given database.
+assertEnoughCapabilities :: (Monad m) => PropertyM m ()
+assertEnoughCapabilities =
+  when
+    (numCapabilities <= 1)
+    ( run $
+        throwError
+          "enoughCapabilities"
+          "available threads <= 1; machine / Haskell RTS settings not useful for testing"
+    )
+
+-- Writes the given key-value pairs to the given database in an ordinary way.
 writeChunk ::
   (Foldable t, Mode mode) =>
   Database mode ->
@@ -967,6 +807,6 @@ marshalOut :: ByteString -> (MDB_val -> IO ()) -> IO ()
 marshalOut bs f =
   unsafeUseAsCStringLen bs $ \(ptr, len) -> f $ MDB_val (fromIntegral len) (castPtr ptr)
 
-assertMsg :: Monad m => String -> Bool -> PropertyM m ()
+assertMsg :: (Monad m) => String -> Bool -> PropertyM m ()
 assertMsg _ True = return ()
 assertMsg msg False = fail $ "Assert failed: " ++ msg

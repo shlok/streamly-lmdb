@@ -69,15 +69,12 @@ main = do
 
 See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup>):
 
-* Reading:
-  - For iterating through a fully cached LMDB database, this library has roughly a 110 ns/pair overhead compared to C. (Plain Haskell `IO` code has roughly a 70 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
-  - By using `unsafeReadLMDB` instead of `readLMDB`, we can get the overhead down to roughly 100 ns/pair.
-  - By additionally using the `readUnsafeFFI` option (to use `unsafe` FFI calls under the hood), we can get the overhead down to roughly 40 ns/pair.
-
+* Reading (iterating through a fully cached LMDB database):
+  - When using the ordinary `readLMDB` (which creates intermediate key/value `ByteString`s managed by the RTS), the overhead compared to C depends on the key/value sizes; for 480-byte keys and 2400-byte values, the overhead is roughly 950 ns/pair.
+  - By using `unsafeReadLMDB` instead of `readLMDB` (to avoid the intermediate `ByteString`s), we can get the overhead compared to C down to roughly 90 ns/pair. (Plain Haskell `IO` code has roughly a 50 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
 * Writing:
-  - For writing to an LMDB database, this library has roughly a 210 ns/pair overhead compared to C. (Plain Haskell `IO` code has roughly a 100 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
-  - By using the `writeUnsafeFFI` option (to use `unsafe` FFI calls under the hood), we can get the overhead down to roughly 140 ns/pair.
+  - The overhead of this library compared to C depends on the size of the key/value pairs (`ByteString`s managed by the RTS). For 480-byte keys and 2400-byte values, the overhead is around 3.5 μs/pair.
+  - For now, we don’t provide “unsafe” write functionality (to avoid the key/value `ByteString`s) because this write performance is currently good enough for our purposes.
+* For reference, we note that opening and reading 1 byte [16 KiB] from a file on disk with C takes us over 2.5 μs [20 μs].)
 
-* For most Haskell programs, these differences will not cause problems. (For instance, note that merely opening and reading 1 byte from a file with C already takes us tens of *microseconds*.)
-
-<sup>†</sup> May 2023; [Linode](https://linode.com); Debian 11, Dedicated 32GB: 16 CPU, 640GB SSD storage, 32GB RAM.
+<sup>†</sup> June 2024; NixOS 22.11; Intel i7-12700K (3.6 GHz, 12 cores); Corsair VENGEANCE LPX DDR4 RAM 64GB (2 x 32GB) 3200MHz; Samsung 970 EVO Plus SSD 2TB (M.2 NVMe).

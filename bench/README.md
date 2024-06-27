@@ -10,8 +10,9 @@ These programs are currently undocumented, apart from the brief usage descriptio
 
 ## Running benchmarks
 
-* Note (April 2023): We have only tested this on Debian 11. Feel free to try on other systems.
-* Make sure you have installed [Nix](https://nixos.org) with support for Nix Flakes.
-* Within this directory (`bench`), enter the development shell with `nix develop`.
-* Run `cabal build` and `cabal exec -- bench`. (You will get results for the GHC version specified in `flake.nix`.)
-* View the `csv` files. We are currently not explaining the columns in detail here, but our main conclusions are outlined in `../README.md`.
+* Note (June 2024): We have only tested this on NixOS 22.11. It should work fine on other systems (e.g., Debian Linux); feel free to try.
+* If you are on NixOS, please make sure you have enabled Nix Flakes.
+* If you are on a non-NixOS system, please make sure you have installed [Nix](https://nixos.org) and enabled Nix Flakes.
+* Within this directory (`bench`), enter the development shell with `nix develop -L`.
+* Run `cabal build -ffusion-plugin && cabal exec -- bench`.
+* View `stdout` and the `csv` files. We are currently not explaining the data in detail here, but our main conclusions are outlined in `../README.md`.
