@@ -3,25 +3,11 @@
 # For more information, please see the documentation at:
 #   https://docs.haskellstack.org/en/stable/lock_files
 
-packages:
-- completed:
-    hackage: streamly-0.9.0@sha256:8aedb49557487a3f642f6e4cc55830dc0832928f298e016e82e92e68da07f43f,19866
-    pantry-tree:
-      sha256: 7cf40022cbcf5e4aa34d33a9d44416adc08a81fb7bf15496f5025b26b5520069
-      size: 21867
-  original:
-    hackage: streamly-0.9.0@sha256:8aedb49557487a3f642f6e4cc55830dc0832928f298e016e82e92e68da07f43f,19866
-- completed:
-    hackage: streamly-core-0.1.0@sha256:34c7c4e87b8d5e5956efd256483348d1230afb79283c93a470c6af2e21c7b625,17754
-    pantry-tree:
-      sha256: b630406e8c2d55176f27d6c2b35a64c91aef12ed7389cf08115a993ade1788b4
-      size: 10618
-  original:
-    hackage: streamly-core-0.1.0@sha256:34c7c4e87b8d5e5956efd256483348d1230afb79283c93a470c6af2e21c7b625,17754
+packages: []
 snapshots:
 - completed:
-    sha256: adbc602422dde10cc330175da7de8609e70afc41449a7e2d6e8b1827aa0e5008
-    size: 649342
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/20/11.yaml
+    sha256: 8e7996960d864443a66eb4105338bbdd6830377b9f6f99cd5527ef73c10c01e7
+    size: 719128
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/22/26.yaml
   original:
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/20/11.yaml
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/lts/22/26.yaml

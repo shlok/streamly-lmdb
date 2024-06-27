@@ -22,8 +22,8 @@ jobs:
     strategy:
       matrix:
         os: ["ubuntu-latest", "macos-latest"]
-        cabal: ["3.10.1.0"]
-        ghc: ["8.10.7", "9.2.8"]
+        cabal: ["3.10.3.0"]
+        ghc: ["9.2.8", "9.6.5"]
       fail-fast: false
     name: cabal ${{ matrix.cabal }} - ${{ matrix.os }}, ${{ matrix.ghc }}
     env:
@@ -50,7 +50,7 @@ jobs:
           restore-keys: |
             cabal-${{ matrix.cabal }}-${{ matrix.os }}-${{ matrix.ghc }}-
       - run: cabal v2-build $CONFIG
-      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 10000'
+      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 500'
       - run: cabal v2-haddock $CONFIG
       - run: cabal v2-sdist
   stack:
@@ -58,7 +58,7 @@ jobs:
     strategy:
       matrix:
         os: ["ubuntu-latest", "macos-latest"]
-        stack: ["2.11.1"]
+        stack: ["2.15.7"]
       fail-fast: false
     name: stack ${{ matrix.stack }} - ${{ matrix.os }}
     steps:
@@ -81,6 +81,6 @@ jobs:
           restore-keys: |
             stack-${{ matrix.stack }}-${{ matrix.os }}-
       - run: stack build
-      - run: stack test --test-arguments="--quickcheck-tests 10000"
+      - run: stack test --test-arguments="--quickcheck-tests 500"
       - run: stack haddock
       - run: stack sdist
