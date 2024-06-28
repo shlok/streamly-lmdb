@@ -58,6 +58,7 @@ test-suite streamly-lmdb-test
   type: exitcode-stdio-1.0
   main-is: TestSuite.hs
   other-modules:
+      ReadmeMain
       Streamly.External.LMDB.Tests
       Paths_streamly_lmdb
   autogen-modules:

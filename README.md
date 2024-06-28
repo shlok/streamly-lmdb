@@ -19,28 +19,18 @@ Install LMDB on your system:
 
 module Main where
 
-import Data.Function ((&))
+import Data.Function
 import qualified Streamly.Data.Fold as F
 import qualified Streamly.Data.Stream.Prelude as S
 import Streamly.External.LMDB
-  ( Limits (mapSize),
-    WriteOptions (writeTransactionSize),
-    defaultLimits,
-    defaultReadOptions,
-    defaultWriteOptions,
-    getDatabase,
-    openEnvironment,
-    readLMDB,
-    tebibyte,
-    writeLMDB,
-  )
 
 main :: IO ()
 main = do
   -- Open an environment. There should already exist a file or
   -- directory at the given path. (Empty for a new environment.)
   env <-
-    openEnvironment "/path/to/lmdb-database" $
+    openEnvironment
+      "/path/to/lmdb-database"
       defaultLimits {mapSize = tebibyte}
 
   -- Get the main database.
@@ -49,9 +39,10 @@ main = do
   db <- getDatabase env Nothing
 
   -- Stream key-value pairs into the database.
-  let fold' = writeLMDB db defaultWriteOptions {writeTransactionSize = 1}
-  let writeStream = S.fromList [("baz", "a"), ("foo", "b"), ("bar", "c")]
-  _ <- S.fold fold' writeStream
+  withReadWriteTransaction env $ \txn ->
+    [("baz", "a"), ("foo", "b"), ("bar", "c")]
+      & S.fromList
+      & S.fold (writeLMDB defaultWriteOptions db txn)
 
   -- Stream key-value pairs out of the
   -- database, printing them along the way.
@@ -59,9 +50,8 @@ main = do
   --     ("bar","c")
   --     ("baz","a")
   --     ("foo","b")
-  let unfold' = readLMDB db Nothing defaultReadOptions
-  let readStream = S.unfold unfold' undefined
-  S.mapM print readStream
+  S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+    & S.mapM print
     & S.fold F.drain
 ```
 
