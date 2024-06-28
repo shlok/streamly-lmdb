@@ -1,5 +1,0 @@
-packages: ./*.cabal
-
--- Homebrew on Apple Silicon.
-extra-include-dirs: /opt/homebrew/include
-extra-lib-dirs: /opt/homebrew/lib
