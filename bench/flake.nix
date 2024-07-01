@@ -70,8 +70,9 @@
                   final.myHaskellPkgs.ormolu
                   final.pkgs.pcre
                   final.pkgs.clang-tools
-                  final.pkgs.gitg
-                ];
+                ] ++ (if system == "x86_64-darwin" || system == "aarch64-darwin"
+                        then []
+                        else [final.pkgs.gitg]);
               };
             })
         ];
