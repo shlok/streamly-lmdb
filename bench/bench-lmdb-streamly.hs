@@ -171,13 +171,13 @@ readCursorUnsafe path us (PrecreatedTxn precreatedTxn) = do
       then withReadOnlyTransaction env $ \txn -> withCursor txn db $ \curs ->
         U.fold
           fold'
-          (unsafeReadLMDB' us db (JustTxn (txn, curs)) ropts (return . snd) (return . snd))
-          undefined
+          unsafeReadLMDB'
+          (ropts, us, db, JustTxn (txn, curs), return . snd, return . snd)
       else
         U.fold
           fold'
-          (unsafeReadLMDB' us db NoTxn ropts (return . snd) (return . snd))
-          undefined
+          unsafeReadLMDB'
+          (ropts, us, db, NoTxn, return . snd, return . snd)
 
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
@@ -204,9 +204,9 @@ readCursorSafe path us (PrecreatedTxn precreatedTxn) = do
   (k, v, t, p) <-
     if precreatedTxn
       then withReadOnlyTransaction env $ \txn -> withCursor txn db $ \curs ->
-        U.fold fold' (readLMDB' us db (JustTxn (txn, curs)) ropts) undefined
+        U.fold fold' readLMDB' (ropts, us, db, JustTxn (txn, curs))
       else
-        U.fold fold' (readLMDB' us db NoTxn ropts) undefined
+        U.fold fold' readLMDB' (ropts, us, db, NoTxn)
   putStrLn $ "Key byte count:   " ++ show k
   putStrLn $ "Value byte count: " ++ show v
   putStrLn $ "Total byte count: " ++ show t

@@ -164,7 +164,7 @@ testReadLMDB =
     let nread = 20
     vec <- V.replicateM nread . pick $ readOptionsAndResults keyValuePairsInDb
     bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) -> do
-      let unf txn = S.toList $ S.unfold (readLMDB' us db txn readOpts) undefined
+      let unf txn = S.toList $ S.unfold readLMDB' (readOpts, us, db, txn)
       results <- unf NoTxn
       resultsTxn <- withReadOnlyTransaction env $ \t -> withCursor t db $ \c -> unf $ JustTxn (t, c)
       return $ results == expectedResults && resultsTxn == expectedResults
@@ -186,7 +186,7 @@ testUnsafeReadLMDB =
       let expectedLengths = map (bimap B.length B.length) expectedResults
       let unf txn =
             S.toList $
-              S.unfold (unsafeReadLMDB' us db txn readOpts (return . snd) (return . snd)) undefined
+              S.unfold unsafeReadLMDB' (readOpts, us, db, txn, return . snd, return . snd)
       lengths <- unf NoTxn
       lengthsTxn <- withReadOnlyTransaction env $ \t -> withCursor t db $ \c -> unf $ JustTxn (t, c)
       return $ lengths == expectedLengths && lengthsTxn == expectedLengths
@@ -267,7 +267,7 @@ testWriteLMDBChunked mode =
 
           -- Read all key-value pairs back from the databases.
           readPairss <- forM dbs $ \db ->
-            run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+            run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
 
           -- And make sure they are as expected.
           let expectedPairsInEachDb = sort $ removeDuplicateKeysRetainLast keyValuePairs
@@ -319,7 +319,7 @@ testWriteLMDBChunked mode =
                             -- Read entire database using 'readLMDB'. While the database grows as
                             -- the chunks get written, these read-only transactions get longer
                             -- lived.
-                            S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+                            S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
                           else
                             -- Read using 'getLMDB' (not the entire database but only this chunk).
                             toList sequ
@@ -337,7 +337,7 @@ testWriteLMDBChunked mode =
 
           -- Read all key-value pairs back from the databases.
           readPairss <- forM dbs $ \db ->
-            run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+            run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
 
           -- Make sure they are as expected. (Recall that for readPairsAlts, we sometimes read the
           -- whole database and sometimes only one chunk.)
@@ -449,7 +449,7 @@ testWriteLMDBOneChunk owOpts =
 
       -- Regardless of whether an exception occurred, read all key-value pairs back from the
       -- database and make sure they are as expected.
-      readPairs <- run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+      readPairs <- run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
       assertMsg "assert (second checks) failure" $
         readPairs == case owOpts of
           OverwrDisallowThrow ->
@@ -519,7 +519,7 @@ testAsyncExceptionsConcurrent =
             $ zip shouldKills pairss
 
     readPairs <-
-      Set.fromList <$> (run . S.toList $ S.unfold (readLMDB db NoTxn defaultReadOptions) undefined)
+      Set.fromList <$> (run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn))
 
     assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairs
 

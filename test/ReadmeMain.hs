@@ -33,6 +33,6 @@ main = do
   --     ("bar","c")
   --     ("baz","a")
   --     ("foo","b")
-  S.unfold (readLMDB db NoTxn defaultReadOptions) undefined
+  S.unfold readLMDB (defaultReadOptions, db, NoTxn)
     & S.mapM print
     & S.fold F.drain

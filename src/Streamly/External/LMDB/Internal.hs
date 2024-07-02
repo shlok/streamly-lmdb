@@ -35,7 +35,6 @@ import Data.Foldable
 import Data.Kind
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
-import Data.Void (Void)
 import Foreign hiding (void)
 import Foreign.C
 import GHC.TypeLits
@@ -313,12 +312,17 @@ newtype UseUnsafeFFI = UseUnsafeFFI Bool deriving (Show)
 readLMDB ::
   forall m emode tmode.
   (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
-  Database emode ->
-  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
-  ReadOptions ->
-  Unfold m Void (ByteString, ByteString)
+  Unfold
+    m
+    ( ReadOptions,
+      Database emode,
+      MaybeTxn tmode (Transaction tmode emode, Cursor)
+    )
+    (ByteString, ByteString)
 readLMDB =
-  readLMDB' (UseUnsafeFFI False)
+  U.lmap
+    (\(ropts, db, mtxncurs) -> (ropts, UseUnsafeFFI False, db, mtxncurs))
+    readLMDB'
 
 -- | Similar to 'readLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
 --
@@ -327,13 +331,18 @@ readLMDB =
 readLMDB' ::
   forall m emode tmode.
   (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
-  UseUnsafeFFI ->
-  Database emode ->
-  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
-  ReadOptions ->
-  Unfold m Void (ByteString, ByteString)
-readLMDB' useUnsafeFFI db mtxncurs ropts =
-  unsafeReadLMDB' useUnsafeFFI db mtxncurs ropts B.packCStringLen B.packCStringLen
+  Unfold
+    m
+    ( ReadOptions,
+      UseUnsafeFFI,
+      Database emode,
+      MaybeTxn tmode (Transaction tmode emode, Cursor)
+    )
+    (ByteString, ByteString)
+readLMDB' =
+  U.lmap
+    (\(ropts, us, db, mtxncurs) -> (ropts, us, db, mtxncurs, B.packCStringLen, B.packCStringLen))
+    unsafeReadLMDB'
 
 -- | Similar to 'readLMDB', except that the keys and values are not automatically converted into
 -- Haskell @ByteString@s.
@@ -346,14 +355,19 @@ readLMDB' useUnsafeFFI db mtxncurs ropts =
 unsafeReadLMDB ::
   forall m k v emode tmode.
   (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
-  Database emode ->
-  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
-  ReadOptions ->
-  (CStringLen -> IO k) ->
-  (CStringLen -> IO v) ->
-  Unfold m Void (k, v)
+  Unfold
+    m
+    ( ReadOptions,
+      Database emode,
+      MaybeTxn tmode (Transaction tmode emode, Cursor),
+      CStringLen -> IO k,
+      CStringLen -> IO v
+    )
+    (k, v)
 unsafeReadLMDB =
-  unsafeReadLMDB' (UseUnsafeFFI False)
+  U.lmap
+    (\(ropts, db, mtxncurs, kmap, vmap) -> (ropts, UseUnsafeFFI False, db, mtxncurs, kmap, vmap))
+    unsafeReadLMDB'
 
 -- | Similar to 'unsafeReadLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
 --
@@ -362,149 +376,153 @@ unsafeReadLMDB =
 unsafeReadLMDB' ::
   forall m k v emode tmode.
   (MonadIO m, Mode emode, Mode tmode, SubMode emode tmode) =>
-  UseUnsafeFFI ->
-  Database emode ->
-  MaybeTxn tmode (Transaction tmode emode, Cursor) ->
-  ReadOptions ->
-  (CStringLen -> IO k) ->
-  (CStringLen -> IO v) ->
-  Unfold m Void (k, v)
-unsafeReadLMDB' (UseUnsafeFFI us) (Database (Environment penv mvars) dbi) mtxncurs ropts kmap vmap =
-  let (firstOp, subsequentOp) = case (ropts.readDirection, ropts.readStart) of
-        (Forward, Nothing) -> (mdb_first, mdb_next)
-        (Forward, Just _) -> (mdb_set_range, mdb_next)
-        (Backward, Nothing) -> (mdb_last, mdb_prev)
-        (Backward, Just _) -> (mdb_set_range, mdb_prev)
-      (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
-        if us
-          then
-            ( mdb_txn_begin_unsafe,
-              mdb_cursor_open_unsafe,
-              c_mdb_cursor_get_unsafe,
-              c_mdb_cursor_close_unsafe,
-              c_mdb_txn_abort_unsafe
-            )
-          else
-            ( mdb_txn_begin,
-              mdb_cursor_open,
-              c_mdb_cursor_get,
-              c_mdb_cursor_close,
-              c_mdb_txn_abort
-            )
+  Unfold
+    m
+    ( ReadOptions,
+      UseUnsafeFFI,
+      Database emode,
+      MaybeTxn tmode (Transaction tmode emode, Cursor),
+      CStringLen -> IO k,
+      CStringLen -> IO v
+    )
+    (k, v)
+unsafeReadLMDB' =
+  U.Unfold
+    ( \(op, subsequentOp, cursor_get, kmap, vmap, pcurs, pk, pv, ref) -> do
+        rc <-
+          liftIO $
+            if op == mdb_set_range && subsequentOp == mdb_prev
+              then do
+                -- A “reverse MDB_SET_RANGE” (i.e., a “less than or equal to”) is not available in
+                -- LMDB, so we simulate it ourselves.
+                kfst' <- peek pk
+                kfst <- B.packCStringLen (kfst'.mv_data, fromIntegral $ kfst'.mv_size)
+                rc <- cursor_get pcurs pk pv op
+                if rc /= 0 && rc == mdb_notfound
+                  then cursor_get pcurs pk pv mdb_last
+                  else
+                    if rc == 0
+                      then do
+                        k' <- peek pk
+                        k <- B.unsafePackCStringLen (k'.mv_data, fromIntegral k'.mv_size)
+                        if k /= kfst
+                          then cursor_get pcurs pk pv mdb_prev
+                          else return rc
+                      else return rc
+              else cursor_get pcurs pk pv op
 
-      supply = U.lmap . const
-   in supply firstOp $
-        U.Unfold
-          ( \(op, pcurs, pk, pv, ref) -> do
-              rc <-
-                liftIO $
-                  if op == mdb_set_range && subsequentOp == mdb_prev
-                    then do
-                      -- A “reverse MDB_SET_RANGE” (i.e., a “less than or equal to”) is not
-                      -- available in LMDB, so we simulate it ourselves.
-                      kfst' <- peek pk
-                      kfst <- B.packCStringLen (kfst'.mv_data, fromIntegral $ kfst'.mv_size)
-                      rc <- cursor_get pcurs pk pv op
-                      if rc /= 0 && rc == mdb_notfound
-                        then cursor_get pcurs pk pv mdb_last
-                        else
-                          if rc == 0
-                            then do
-                              k' <- peek pk
-                              k <- B.unsafePackCStringLen (k'.mv_data, fromIntegral k'.mv_size)
-                              if k /= kfst
-                                then cursor_get pcurs pk pv mdb_prev
-                                else return rc
-                            else return rc
-                    else cursor_get pcurs pk pv op
+        found <-
+          liftIO $
+            if rc /= 0 && rc /= mdb_notfound
+              then do
+                runIOFinalizer ref
+                throwLMDBErrNum "mdb_cursor_get" rc
+              else return $ rc /= mdb_notfound
 
-              found <-
-                liftIO $
-                  if rc /= 0 && rc /= mdb_notfound
-                    then do
-                      runIOFinalizer ref
-                      throwLMDBErrNum "mdb_cursor_get" rc
-                    else return $ rc /= mdb_notfound
+        if found
+          then do
+            !k <- liftIO $ (\x -> kmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pk
+            !v <- liftIO $ (\x -> vmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pv
+            return $
+              U.Yield
+                (k, v)
+                (subsequentOp, subsequentOp, cursor_get, kmap, vmap, pcurs, pk, pv, ref)
+          else do
+            runIOFinalizer ref
+            return U.Stop
+    )
+    ( \(ropts, us, Database (Environment penv mvars) dbi, mtxncurs, kmap, vmap) -> do
+        let (firstOp, subsequentOp) = case (ropts.readDirection, ropts.readStart) of
+              (Forward, Nothing) -> (mdb_first, mdb_next)
+              (Forward, Just _) -> (mdb_set_range, mdb_next)
+              (Backward, Nothing) -> (mdb_last, mdb_prev)
+              (Backward, Just _) -> (mdb_set_range, mdb_prev)
+            (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
+              case us of
+                UseUnsafeFFI True ->
+                  ( mdb_txn_begin_unsafe,
+                    mdb_cursor_open_unsafe,
+                    c_mdb_cursor_get_unsafe,
+                    c_mdb_cursor_close_unsafe,
+                    c_mdb_txn_abort_unsafe
+                  )
+                UseUnsafeFFI False ->
+                  ( mdb_txn_begin,
+                    mdb_cursor_open,
+                    c_mdb_cursor_get,
+                    c_mdb_cursor_close,
+                    c_mdb_txn_abort
+                  )
 
-              if found
-                then do
-                  !k <- liftIO $ (\x -> kmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pk
-                  !v <- liftIO $ (\x -> vmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pv
-                  return $ U.Yield (k, v) (subsequentOp, pcurs, pk, pv, ref)
-                else do
-                  runIOFinalizer ref
-                  return U.Stop
-          )
-          ( \op -> do
-              let isNoTxnCurs = case mtxncurs of
-                    NoTxn -> True
-                    JustTxn _ -> False
+        let isNoTxnCurs = case mtxncurs of
+              NoTxn -> True
+              JustTxn _ -> False
 
-              -- Type-level guarantee.
-              when (isNoTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
+        -- Type-level guarantee.
+        when (isNoTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
 
-              let (numReadersT, _, _, _) = mvars
+        let (numReadersT, _, _, _) = mvars
 
-              (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
-                (ptxn, pcurs, decrReaders) <- case mtxncurs of
-                  NoTxn -> do
-                    atomically $ do
-                      n <- takeTMVar numReadersT
-                      putTMVar numReadersT $ n + 1
+        (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
+          (ptxn, pcurs, decrReaders) <- case mtxncurs of
+            NoTxn -> do
+              atomically $ do
+                n <- takeTMVar numReadersT
+                putTMVar numReadersT $ n + 1
 
-                    let decrReaders = atomically $ do
-                          -- This should, when this is called, never be interruptible because we
-                          -- are, of course, finishing up a reader that is still known to exist.
-                          n <- takeTMVar numReadersT
-                          putTMVar numReadersT $ n - 1
+              let decrReaders = atomically $ do
+                    -- This should, when this is called, never be interruptible because we are, of
+                    -- course, finishing up a reader that is still known to exist.
+                    n <- takeTMVar numReadersT
+                    putTMVar numReadersT $ n - 1
 
-                    ptxn <-
-                      onException
-                        (txn_begin penv nullPtr mdb_rdonly)
-                        decrReaders
-                    pcurs <-
-                      onException
-                        (cursor_open ptxn dbi)
-                        (txn_abort ptxn >> decrReaders)
-                    return (ptxn, pcurs, decrReaders)
-                  JustTxn (Transaction _ ptxn, Cursor pcurs) ->
-                    return (ptxn, pcurs, return ())
+              ptxn <-
+                onException
+                  (txn_begin penv nullPtr mdb_rdonly)
+                  decrReaders
+              pcurs <-
+                onException
+                  (cursor_open ptxn dbi)
+                  (txn_abort ptxn >> decrReaders)
+              return (ptxn, pcurs, decrReaders)
+            JustTxn (Transaction _ ptxn, Cursor pcurs) ->
+              return (ptxn, pcurs, return ())
 
-                -- A utility function to close the cursor, abort the transaction, and decrement
-                -- readers if the caller didn’t supply a transaction and cursor.
-                let finishTxnCursReader =
-                      when isNoTxnCurs $
-                        cursor_close pcurs >> txn_abort ptxn >> decrReaders
+          -- A utility function to close the cursor, abort the transaction, and decrement readers if
+          -- the caller didn’t supply a transaction and cursor.
+          let finishTxnCursReader =
+                when isNoTxnCurs $
+                  cursor_close pcurs >> txn_abort ptxn >> decrReaders
 
-                pk <- onException malloc finishTxnCursReader
-                pv <- onException malloc (free pk >> finishTxnCursReader)
+          pk <- onException malloc finishTxnCursReader
+          pv <- onException malloc (free pk >> finishTxnCursReader)
 
-                ref <-
-                  flip
-                    onException
-                    (free pv >> free pk >> finishTxnCursReader)
-                    $ do
-                      _ <- case ropts.readStart of
-                        Nothing -> return ()
-                        Just k -> B.unsafeUseAsCStringLen k $ \(kp, kl) ->
-                          poke pk (MDB_val (fromIntegral kl) kp)
-                      newIOFinalizer . mask_ $ do
-                        free pv >> free pk
-                        -- With LMDB, there is ordinarily no need to commit read-only transactions.
-                        -- (The exception is when we want to make databases that were opened during
-                        -- the transaction available later, but that’s not applicable here.) We can
-                        -- therefore abort ptxn, both for failure (exceptions) and success.
-                        --
-                        -- Note furthermore that this should be sound in the face of async
-                        -- exceptions (where this finalizer could get called from a different
-                        -- thread) because LMDB with MDB_NOTLS allows for read-only transactions
-                        -- being used from multiple threads; see
-                        -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
-                        finishTxnCursReader
+          ref <-
+            flip
+              onException
+              (free pv >> free pk >> finishTxnCursReader)
+              $ do
+                _ <- case ropts.readStart of
+                  Nothing -> return ()
+                  Just k -> B.unsafeUseAsCStringLen k $ \(kp, kl) ->
+                    poke pk (MDB_val (fromIntegral kl) kp)
+                newIOFinalizer . mask_ $ do
+                  free pv >> free pk
+                  -- With LMDB, there is ordinarily no need to commit read-only transactions. (The
+                  -- exception is when we want to make databases that were opened during the
+                  -- transaction available later, but that’s not applicable here.) We can therefore
+                  -- abort ptxn, both for failure (exceptions) and success.
+                  --
+                  -- Note furthermore that this should be sound in the face of async exceptions
+                  -- (where this finalizer could get called from a different thread) because LMDB
+                  -- with MDB_NOTLS allows for read-only transactions being used from multiple
+                  -- threads; see
+                  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
+                  finishTxnCursReader
 
-                return (pcurs, pk, pv, ref)
-              return (op, pcurs, pk, pv, ref)
-          )
+          return (pcurs, pk, pv, ref)
+        return (firstOp, subsequentOp, cursor_get, kmap, vmap, pcurs, pk, pv, ref)
+    )
 
 -- | Looks up the value for the given key in the given database.
 --
