@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - master
-      - rare-timeout
+      - wip
   pull_request:
     types:
       - opened
