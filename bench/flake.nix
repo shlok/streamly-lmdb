@@ -21,24 +21,14 @@
               myHaskellPkgs = haskellPkgs.override {
                 overrides = hfinal: hprev: {
                   ${packageName} =
-                    final.haskell.lib.compose.addBuildDepends
-                      [final.pkgs.lmdb]
-                      (hfinal.callCabal2nix packageName ./. {
-                        # Use local streamly-lmdb in "../".
-                        streamly-lmdb =
-                          final.haskell.lib.compose.addBuildDepends
-                          [final.pkgs.lmdb]
-                          (hfinal.callCabal2nix "streamly-lmdb" ../. {
-                            streamly = hprev.streamly.overrideAttrs (old: {
-                              buildInputs =
-                                if system == "x86_64-darwin"
-                                  then [final.pkgs.darwin.apple_sdk.frameworks.Cocoa]
-                                  else [];
-                            });
-                          });
-                      });
+                    hfinal.callCabal2nix packageName ./. {
+                      # Use local streamly-lmdb in "../".
+                      streamly-lmdb =
+                        hfinal.callCabal2nix "streamly-lmdb" ../. {
+                          lmdb = final.pkgs.lmdb;
+                        };
+                    };
 
-                  # 2024-06-04.
                   # nixpkgs-unstable 4a4ecb0ab415c9fccfb005567a215e6a9564cdf5 (2024-06-03).
                   # We want Ormolu 0.7.4 for better commenting within if-else.
                   ormolu = hfinal.ormolu_0_7_4_0;
@@ -61,18 +51,16 @@
 
               myDevShell = final.myHaskellPkgs.shellFor {
                 packages = p: [p.${packageName}];
-
-                buildInputs = [final.pkgs.lmdb];
-
                 nativeBuildInputs = [
                   final.myHaskellPkgs.cabal-install
                   final.myHaskellPkgs.haskell-language-server
                   final.myHaskellPkgs.ormolu
                   final.pkgs.pcre
                   final.pkgs.clang-tools
-                ] ++ (if system == "x86_64-darwin" || system == "aarch64-darwin"
-                        then []
-                        else [final.pkgs.gitg]);
+
+                  # Needed so bench can compile the C program.
+                  final.pkgs.lmdb
+                ];
               };
             })
         ];
