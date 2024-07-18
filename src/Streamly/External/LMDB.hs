@@ -109,6 +109,7 @@ module Streamly.External.LMDB
     Mode,
     ReadWrite,
     ReadOnly,
+    SubMode,
 
     -- * Error types
     LMDB_Error (..),
