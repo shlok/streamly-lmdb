@@ -100,8 +100,9 @@ module Streamly.External.LMDB
     writeAccumIgnore,
     writeAccumStop,
 
-    -- ** Chunked writing
+    -- ** Chunked writing #chunkedwriting#
     chunkPairs,
+    chunkPairsFold,
     writeLMDBChunk,
     ChunkSize (..),
 

@@ -54,7 +54,8 @@ tests =
   [ testGetDatabase,
     testReadLMDB,
     testUnsafeReadLMDB,
-    testWriteLMDBChunked ModeSerial,
+    testWriteLMDBChunked (ModeSerial (FoldBasedChunk False)),
+    testWriteLMDBChunked (ModeSerial (FoldBasedChunk True)),
     testWriteLMDBChunked (ModeParallel (ClearDatabase False)),
     testWriteLMDBChunked (ModeParallel (ClearDatabase True)),
     testWriteLMDBOneChunk OverwrDisallowThrow,
@@ -195,10 +196,15 @@ testUnsafeReadLMDB =
 
 newtype ClearDatabase = ClearDatabase Bool
 
-data ChunkedMode = ModeSerial | ModeParallel !ClearDatabase
+-- | Note: Fold-based chunking is not meant for parallelization (as folds are stateful one-by-one
+-- computations).
+newtype FoldBasedChunk = FoldBasedChunk Bool
+
+data ChunkedMode = ModeSerial !FoldBasedChunk | ModeParallel !ClearDatabase
 
 instance Show ChunkedMode where
-  show ModeSerial = "serial"
+  show (ModeSerial (FoldBasedChunk False)) = "serial (stream-based chunking)"
+  show (ModeSerial (FoldBasedChunk True)) = "serial (fold-based chunking)"
   show (ModeParallel (ClearDatabase clear)) =
     printf
       "parallel (%s)"
@@ -252,18 +258,34 @@ testWriteLMDBChunked mode =
             return (ChunkBytes chunkBytes, maxPairs)
 
       case mode of
-        ModeSerial -> do
+        ModeSerial fbc -> do
           -- Write key-value pairs to the database. No parallelization is desired, so duplicate keys
           -- are allowed.
           keyValuePairs <- toByteStrings <$> arbitraryKeyValuePairs maxPairsBase
-          run $
-            S.fromList @IO keyValuePairs
-              & chunkPairs chunkSize
-              -- Assign each chunk to each database and flatten.
-              & fmap (\sequ -> V.toList $ V.map (sequ,) dbs)
-              & S.unfoldMany U.fromList
-              & S.mapM (\(sequ, db) -> writeLMDBChunk' us wopts db sequ)
-              & S.fold F.drain
+          case fbc of
+            FoldBasedChunk False ->
+              run $
+                S.fromList @IO keyValuePairs
+                  & chunkPairs chunkSize
+                  -- Assign each chunk to each database and flatten.
+                  & fmap (\sequ -> V.toList $ V.map (sequ,) dbs)
+                  & S.unfoldMany U.fromList
+                  & S.mapM (\(sequ, db) -> writeLMDBChunk' us wopts db sequ)
+                  & S.fold F.drain
+            FoldBasedChunk True ->
+              run $
+                S.fromList @IO keyValuePairs
+                  & S.fold
+                    ( chunkPairsFold
+                        chunkSize
+                        ( F.foldlM'
+                            ( \() sequ ->
+                                forM_ dbs $ \db ->
+                                  writeLMDBChunk' us wopts db sequ
+                            )
+                            (return ())
+                        )
+                    )
 
           -- Read all key-value pairs back from the databases.
           readPairss <- forM dbs $ \db ->

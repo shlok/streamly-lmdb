@@ -877,11 +877,7 @@ data ChunkSize
 -- | Chunks up the incoming stream of key-value pairs using the desired chunk size. One can try,
 -- e.g., @ChunkBytes mebibyte@ (1 MiB chunks) and benchmark from there.
 --
--- The chunks are processed using the desired fold (e.g., 'writeLMDBChunksFold').
---
--- /Internal/. (Not exposed because 'chunkPairs' seems far more useful, in particular because it can
--- handle the chunks in parallel instead of constraining us to a stateful computation on the chunks
--- one by one.)
+-- The chunks are processed using the desired fold.
 {-# INLINE chunkPairsFold #-}
 chunkPairsFold ::
   forall m a.
@@ -1008,8 +1004,8 @@ writeLMDBChunk' useUnsafeFFI wopts db@(Database env _) sequ =
 -- provided transaction.
 --
 -- If you have a long stream of key-value pairs that you want to write to an LMDB database while
--- avoiding a long-lived transaction (see [Transactions](#g:transactions)), you can use
--- 'chunkPairs'\/'writeLMDBChunk'.
+-- avoiding a long-lived transaction (see [Transactions](#g:transactions)), you can use the
+-- functions for [chunked writing](#g:chunkedwriting).
 {-# INLINE writeLMDB #-}
 writeLMDB ::
   forall m a.
