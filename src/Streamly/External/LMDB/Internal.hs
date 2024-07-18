@@ -938,32 +938,6 @@ chunkPairsFold chunkSz (F.Fold astep ainit aextr afinal) =
             (\(_, _, as) -> aextr as)
             (\(sequ, _, as) -> final sequ as)
 
--- | Writes chunks of key-value pairs to the provided database.
---
--- Each chunk is written to the database using 'writeLMDB' with the provided 'WriteOptions' (within
--- a surrounding 'withReadWriteTransaction').
---
--- /Internal/. (Not exposed because this was designed with 'chunkPairsFold' in mind.)
-{-# INLINE writeLMDBChunksFold' #-}
-writeLMDBChunksFold' ::
-  forall m b a.
-  (MonadBaseControl IO m, MonadIO m, MonadCatch m) =>
-  UseUnsafeFFI ->
-  WriteOptions m b ->
-  Database ReadWrite ->
-  Fold m b a ->
-  Fold m (Seq (ByteString, ByteString)) a
-writeLMDBChunksFold' useUnsafeFFI wopts db@(Database env _) (F.Fold bstep binit bextr bfinal) =
-  F.Fold
-    ( \bs sequ -> do
-        b <- withReadWriteTransaction env $ \txn ->
-          S.fold (writeLMDB' useUnsafeFFI wopts db txn) . S.fromList . toList $ sequ
-        bstep bs b
-    )
-    binit
-    bextr
-    bfinal
-
 -- | Chunks up the incoming stream of key-value pairs using the desired chunk size. One can try,
 -- e.g., @ChunkBytes mebibyte@ (1 MiB chunks) and benchmark from there.
 {-# INLINE chunkPairs #-}
