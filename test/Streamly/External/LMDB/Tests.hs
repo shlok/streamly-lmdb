@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
@@ -13,6 +14,8 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Exception hiding (assert)
 import Control.Monad
+import Control.Monad.Identity
+import Control.Monad.Trans.Class
 import Data.Bifunctor
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -25,6 +28,7 @@ import Data.List
 import qualified Data.Map.Strict as M
 import Data.Maybe
 import qualified Data.Sequence as Seq
+import Data.Serialize.Get
 import Data.Serialize.Put
 import qualified Data.Set as Set
 import qualified Data.Vector as V
@@ -65,6 +69,8 @@ tests =
     testWriteLMDBOneChunk OverwrAppendThrow,
     testWriteLMDBOneChunk OverwrAppendIgnore,
     testWriteLMDBOneChunk OverwrAppendStop,
+    testWriteInPlace WriteInPlaceBefore,
+    testWriteInPlace WriteInPlaceAfter,
     testAsyncExceptionsConcurrent,
     testBetween
   ]
@@ -122,21 +128,22 @@ testGetDatabase =
 -- | Creates a single environment with one unnamed database ('Nothing') or >=1 ('Just') named
 -- databases for which the provided action is run.
 withEnvDbs ::
+  (MonadTrans m) =>
   Maybe Int ->
-  ((Environment ReadWrite, V.Vector (Database ReadWrite)) -> PropertyM IO a) ->
-  PropertyM IO a
+  ((Environment ReadWrite, V.Vector (Database ReadWrite)) -> m IO a) ->
+  m IO a
 withEnvDbs mNumDbs f = do
-  -- TODO: bracket for PropertyM?
-  tmpParent <- run getCanonicalTemporaryDirectory
-  tmpDir <- run $ createTempDirectory tmpParent "streamly-lmdb-tests"
+  -- TODO: bracket for MonadTrans (or PropertyM)?
+  tmpParent <- lift getCanonicalTemporaryDirectory
+  tmpDir <- lift $ createTempDirectory tmpParent "streamly-lmdb-tests"
   env <-
-    run $
+    lift $
       openEnvironment tmpDir $
         defaultLimits
           { mapSize = tebibyte,
             maxDatabases = fromMaybe 0 mNumDbs
           }
-  dbs <- run $ case mNumDbs of
+  dbs <- lift $ case mNumDbs of
     Nothing -> V.singleton <$> getDatabase env Nothing
     Just numDbs
       | numDbs >= 1 -> forM (V.fromList [1 .. numDbs]) $ \i ->
@@ -145,7 +152,7 @@ withEnvDbs mNumDbs f = do
 
   a <- f (env, dbs)
 
-  run $ do
+  lift $ do
     waitReaders env
     forM_ dbs $ \db -> closeDatabase db
     closeEnvironment env
@@ -208,7 +215,7 @@ instance Show ChunkedMode where
   show (ModeParallel (ClearDatabase clear)) =
     printf
       "parallel (%s)"
-      (if clear then "with clearDatabase" else "without clearDatabase")
+      (if clear then "with clearDatabase" :: String else "without clearDatabase")
 
 -- | Write key-value pairs to a database using our library in a chunked manner with overwriting
 -- allowed, read all key-value pairs back from the database using our library (already covered by
@@ -488,6 +495,85 @@ testWriteLMDBOneChunk owOpts =
               else []
           OverwrAppendIgnore -> fst $ filterGreaterThan keyValuePairs
           OverwrAppendStop -> prefixBeforeStrictlySortedKeysEnd keyValuePairs
+
+data WriteInPlaceMode
+  = -- | Write new keys before existing keys.
+    WriteInPlaceBefore
+  | -- | Write new keys after existing keys.
+    WriteInPlaceAfter
+  deriving (Show)
+
+-- | Write key-value pairs to a database, update the values of these keys while writing more
+-- key-value pairs (using the same read-write transaction), and make sure things are as expected.
+testWriteInPlace :: WriteInPlaceMode -> TestTree
+testWriteInPlace mode =
+  testCase (printf "writeInPlace (%s)" (show mode)) $
+    runIdentityT $
+      withEnvDbs @IdentityT Nothing $ \(env, dbs) -> do
+        let db = case V.toList dbs of [x] -> x; _ -> error "unreachable"
+
+        -- Write 100,101,...200 (big-endian Word64s) keys to the database.
+        lift $ withReadWriteTransaction env $ \txn ->
+          [100 :: Word64 .. 200]
+            & S.fromList @IO
+            & fmap (\w -> (runPut . putWord64be $ w, "a"))
+            & S.fold (writeLMDB defaultWriteOptions db txn)
+
+        (iteratedKeys, ()) <-
+          lift $ withReadWriteTransaction env $ \txn -> withCursor txn db $ \curs ->
+            -- Read all keys back from the database (starting at 100).
+            S.unfold @IO readLMDB (defaultReadOptions, db, JustTxn (txn, curs))
+              & S.mapM
+                ( \(k, _) -> do
+                    w <- either (error "unexpected") return $ runGet getWord64be k
+                    return
+                      [ Left $ Just w, -- Left: collection of iterated keys.
+                        Right $ Just w, -- Right: updated and new pairs.
+                        Right $ case mode of
+                          WriteInPlaceBefore -> Just $ w - 100 -- [0 .. 100]
+                          WriteInPlaceAfter ->
+                            if w <= 200 -- Prevent infinite database growth.
+                              then Just $ w + 100 -- [200 .. 300]
+                              else Nothing
+                      ]
+                )
+              & S.unfoldMany U.fromList
+              & S.fold
+                ( F.partition
+                    ( F.lmap
+                        (fromMaybe (error "unreachable"))
+                        F.toList
+                    )
+                    ( F.catMaybes . F.lmap (\w -> (runPut . putWord64be $ w, "b")) $
+                        writeLMDB defaultWriteOptions db txn
+                    )
+                )
+
+        -- Make sure the keys that were iterated through are as expected. (Keys <=100 should not be
+        -- grabbed during the iteration but keys >=200 should because we start the iteration at 100
+        -- and “cursor next” should grab the next word.)
+        lift $
+          assertEqual
+            "iterated pairs as expected"
+            ( case mode of
+                WriteInPlaceBefore -> [100 .. 200]
+                WriteInPlaceAfter -> [100 .. 300]
+            )
+            iteratedKeys
+
+        -- Make sure all key-value pairs are as expected.
+        kvs <-
+          lift $
+            S.unfold @IO readLMDB (defaultReadOptions, db, NoTxn)
+              & S.fold F.toList
+        lift $
+          assertEqual
+            "final pairs as expected"
+            ( map (\w -> (runPut . putWord64be $ w, "b")) $ case mode of
+                WriteInPlaceBefore -> [0 .. 200]
+                WriteInPlaceAfter -> [100 .. 300]
+            )
+            kvs
 
 -- | Perform reads and writes on a database concurrently, throwTo threads at random, and read all
 -- key-value pairs back from the database using our library (already covered by 'testReadLMDB') and
