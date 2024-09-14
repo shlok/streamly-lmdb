@@ -41,12 +41,16 @@ module Streamly.External.LMDB
     -- and read-write transactions do not block read-only transactions, but read-write transactions
     -- are serialized and block other read-write transactions.
     --
+    -- Read-only transactions attain a snapshot view of the environment; this view is not affected
+    -- by newer read-write transactions.
+    --
     -- /Warning/: Long-lived transactions are discouraged by LMDB, and it is your responsibility as
     -- a user of this library to avoid them as necessary. The reasons are twofold: (a) The first one
     -- we already mentioned: Read-write transactions block other read-write transactions. (b) The
     -- second is more insidious: Even though read-only transactions do not block read-write
-    -- transactions (as already mentioned), read-only transactions prevent the reuse of pages freed
-    -- by newer read-write transactions, so the database can grow quickly.
+    -- transactions, read-only transactions (since they attain a snapshot view of the environment)
+    -- prevent the reuse of pages freed by newer read-write transactions, so the database can grow
+    -- quickly.
     Transaction (),
 
     -- ** Read-only transactions
@@ -75,6 +79,7 @@ module Streamly.External.LMDB
     ReadOptions (..),
     defaultReadOptions,
     ReadDirection (..),
+    ReadStart (..),
 
     -- ** Direct reading
     getLMDB,
@@ -118,6 +123,7 @@ module Streamly.External.LMDB
 
     -- * Miscellaneous
     MaybeTxn (..),
+    EitherTxn (..),
     kibibyte,
     mebibyte,
     gibibyte,

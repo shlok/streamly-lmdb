@@ -50,7 +50,7 @@ main = do
   --     ("bar","c")
   --     ("baz","a")
   --     ("foo","b")
-  S.unfold readLMDB (defaultReadOptions, db, NoTxn)
+  S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing)
     & S.mapM print
     & S.fold F.drain
 ```
@@ -65,6 +65,6 @@ See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup
 * Writing:
   - The overhead of this library compared to C depends on the size of the key/value pairs (`ByteString`s managed by the RTS). For 480-byte keys and 2400-byte values, the overhead is around 3.8 μs/pair.
   - For now, we don’t provide “unsafe” write functionality (to avoid the key/value `ByteString`s) because this write performance is currently good enough for our purposes.
-* For reference, we note that opening and reading 1 byte [16 KiB] from a file on disk with C takes us around 2.5 μs [20 μs].)
+* For reference, we note that opening and reading 1 byte [16 KiB] from a file on disk with C takes us around 2.5 μs [20 μs].
 
 <sup>†</sup> July 2024; NixOS 22.11; Intel i7-12700K (3.6 GHz, 12 cores); Corsair VENGEANCE LPX DDR4 RAM 64GB (2 x 32GB) 3200MHz; Samsung 970 EVO Plus SSD 2TB (M.2 NVMe).
