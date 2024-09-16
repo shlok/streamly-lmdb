@@ -305,12 +305,11 @@ newtype UseUnsafeFFI = UseUnsafeFFI Bool deriving (Show)
 -- entire duration of the unfold. (b) Otherwise, new transactions and cursors are automatically
 -- created according to the desired chunk size. In this case, each transaction (apart from the first
 -- one) starts as expected at the key next to (i.e., the largest\/smallest key less\/greater than)
--- the previously encountered key. In this case, you need to have a good understanding of the
--- ordering of your keys, especially if you are writing to the same database downstream.
+-- the previously encountered key.
 --
 -- If you want to iterate through a large database while avoiding a long-lived transaction (see
 -- [Transactions](#g:transactions)), it is your responsibility to either chunk up your usage of
--- 'readLMDB' (which can be done with 'readStart') or specify a chunk size as described above.
+-- 'readLMDB' (with which 'readStart' can help) or specify a chunk size as described above.
 --
 -- Runtime consideration: If you call 'readLMDB' very frequently without a precreated transaction
 -- and cursor, you might find upon profiling that a significant time is being spent at
@@ -399,6 +398,15 @@ unsafeReadLMDB' ::
     )
     (k, v)
 unsafeReadLMDB' =
+  -- Performance notes:
+  -- + Unfortunately, introducing ChunkSize support increased overhead compared to C from around 50
+  --   ns/pair to around 110 ns/s (for the safe FFI case).
+  -- + We mention below what things helped with performance.
+  -- + We tried various other things (e.g., using [0] or [4] phase control for the inlined
+  --   subfunctions, wrapping changing state in IORefs, etc.), but to no avail.
+  -- + For now, we presume that there is simply not much more gain left to achieve, given the extra
+  --   workload needed for the chunking support. (TODO: We noticed that removing the unsafe FFI
+  --   support altogether seems to give around 5 ns/pair speedup, but for now we don’t bother.)
   let {-# INLINE newTxnCurs #-}
       newTxnCurs ::
         (Ptr MDB_env -> Ptr MDB_txn -> CUInt -> IO (Ptr MDB_txn)) ->
@@ -408,7 +416,7 @@ unsafeReadLMDB' =
         Ptr MDB_env ->
         MDB_dbi_t ->
         TMVar NumReaders ->
-        IO (Ptr MDB_txn, Ptr MDB_cursor, IOFinalizer)
+        IO (Ptr MDB_cursor, IOFinalizer)
       newTxnCurs
         txn_begin
         txn_abort
@@ -456,7 +464,7 @@ unsafeReadLMDB' =
                 )
                 (cursor_close pcurs >> txn_abort ptxn >> decrReaders)
 
-            return (ptxn, pcurs, txnCursRef)
+            return (pcurs, txnCursRef)
 
       {-# INLINE positionCurs #-}
       positionCurs ::
@@ -513,159 +521,201 @@ unsafeReadLMDB' =
                   then cursor_get pcurs pk pv mdb_last
                   else return rc
    in U.Unfold
-        ( \( opts@(ropts, _, Database (Environment penv mvars) dbi, etxncurs, kmap, vmap),
-             (isFst, chunkSz, ptxn, pcurs, txnCursRef, pk, pv, pref),
-             fs@(txn_begin, cursor_open, cursor_get, cursor_close, txn_abort)
-             ) -> do
-              let (numReadersT, _, _, _) = mvars
+        ( \( (rc, chunkSz, pcurs, txnCursRef),
+             rf@ReadLMDBFixed_ {r_db = Database (Environment !penv !mvars) !dbi}
+             ) ->
+              liftIO $ do
+                let (numReadersT, _, _, _) = mvars
 
-              -- If the chunk size has exceeded a desired limit, dispose of the existing read-only
-              -- transaction and cursor and create new ones.
-              let exceeded = case etxncurs of
-                    LeftTxn Nothing -> False
-                    LeftTxn (Just (ChunkNumPairs maxPairs)) -> chunkSz >= maxPairs
-                    LeftTxn (Just (ChunkBytes maxBytes)) -> chunkSz >= maxBytes
-                    RightTxn _ -> False
-              (mprevk, ptxn', pcurs', txnCursRef') <- -- mprevk: Just iff “exceeded.”
-                if exceeded
-                  then liftIO $ do
-                    -- We make a copy of pk before aborting the current read-only transaction (which
-                    -- makes the data in pk unavailable).
-                    prevk <-
-                      peek pk >>= \x -> B.packCStringLen (x.mv_data, fromIntegral x.mv_size)
-                    runIOFinalizer txnCursRef
-                    (\(x, y, z) -> (Just prevk, x, y, z))
-                      <$> newTxnCurs
-                        txn_begin
-                        txn_abort
-                        cursor_open
-                        cursor_close
-                        penv
-                        dbi
-                        numReadersT
+                if rc == 0
+                  then do
+                    -- + pk and pv now contain the data we want to yield; prepare p and v for
+                    --   yielding.
+                    -- + Note: pk will remain important below in the case where the desired maximum
+                    --   ChunkSize is exceeded.
+                    -- + (Avoiding the extra byte size things in the non-ChunkBytes cases seemed to
+                    --   improve performance by around 10 ns/pair.)
+                    -- + (These bang patterns and/or the below bang pattern seemed to improve
+                    --   performance by around 20 ns/pair.)
+                    (!k, !v, !chunkSz') <-
+                      if rf.r_chunkSzInc > 1
+                        then do
+                          (kSz, k) <-
+                            peek rf.r_pk >>= \x ->
+                              let sz = fromIntegral x.mv_size in (sz,) <$> rf.r_kmap (x.mv_data, sz)
+                          (vSz, v) <-
+                            peek rf.r_pv >>= \x ->
+                              let sz = fromIntegral x.mv_size in (sz,) <$> rf.r_vmap (x.mv_data, sz)
+                          return (k, v, chunkSz + kSz + vSz)
+                        else do
+                          k <- peek rf.r_pk >>= \x -> rf.r_kmap (x.mv_data, fromIntegral x.mv_size)
+                          v <- peek rf.r_pv >>= \x -> rf.r_vmap (x.mv_data, fromIntegral x.mv_size)
+                          return (k, v, chunkSz + rf.r_chunkSzInc)
+
+                    -- If the chunk size has exceeded a desired limit, dispose of the existing
+                    -- read-only transaction and cursor and create new ones.
+                    !x <-
+                      if chunkSz' < rf.r_chunkSzMax
+                        then do
+                          -- Staying on the same chunk.
+                          rc' <- rf.r_cursor_get pcurs rf.r_pk rf.r_pv rf.r_nextPrevOp
+                          return ((rc', chunkSz', pcurs, txnCursRef), rf)
+                        else do
+                          -- We make a copy of pk before aborting the current read-only transaction
+                          -- (which makes the data in pk unavailable).
+                          prevk <-
+                            peek rf.r_pk
+                              >>= \x -> B.packCStringLen (x.mv_data, fromIntegral x.mv_size)
+                          runIOFinalizer txnCursRef
+                          (pcurs', txnCursRef') <- rf.r_newtxncurs penv dbi numReadersT
+                          rc' <-
+                            positionCurs
+                              rf.r_cursor_get
+                              (rf.r_nextChunkOp prevk)
+                              pcurs'
+                              rf.r_pk
+                              rf.r_pv
+                          return ((rc', 0, pcurs', txnCursRef'), rf)
+
+                    return $ U.Yield (k, v) x
                   else
-                    return (Nothing, ptxn, pcurs, txnCursRef)
-
-              -- Position the cursor at the desired location.
-              rc <-
-                liftIO $
-                  if isFst
-                    then do
-                      positionCurs cursor_get ropts.readStart pcurs' pk pv
-                    else case (mprevk, ropts.readDirection) of
-                      (Nothing, Forward) -> cursor_get pcurs' pk pv mdb_next
-                      (Nothing, Backward) -> cursor_get pcurs' pk pv mdb_prev
-                      (Just prevk, Forward) -> positionCurs cursor_get (ReadGT prevk) pcurs' pk pv
-                      (Just prevk, Backward) -> positionCurs cursor_get (ReadLT prevk) pcurs' pk pv
-
-              found <-
-                liftIO $
-                  if rc /= 0 && rc /= mdb_notfound
-                    then do
-                      runIOFinalizer txnCursRef >> runIOFinalizer pref
-                      throwLMDBErrNum "mdb_cursor_get" rc
-                    else return $ rc /= mdb_notfound
-
-              if found
-                then do
-                  -- + pk and pv now contain the data we want to yield; prepare p and v for
-                  --   yielding. Also grab the bytes (for the ChunkBytes case).
-                  -- + Note: pk will remain important in the next iteration in the case where the
-                  --   desired maximum ChunkSize is exceeded.
-                  (kSz, k) <-
-                    liftIO $
-                      peek pk
-                        >>= \x -> (x.mv_size,) <$> kmap (x.mv_data, fromIntegral x.mv_size)
-                  (vSz, v) <-
-                    liftIO $
-                      peek pv
-                        >>= \x -> (x.mv_size,) <$> vmap (x.mv_data, fromIntegral x.mv_size)
-
-                  let chunkSz' = case mprevk of
-                        Nothing -> chunkSz
-                        Just _ -> 0 -- Reset to zero iff “exceeded.”
-                      chunkSz'' = case etxncurs of
-                        LeftTxn Nothing -> chunkSz' -- Stays zero.
-                        LeftTxn (Just (ChunkNumPairs _)) -> chunkSz' + 1
-                        LeftTxn (Just (ChunkBytes _)) -> chunkSz' + fromIntegral (kSz + vSz)
-                        RightTxn _ -> chunkSz' -- Stays zero.
-                  return $
-                    U.Yield
-                      (k, v)
-                      ( opts,
-                        (False, chunkSz'', ptxn', pcurs', txnCursRef', pk, pv, pref),
-                        fs
-                      )
-                else do
-                  runIOFinalizer txnCursRef >> runIOFinalizer pref
-                  return U.Stop
+                    if rc == mdb_notfound
+                      then do
+                        runIOFinalizer txnCursRef >> runIOFinalizer rf.r_pref
+                        return U.Stop
+                      else do
+                        runIOFinalizer txnCursRef >> runIOFinalizer rf.r_pref
+                        throwLMDBErrNum "mdb_cursor_get" rc
         )
-        ( \(ropts, us, db@(Database (Environment penv mvars) dbi), etxncurs, kmap, vmap) -> do
-            let useInternalTxnCurs = case etxncurs of
-                  LeftTxn _ -> True
-                  RightTxn _ -> False
+        ( \(ropts, us, db@(Database (Environment penv mvars) dbi), etxncurs, kmap, vmap) ->
+            liftIO $ do
+              let useInternalTxnCurs = case etxncurs of
+                    LeftTxn _ -> True
+                    RightTxn _ -> False
 
-            -- Type-level guarantee.
-            when (useInternalTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
+              -- Type-level guarantee.
+              when (useInternalTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
 
-            case etxncurs of
-              LeftTxn Nothing -> return ()
-              LeftTxn (Just (ChunkNumPairs maxPairs)) ->
-                unless (maxPairs > 0) $
-                  throwError "readLMDB" "please specify positive ChunkNumPairs"
-              LeftTxn (Just (ChunkBytes maxBytes)) ->
-                unless (maxBytes > 0) $
-                  throwError "readLMDB" "please specify positive ChunkBytes"
-              RightTxn _ -> return ()
+              case etxncurs of
+                LeftTxn Nothing -> return ()
+                RightTxn _ -> return ()
+                LeftTxn (Just (ChunkNumPairs maxPairs)) ->
+                  unless (maxPairs > 0) $
+                    throwError "readLMDB" "please specify positive ChunkNumPairs"
+                LeftTxn (Just (ChunkBytes maxBytes)) ->
+                  unless (maxBytes > 0) $
+                    throwError "readLMDB" "please specify positive ChunkBytes"
 
-            (pk, pv, pref) <- liftIO . mask_ $ do
-              pk <- malloc
-              pv <- onException malloc (free pk)
-              pref <- onException (newIOFinalizer $ free pv >> free pk) (free pv >> free pk)
-              return (pk, pv, pref)
+              (pk, pv, pref) <- mask_ $ do
+                pk <- malloc
+                pv <- onException malloc (free pk)
+                pref <- onException (newIOFinalizer $ free pv >> free pk) (free pv >> free pk)
+                return (pk, pv, pref)
 
-            let (numReadersT, _, _, _) = mvars
-                isFst = True
-                chunkSz :: Int = 0
+              let (numReadersT, _, _, _) = mvars
+                  chunkSz :: Int = 0
 
-                (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
-                  case us of
-                    UseUnsafeFFI True ->
-                      ( mdb_txn_begin_unsafe,
-                        mdb_cursor_open_unsafe,
-                        c_mdb_cursor_get_unsafe,
-                        c_mdb_cursor_close_unsafe,
-                        c_mdb_txn_abort_unsafe
-                      )
-                    UseUnsafeFFI False ->
-                      ( mdb_txn_begin,
-                        mdb_cursor_open,
-                        c_mdb_cursor_get,
-                        c_mdb_cursor_close,
-                        c_mdb_txn_abort
-                      )
+                  -- + Avoid case lookups in each iteration.
+                  -- + (This seemed to improve performance by over 200 ns/pair.)
+                  (nextPrevOp, nextChunkOp) = case ropts.readDirection of
+                    Forward -> (mdb_next, ReadGT)
+                    Backward -> (mdb_prev, ReadLT)
+                  (chunkSzInc, chunkSzMax) :: (Int, Int) = case etxncurs of
+                    -- chunkSz stays zero.
+                    LeftTxn Nothing -> (0, maxBound)
+                    RightTxn _ -> (0, maxBound)
+                    -- chunkSz increments by 1.
+                    LeftTxn (Just (ChunkNumPairs maxPairs)) -> (1, maxPairs)
+                    -- “chunkSzInc > 1” means we should increment by bytes. (2 is meaningless.)
+                    LeftTxn (Just (ChunkBytes maxBytes)) -> (2, maxBytes)
 
-            (ptxn, pcurs, txnCursRef) <- case etxncurs of
-              LeftTxn _ -> do
-                -- Create first transaction and cursor.
-                liftIO $
-                  newTxnCurs txn_begin txn_abort cursor_open cursor_close penv dbi numReadersT
-              RightTxn (Transaction _ ptxn, Cursor pcurs) -> do
-                -- Transaction and cursor are provided by the user.
-                f <- newIOFinalizer $ return ()
-                return (ptxn, pcurs, f)
+                  (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
+                    case us of
+                      UseUnsafeFFI True ->
+                        ( mdb_txn_begin_unsafe,
+                          mdb_cursor_open_unsafe,
+                          c_mdb_cursor_get_unsafe,
+                          c_mdb_cursor_close_unsafe,
+                          c_mdb_txn_abort_unsafe
+                        )
+                      UseUnsafeFFI False ->
+                        ( mdb_txn_begin,
+                          mdb_cursor_open,
+                          c_mdb_cursor_get,
+                          c_mdb_cursor_close,
+                          c_mdb_txn_abort
+                        )
 
-            return
-              ( (ropts, us, db, etxncurs, kmap, vmap),
-                (isFst, chunkSz, ptxn, pcurs, txnCursRef, pk, pv, pref),
-                (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort)
-              )
+                  newtxncurs = newTxnCurs txn_begin txn_abort cursor_open cursor_close
+
+              (pcurs, txnCursRef) <- case etxncurs of
+                LeftTxn _ -> do
+                  -- Create first transaction and cursor.
+                  newtxncurs penv dbi numReadersT
+                RightTxn (_, Cursor pcurs) -> do
+                  -- Transaction and cursor are provided by the user.
+                  f <- newIOFinalizer $ return ()
+                  return (pcurs, f)
+
+              rc <- positionCurs cursor_get ropts.readStart pcurs pk pv
+
+              return
+                ( -- State that can change in iterations.
+                  (rc, chunkSz, pcurs, txnCursRef),
+                  ReadLMDBFixed_
+                    { r_db = db,
+                      r_kmap = kmap,
+                      r_vmap = vmap,
+                      r_newtxncurs = newtxncurs,
+                      r_cursor_get = cursor_get,
+                      r_nextPrevOp = nextPrevOp,
+                      r_nextChunkOp = nextChunkOp,
+                      r_chunkSzInc = chunkSzInc,
+                      r_chunkSzMax = chunkSzMax,
+                      r_pk = pk,
+                      r_pv = pv,
+                      r_pref = pref
+                    }
+                )
         )
+
+-- | State that stays fixed in 'readLMDB' iterations.
+--
+-- /Internal/.
+data ReadLMDBFixed_ emode k v = ReadLMDBFixed_
+  { -- (Keeping the records lazy seemed to improve performance by around 5-10 ns/pair.)
+    r_db :: Database emode,
+    r_kmap :: CStringLen -> IO k,
+    r_vmap :: CStringLen -> IO v,
+    r_newtxncurs ::
+      Ptr MDB_env ->
+      MDB_dbi_t ->
+      TMVar NumReaders ->
+      IO (Ptr MDB_cursor, IOFinalizer),
+    r_cursor_get ::
+      Ptr MDB_cursor ->
+      Ptr MDB_val ->
+      Ptr MDB_val ->
+      MDB_cursor_op_t ->
+      IO CInt,
+    r_nextPrevOp :: MDB_cursor_op_t,
+    r_nextChunkOp :: ByteString -> ReadStart,
+    r_chunkSzInc :: Int,
+    r_chunkSzMax :: Int,
+    r_pk :: Ptr MDB_val,
+    r_pv :: Ptr MDB_val,
+    r_pref :: IOFinalizer
+  }
 
 -- | Looks up the value for the given key in the given database.
 --
 -- If an existing transaction is not provided, a read-only transaction is automatically created
 -- internally.
+--
+-- Runtime consideration: If you call 'getLMDB' very frequently without a precreated transaction,
+-- you might find upon profiling that a significant time is being spent at @mdb_txn_begin@, or find
+-- yourself having to increase 'maxReaders' in the environment’s limits because the transactions are
+-- not being garbage collected fast enough. In this case, please consider precreating a transaction.
 {-# INLINE getLMDB #-}
 getLMDB ::
   forall emode tmode.
@@ -1019,7 +1069,7 @@ defaultWriteOptions =
     { writeOverwriteOptions = OverwriteAllow
     }
 
--- | A chunk size for use with 'chunkPairs'.
+-- | A chunk size.
 data ChunkSize
   = -- | Chunk up key-value pairs by number of pairs. The final chunk can have a fewer number of
     -- pairs.

@@ -60,11 +60,11 @@ main = do
 See `bench/README.md`. Summary (with rough figures from our machine<sup>†</sup>):
 
 * Reading (iterating through a fully cached LMDB database):
-  - When using the ordinary `readLMDB` (which creates intermediate key/value `ByteString`s managed by the RTS), the overhead compared to C depends on the key/value sizes; for 480-byte keys and 2400-byte values, the overhead is roughly 795 ns/pair.
-  - By using `unsafeReadLMDB` instead of `readLMDB` (to avoid the intermediate `ByteString`s), we can get the overhead compared to C down to roughly 50 ns/pair. (Plain Haskell `IO` code has roughly a 48 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
+  - When using the ordinary `readLMDB` (which creates intermediate key/value `ByteString`s managed by the RTS), the overhead compared to C depends on the key/value sizes; for 480-byte keys and 2400-byte values, the overhead is roughly 815 ns/pair.
+  - By using `unsafeReadLMDB` instead of `readLMDB` (to avoid the intermediate `ByteString`s), we can get the overhead compared to C down to roughly 90 ns/pair. (Plain Haskell `IO` code has roughly a 50 ns/pair overhead compared to C. The two preceding figures being similar fulfills the promise of [streamly](https://hackage.haskell.org/package/streamly) and stream fusion.)
 * Writing:
-  - The overhead of this library compared to C depends on the size of the key/value pairs (`ByteString`s managed by the RTS). For 480-byte keys and 2400-byte values, the overhead is around 3.8 μs/pair.
+  - The overhead of this library compared to C depends on the size of the key/value pairs (`ByteString`s managed by the RTS). For 480-byte keys and 2400-byte values, the overhead is around 4.3 μs/pair.
   - For now, we don’t provide “unsafe” write functionality (to avoid the key/value `ByteString`s) because this write performance is currently good enough for our purposes.
-* For reference, we note that opening and reading 1 byte [16 KiB] from a file on disk with C takes us around 2.5 μs [20 μs].
+* For reference, we note that opening and reading 1 byte [16 KiB] from a file on disk with C takes us around 2.8 μs [20 μs].
 
-<sup>†</sup> July 2024; NixOS 22.11; Intel i7-12700K (3.6 GHz, 12 cores); Corsair VENGEANCE LPX DDR4 RAM 64GB (2 x 32GB) 3200MHz; Samsung 970 EVO Plus SSD 2TB (M.2 NVMe).
+<sup>†</sup> September 2024; NixOS 24.11; Intel i7-12700K (3.6 GHz, 12 cores); Corsair VENGEANCE LPX DDR4 RAM 64GB (2 x 32GB) 3200MHz; Samsung 970 EVO Plus SSD 2TB (M.2 NVMe).
