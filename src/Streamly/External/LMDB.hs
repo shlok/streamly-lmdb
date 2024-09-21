@@ -79,6 +79,7 @@ module Streamly.External.LMDB
     ReadOptions (..),
     defaultReadOptions,
     ReadDirection (..),
+    ReadStart (..),
 
     -- ** Direct reading
     getLMDB,
@@ -108,7 +109,6 @@ module Streamly.External.LMDB
     chunkPairs,
     chunkPairsFold,
     writeLMDBChunk,
-    ChunkSize (..),
 
     -- * Mode
     Mode,
@@ -121,7 +121,9 @@ module Streamly.External.LMDB
     MDB_ErrCode (..),
 
     -- * Miscellaneous
+    ChunkSize (..),
     MaybeTxn (..),
+    EitherTxn (..),
     kibibyte,
     mebibyte,
     gibibyte,

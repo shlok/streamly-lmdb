@@ -159,6 +159,18 @@ withEnvDbs mNumDbs f = do
     removeDirectoryRecursive tmpDir
   return a
 
+genChunkSz :: Int -> Gen (Maybe ChunkSize)
+genChunkSz numKvPairs =
+  oneof
+    [ do
+        numPairs <- max 1 <$> chooseInt (1, 2 * numKvPairs)
+        return . Just $ ChunkNumPairs numPairs,
+      do
+        numBytes <- max 1 <$> chooseInt (1, 2 * 2 * kShortBsMaxLen * numKvPairs)
+        return . Just $ ChunkBytes numBytes,
+      return Nothing
+    ]
+
 -- | Write key-value pairs to a database in a normal manner, read them back using our library, and
 -- make sure the result is what we wrote. Concurrent read transactions are covered.
 testReadLMDB :: TestTree
@@ -169,15 +181,18 @@ testReadLMDB =
     run $ writeChunk db False keyValuePairs
     let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
 
+    mChunkSz <- pick $ genChunkSz (length keyValuePairs)
     let nread = 20
     vec <- V.replicateM nread . pick $ readOptionsAndResults keyValuePairsInDb
-    bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) -> do
-      let unf txn = S.toList $ S.unfold readLMDB' (readOpts, us, db, txn)
-      results <- unf NoTxn
-      resultsTxn <- withReadOnlyTransaction env $ \t -> withCursor t db $ \c -> unf $ JustTxn (t, c)
-      return $ results == expectedResults && resultsTxn == expectedResults
+    bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) ->
+      forM readOpts $ \(ropts, ShouldSucceed ss) -> do
+        let unf txn = S.toList $ S.unfold readLMDB' (ropts, us, db, txn)
+        results <- unf $ LeftTxn mChunkSz
+        resultsTxn <- withReadOnlyTransaction env $ \t ->
+          withCursor t db $ \c -> unf $ RightTxn (t, c)
+        return $ boolToOp ss results expectedResults && boolToOp ss resultsTxn expectedResults
 
-    return $ and bs
+    return $ all and bs
 
 -- | Similar to 'testReadLMDB', except that it tests the unsafe function in a different manner.
 testUnsafeReadLMDB :: TestTree
@@ -188,18 +203,21 @@ testUnsafeReadLMDB =
     run $ writeChunk db False keyValuePairs
     let keyValuePairsInDb = sort . removeDuplicateKeysRetainLast $ keyValuePairs
 
+    mChunkSz <- pick $ genChunkSz (length keyValuePairs)
     let nread = 20
     vec <- V.replicateM nread . pick $ readOptionsAndResults keyValuePairsInDb
-    bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) -> do
-      let expectedLengths = map (bimap B.length B.length) expectedResults
-      let unf txn =
-            S.toList $
-              S.unfold unsafeReadLMDB' (readOpts, us, db, txn, return . snd, return . snd)
-      lengths <- unf NoTxn
-      lengthsTxn <- withReadOnlyTransaction env $ \t -> withCursor t db $ \c -> unf $ JustTxn (t, c)
-      return $ lengths == expectedLengths && lengthsTxn == expectedLengths
+    bs <- run $ forConcurrently vec $ \(us, readOpts, expectedResults) ->
+      forM readOpts $ \(ropts, ShouldSucceed ss) -> do
+        let expectedLengths = map (bimap B.length B.length) expectedResults
+        let unf txn =
+              S.toList $
+                S.unfold unsafeReadLMDB' (ropts, us, db, txn, return . snd, return . snd)
+        lengths <- unf $ LeftTxn mChunkSz
+        lengthsTxn <- withReadOnlyTransaction env $ \t ->
+          withCursor t db $ \c -> unf $ RightTxn (t, c)
+        return $ boolToOp ss lengths expectedLengths && boolToOp ss lengthsTxn expectedLengths
 
-    return $ and bs
+    return $ all and bs
 
 newtype ClearDatabase = ClearDatabase Bool
 
@@ -296,7 +314,7 @@ testWriteLMDBChunked mode =
 
           -- Read all key-value pairs back from the databases.
           readPairss <- forM dbs $ \db ->
-            run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
+            run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing)
 
           -- And make sure they are as expected.
           let expectedPairsInEachDb = sort $ removeDuplicateKeysRetainLast keyValuePairs
@@ -320,6 +338,8 @@ testWriteLMDBChunked mode =
             if clearDb && not (null chunks)
               then Just <$> pick (chooseInt (0, length chunks - 1))
               else return Nothing
+
+          mChunkSz <- pick $ genChunkSz (length keyValuePairs)
 
           readPairsAlts <- -- Alternative way of reading pairs back from the databases.
             run $
@@ -345,10 +365,10 @@ testWriteLMDBChunked mode =
                       (chunkIdx,dbIdx,)
                         <$> if b
                           then
-                            -- Read entire database using 'readLMDB'. While the database grows as
-                            -- the chunks get written, these read-only transactions get longer
-                            -- lived.
-                            S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
+                            -- Read entire database using 'readLMDB'. (In the Nothing ChunkSz case,
+                            -- While the database grows as the chunks get written, these read-only
+                            -- transactions get longer lived.)
+                            S.toList $ S.unfold readLMDB (defaultReadOptions, db, LeftTxn mChunkSz)
                           else
                             -- Read using 'getLMDB' (not the entire database but only this chunk).
                             toList sequ
@@ -366,7 +386,7 @@ testWriteLMDBChunked mode =
 
           -- Read all key-value pairs back from the databases.
           readPairss <- forM dbs $ \db ->
-            run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
+            run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing)
 
           -- Make sure they are as expected. (Recall that for readPairsAlts, we sometimes read the
           -- whole database and sometimes only one chunk.)
@@ -478,7 +498,7 @@ testWriteLMDBOneChunk owOpts =
 
       -- Regardless of whether an exception occurred, read all key-value pairs back from the
       -- database and make sure they are as expected.
-      readPairs <- run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn)
+      readPairs <- run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing)
       assertMsg "assert (second checks) failure" $
         readPairs == case owOpts of
           OverwrDisallowThrow ->
@@ -522,7 +542,7 @@ testWriteInPlace mode =
         (iteratedKeys, ()) <-
           lift $ withReadWriteTransaction env $ \txn -> withCursor txn db $ \curs ->
             -- Read all keys back from the database (starting at 100).
-            S.unfold @IO readLMDB (defaultReadOptions, db, JustTxn (txn, curs))
+            S.unfold @IO readLMDB (defaultReadOptions, db, RightTxn (txn, curs))
               & S.mapM
                 ( \(k, _) -> do
                     w <- either (error "unexpected") return $ runGet getWord64be k
@@ -564,7 +584,7 @@ testWriteInPlace mode =
         -- Make sure all key-value pairs are as expected.
         kvs <-
           lift $
-            S.unfold @IO readLMDB (defaultReadOptions, db, NoTxn)
+            S.unfold @IO readLMDB (defaultReadOptions, db, LeftTxn Nothing)
               & S.fold F.toList
         lift $
           assertEqual
@@ -627,7 +647,8 @@ testAsyncExceptionsConcurrent =
             $ zip shouldKills pairss
 
     readPairs <-
-      Set.fromList <$> (run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, NoTxn))
+      Set.fromList
+        <$> (run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing))
 
     assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairs
 
@@ -635,10 +656,13 @@ testAsyncExceptionsConcurrent =
 -- bytestrings.)
 newtype ShortBS = ShortBS ByteString deriving (Eq, Ord, Show)
 
+kShortBsMaxLen :: Int
+kShortBsMaxLen = 50
+
 instance Arbitrary ShortBS where
   arbitrary :: Gen ShortBS
   arbitrary = do
-    len <- chooseInt (0, 50)
+    len <- chooseInt (0, kShortBsMaxLen)
     ShortBS . B.pack <$> vector len
 
 toByteStrings :: [(ShortBS, ShortBS)] -> [(ByteString, ByteString)]
@@ -780,8 +804,12 @@ type PairsInDatabase = [(ByteString, ByteString)]
 
 type ExpectedReadResult = [(ByteString, ByteString)]
 
+newtype ShouldSucceed = ShouldSucceed Bool deriving (Show)
+
 -- | Given database pairs, randomly generates read options and corresponding expected results.
-readOptionsAndResults :: PairsInDatabase -> Gen (UseUnsafeFFI, ReadOptions, ExpectedReadResult)
+readOptionsAndResults ::
+  PairsInDatabase ->
+  Gen (UseUnsafeFFI, [(ReadOptions, ShouldSucceed)], ExpectedReadResult)
 readOptionsAndResults pairsInDb = do
   forw <- arbitrary
   let dir = if forw then Forward else Backward
@@ -790,12 +818,23 @@ readOptionsAndResults pairsInDb = do
   readAll <- frequency [(1, return True), (3, return False)]
   let ropts = defaultReadOptions {readDirection = dir}
   if readAll
-    then return (us, ropts {readStart = Nothing}, (if forw then id else reverse) pairsInDb)
+    then
+      return
+        ( us,
+          [(ropts {readStart = if forw then ReadBeg else ReadEnd}, ShouldSucceed True)],
+          (if forw then id else reverse) pairsInDb
+        )
     else
       if len == 0
         then do
           bs <- arbitrary >>= \(NonEmpty ws) -> return $ B.pack ws
-          return (us, ropts {readStart = Just bs}, [])
+          return
+            ( us,
+              map
+                (\x -> (ropts {readStart = x}, ShouldSucceed True))
+                [ReadBeg, ReadEnd, ReadGE bs, ReadGT bs, ReadLE bs, ReadLT bs],
+              []
+            )
         else do
           idx <-
             if len < 3
@@ -811,30 +850,67 @@ readOptionsAndResults pairsInDb = do
                 | idx == 0 = Nothing
                 | otherwise = betweenBs (keyAt $ idx - 1) (keyAt idx)
           let forwEq =
-                (us, ropts {readStart = Just $ keyAt idx}, drop idx pairsInDb)
+                ( us,
+                  [ (ropts {readStart = ReadGE $ keyAt idx}, ShouldSucceed True),
+                    (ropts {readStart = ReadGT $ keyAt idx}, ShouldSucceed False)
+                  ],
+                  drop idx pairsInDb
+                )
           let backwEq =
-                (us, ropts {readStart = Just $ keyAt idx}, reverse $ take (idx + 1) pairsInDb)
+                ( us,
+                  [ (ropts {readStart = ReadLE $ keyAt idx}, ShouldSucceed True),
+                    (ropts {readStart = ReadLT $ keyAt idx}, ShouldSucceed False)
+                  ],
+                  reverse $ take (idx + 1) pairsInDb
+                )
 
-          -- Test with three possibilities: The chosen readStart is equal to, less than, or greater
-          -- than one of the keys in the database.
+          -- Test with three desired possibilities: The chosen readStart is equal to, less than, or
+          -- greater than one of the keys in the database.
           ord <- arbitrary @Ordering
 
           return $ case (ord, dir) of
             (EQ, Forward) -> forwEq
             (EQ, Backward) -> backwEq
             (GT, Forward) -> case nextKey of
-              Nothing -> forwEq
-              Just nextKey' -> (us, ropts {readStart = Just nextKey'}, drop (idx + 1) pairsInDb)
-            (GT, Backward) -> case nextKey of
-              Nothing -> backwEq
+              Nothing -> (us, [], [])
               Just nextKey' ->
-                (us, ropts {readStart = Just nextKey'}, reverse $ take (idx + 1) pairsInDb)
+                ( us,
+                  [ (ropts {readStart = ReadGE nextKey'}, ShouldSucceed True),
+                    (ropts {readStart = ReadGT nextKey'}, ShouldSucceed True)
+                  ],
+                  drop (idx + 1) pairsInDb
+                )
+            (GT, Backward) -> case nextKey of
+              Nothing -> (us, [], [])
+              Just nextKey' ->
+                ( us,
+                  [ (ropts {readStart = ReadLE nextKey'}, ShouldSucceed True),
+                    (ropts {readStart = ReadLT nextKey'}, ShouldSucceed True)
+                  ],
+                  reverse $ take (idx + 1) pairsInDb
+                )
             (LT, Forward) -> case prevKey of
-              Nothing -> forwEq
-              Just prevKey' -> (us, ropts {readStart = Just prevKey'}, drop idx pairsInDb)
+              Nothing -> (us, [], [])
+              Just prevKey' ->
+                ( us,
+                  [ (ropts {readStart = ReadGE prevKey'}, ShouldSucceed True),
+                    (ropts {readStart = ReadGT prevKey'}, ShouldSucceed True)
+                  ],
+                  drop idx pairsInDb
+                )
             (LT, Backward) -> case prevKey of
-              Nothing -> backwEq
-              Just prevKey' -> (us, ropts {readStart = Just prevKey'}, reverse $ take idx pairsInDb)
+              Nothing -> (us, [], [])
+              Just prevKey' ->
+                ( us,
+                  [ (ropts {readStart = ReadLE prevKey'}, ShouldSucceed True),
+                    (ropts {readStart = ReadLT prevKey'}, ShouldSucceed True)
+                  ],
+                  reverse $ take idx pairsInDb
+                )
+
+boolToOp :: (Eq a) => Bool -> (a -> a -> Bool)
+boolToOp True = (==)
+boolToOp False = (/=)
 
 generatePairsWithUniqueKeys ::
   (Monad m) => Int -> Int -> S.Stream (PropertyM m) [(ByteString, ByteString)]

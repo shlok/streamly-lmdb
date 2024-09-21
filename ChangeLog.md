@@ -3,8 +3,10 @@
 * Updated for Streamly 0.10.0.
 * Added proper concurrency support, including safety upon asynchronous exceptions. (The previous versions were unreliable in concurrent settings—segfaults, deadlocks, etc.)
 * A byproduct of the previous point: `writeLMDB` no longer maintains its own read-write transactions under the hood.
+* Added the ability to chunk the read-only transactions (by bytes or number of pairs) that `readLMDB` can create under the hood.
 * Added the ability to use read-write transactions for `readLMDB`.
 * Eliminated the `Void` seed for `readLMDB`.
+* Added more choices for `readStart`.
 * Added the ability to stream unexpected key-value pairs in `writeLMDB` into a separate fold.
 * Added `getLMDB` for getting a single key-value pair normally (without streaming).
 * Added `writeLMDBChunk` for writing key-value pairs normally (without streaming).

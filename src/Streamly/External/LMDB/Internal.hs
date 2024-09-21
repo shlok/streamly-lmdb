@@ -279,12 +279,17 @@ closeDatabase (Database (Environment penv mvars) dbi) = do
   withMVar lock $ \() ->
     c_mdb_dbi_close penv dbi
 
--- | A type for an optional thing (in our case a transaction and cursor for
--- 'readLMDB'\/'unsafeReadLMDB' and a transaction for 'getLMDB') where we want to fix the
--- transaction mode to @ReadOnly@ in the nothing case. (@Maybe@ isn’t powerful enough for this.)
+-- | A type for an optional thing where we want to fix the transaction mode to @ReadOnly@ in the
+-- nothing case. (@Maybe@ isn’t powerful enough for this.)
 data MaybeTxn tmode a where
   NoTxn :: MaybeTxn ReadOnly a
   JustTxn :: a -> MaybeTxn tmode a
+
+-- | A type for an @Either@-like choice where we want to fix the transaction mode to @ReadOnly@ in
+-- the @Left@ case. (@Either@ isn’t powerful enough for this.)
+data EitherTxn tmode a b where
+  LeftTxn :: a -> EitherTxn ReadOnly a b
+  RightTxn :: b -> EitherTxn tmode a b
 
 -- | Use @unsafe@ FFI calls under the hood. This can increase iteration speed, but one should
 -- bear in mind that @unsafe@ FFI calls, since they block all other threads, can have an adverse
@@ -295,16 +300,22 @@ newtype UseUnsafeFFI = UseUnsafeFFI Bool deriving (Show)
 
 -- | Creates an unfold with which we can stream key-value pairs from the given database.
 --
--- If an existing transaction and cursor are not provided, a read-only transaction and cursor are
--- automatically created and kept open for the duration of the unfold. We suggest doing this as a
--- first option. However, if you find this to be a bottleneck (e.g., if you find upon profiling that
--- a significant time is being spent at @mdb_txn_begin@, or if you find yourself having to increase
--- 'maxReaders' in the environment’s limits because the transactions and cursors are not being
--- garbage collected fast enough), consider precreating a transaction and cursor.
+-- If an existing transaction and cursor are not provided, there are two possibilities: (a) If a
+-- chunk size is not provided, a read-only transaction and cursor are automatically created for the
+-- entire duration of the unfold. (b) Otherwise, new transactions and cursors are automatically
+-- created according to the desired chunk size. In this case, each transaction (apart from the first
+-- one) starts as expected at the key next to (i.e., the largest\/smallest key less\/greater than)
+-- the previously encountered key.
 --
 -- If you want to iterate through a large database while avoiding a long-lived transaction (see
--- [Transactions](#g:transactions)), it is your responsibility to chunk up your usage of 'readLMDB'.
--- ('readStart' can help with this.)
+-- [Transactions](#g:transactions)), it is your responsibility to either chunk up your usage of
+-- 'readLMDB' (with which 'readStart' can help) or specify a chunk size as described above.
+--
+-- Runtime consideration: If you call 'readLMDB' very frequently without a precreated transaction
+-- and cursor, you might find upon profiling that a significant time is being spent at
+-- @mdb_txn_begin@, or find yourself having to increase 'maxReaders' in the environment’s limits
+-- because the transactions and cursors are not being garbage collected fast enough. In this case,
+-- please consider precreating a transaction and cursor.
 --
 -- If you don’t want the overhead of intermediate @ByteString@s (on your way to your eventual data
 -- structures), use 'unsafeReadLMDB' instead.
@@ -316,12 +327,12 @@ readLMDB ::
     m
     ( ReadOptions,
       Database emode,
-      MaybeTxn tmode (Transaction tmode emode, Cursor)
+      EitherTxn tmode (Maybe ChunkSize) (Transaction tmode emode, Cursor)
     )
     (ByteString, ByteString)
 readLMDB =
   U.lmap
-    (\(ropts, db, mtxncurs) -> (ropts, UseUnsafeFFI False, db, mtxncurs))
+    (\(ropts, db, etxncurs) -> (ropts, UseUnsafeFFI False, db, etxncurs))
     readLMDB'
 
 -- | Similar to 'readLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
@@ -336,12 +347,12 @@ readLMDB' ::
     ( ReadOptions,
       UseUnsafeFFI,
       Database emode,
-      MaybeTxn tmode (Transaction tmode emode, Cursor)
+      EitherTxn tmode (Maybe ChunkSize) (Transaction tmode emode, Cursor)
     )
     (ByteString, ByteString)
 readLMDB' =
   U.lmap
-    (\(ropts, us, db, mtxncurs) -> (ropts, us, db, mtxncurs, B.packCStringLen, B.packCStringLen))
+    (\(ropts, us, db, etxncurs) -> (ropts, us, db, etxncurs, B.packCStringLen, B.packCStringLen))
     unsafeReadLMDB'
 
 -- | Similar to 'readLMDB', except that the keys and values are not automatically converted into
@@ -359,14 +370,14 @@ unsafeReadLMDB ::
     m
     ( ReadOptions,
       Database emode,
-      MaybeTxn tmode (Transaction tmode emode, Cursor),
+      EitherTxn tmode (Maybe ChunkSize) (Transaction tmode emode, Cursor),
       CStringLen -> IO k,
       CStringLen -> IO v
     )
     (k, v)
 unsafeReadLMDB =
   U.lmap
-    (\(ropts, db, mtxncurs, kmap, vmap) -> (ropts, UseUnsafeFFI False, db, mtxncurs, kmap, vmap))
+    (\(ropts, db, etxncurs, kmap, vmap) -> (ropts, UseUnsafeFFI False, db, etxncurs, kmap, vmap))
     unsafeReadLMDB'
 
 -- | Similar to 'unsafeReadLMDB', except that it has an extra 'UseUnsafeFFI' parameter.
@@ -381,148 +392,320 @@ unsafeReadLMDB' ::
     ( ReadOptions,
       UseUnsafeFFI,
       Database emode,
-      MaybeTxn tmode (Transaction tmode emode, Cursor),
+      EitherTxn tmode (Maybe ChunkSize) (Transaction tmode emode, Cursor),
       CStringLen -> IO k,
       CStringLen -> IO v
     )
     (k, v)
 unsafeReadLMDB' =
-  U.Unfold
-    ( \(op, subsequentOp, cursor_get, kmap, vmap, pcurs, pk, pv, ref) -> do
-        rc <-
-          liftIO $
-            if op == mdb_set_range && subsequentOp == mdb_prev
-              then do
-                -- A “reverse MDB_SET_RANGE” (i.e., a “less than or equal to”) is not available in
-                -- LMDB, so we simulate it ourselves.
-                kfst' <- peek pk
-                kfst <- B.packCStringLen (kfst'.mv_data, fromIntegral $ kfst'.mv_size)
-                rc <- cursor_get pcurs pk pv op
-                if rc /= 0 && rc == mdb_notfound
-                  then cursor_get pcurs pk pv mdb_last
-                  else
-                    if rc == 0
-                      then do
-                        k' <- peek pk
-                        k <- B.unsafePackCStringLen (k'.mv_data, fromIntegral k'.mv_size)
-                        if k /= kfst
-                          then cursor_get pcurs pk pv mdb_prev
-                          else return rc
-                      else return rc
-              else cursor_get pcurs pk pv op
+  -- Performance notes:
+  -- + Unfortunately, introducing ChunkSize support increased overhead compared to C from around 50
+  --   ns/pair to around 90 ns/s (for the safe FFI case).
+  -- + We mention below what things helped with performance.
+  -- + We tried various other things (e.g., using [0] or [4] phase control for the inlined
+  --   subfunctions, wrapping changing state in IORefs, etc.), but to no avail.
+  -- + For now, we presume that there is simply not much more gain left to achieve, given the extra
+  --   workload needed for the chunking support. (TODO: We noticed that removing the unsafe FFI
+  --   support altogether seems to give around 5 ns/pair speedup, but for now we don’t bother.)
+  let {-# INLINE newTxnCurs #-}
+      newTxnCurs ::
+        (Ptr MDB_env -> Ptr MDB_txn -> CUInt -> IO (Ptr MDB_txn)) ->
+        (Ptr MDB_txn -> IO ()) ->
+        (Ptr MDB_txn -> MDB_dbi_t -> IO (Ptr MDB_cursor)) ->
+        (Ptr MDB_cursor -> IO ()) ->
+        Ptr MDB_env ->
+        MDB_dbi_t ->
+        TMVar NumReaders ->
+        IO (Ptr MDB_cursor, IOFinalizer)
+      newTxnCurs
+        txn_begin
+        txn_abort
+        cursor_open
+        cursor_close
+        penv
+        dbi
+        numReadersT =
+          mask_ $ do
+            atomically $ do
+              n <- takeTMVar numReadersT
+              putTMVar numReadersT $ n + 1
 
-        found <-
-          liftIO $
-            if rc /= 0 && rc /= mdb_notfound
-              then do
-                runIOFinalizer ref
-                throwLMDBErrNum "mdb_cursor_get" rc
-              else return $ rc /= mdb_notfound
+            let decrReaders = atomically $ do
+                  -- This should, when this is called, never be interruptible because we are, of
+                  -- course, finishing up a reader that is still known to exist.
+                  n <- takeTMVar numReadersT
+                  putTMVar numReadersT $ n - 1
 
-        if found
-          then do
-            !k <- liftIO $ (\x -> kmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pk
-            !v <- liftIO $ (\x -> vmap (x.mv_data, fromIntegral x.mv_size)) =<< peek pv
-            return $
-              U.Yield
-                (k, v)
-                (subsequentOp, subsequentOp, cursor_get, kmap, vmap, pcurs, pk, pv, ref)
-          else do
-            runIOFinalizer ref
-            return U.Stop
-    )
-    ( \(ropts, us, Database (Environment penv mvars) dbi, mtxncurs, kmap, vmap) -> do
-        let (firstOp, subsequentOp) = case (ropts.readDirection, ropts.readStart) of
-              (Forward, Nothing) -> (mdb_first, mdb_next)
-              (Forward, Just _) -> (mdb_set_range, mdb_next)
-              (Backward, Nothing) -> (mdb_last, mdb_prev)
-              (Backward, Just _) -> (mdb_set_range, mdb_prev)
-            (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
-              case us of
-                UseUnsafeFFI True ->
-                  ( mdb_txn_begin_unsafe,
-                    mdb_cursor_open_unsafe,
-                    c_mdb_cursor_get_unsafe,
-                    c_mdb_cursor_close_unsafe,
-                    c_mdb_txn_abort_unsafe
-                  )
-                UseUnsafeFFI False ->
-                  ( mdb_txn_begin,
-                    mdb_cursor_open,
-                    c_mdb_cursor_get,
-                    c_mdb_cursor_close,
-                    c_mdb_txn_abort
-                  )
-
-        let isNoTxnCurs = case mtxncurs of
-              NoTxn -> True
-              JustTxn _ -> False
-
-        -- Type-level guarantee.
-        when (isNoTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
-
-        let (numReadersT, _, _, _) = mvars
-
-        (pcurs, pk, pv, ref) <- liftIO $ mask_ $ do
-          (ptxn, pcurs, decrReaders) <- case mtxncurs of
-            NoTxn -> do
-              atomically $ do
-                n <- takeTMVar numReadersT
-                putTMVar numReadersT $ n + 1
-
-              let decrReaders = atomically $ do
-                    -- This should, when this is called, never be interruptible because we are, of
-                    -- course, finishing up a reader that is still known to exist.
-                    n <- takeTMVar numReadersT
-                    putTMVar numReadersT $ n - 1
-
-              ptxn <-
-                onException
-                  (txn_begin penv nullPtr mdb_rdonly)
-                  decrReaders
-              pcurs <-
-                onException
-                  (cursor_open ptxn dbi)
-                  (txn_abort ptxn >> decrReaders)
-              return (ptxn, pcurs, decrReaders)
-            JustTxn (Transaction _ ptxn, Cursor pcurs) ->
-              return (ptxn, pcurs, return ())
-
-          -- A utility function to close the cursor, abort the transaction, and decrement readers if
-          -- the caller didn’t supply a transaction and cursor.
-          let finishTxnCursReader =
-                when isNoTxnCurs $
-                  cursor_close pcurs >> txn_abort ptxn >> decrReaders
-
-          pk <- onException malloc finishTxnCursReader
-          pv <- onException malloc (free pk >> finishTxnCursReader)
-
-          ref <-
-            flip
+            ptxn <-
               onException
-              (free pv >> free pk >> finishTxnCursReader)
-              $ do
-                _ <- case ropts.readStart of
-                  Nothing -> return ()
-                  Just k -> B.unsafeUseAsCStringLen k $ \(kp, kl) ->
-                    poke pk (MDB_val (fromIntegral kl) kp)
-                newIOFinalizer . mask_ $ do
-                  free pv >> free pk
-                  -- With LMDB, there is ordinarily no need to commit read-only transactions. (The
-                  -- exception is when we want to make databases that were opened during the
-                  -- transaction available later, but that’s not applicable here.) We can therefore
-                  -- abort ptxn, both for failure (exceptions) and success.
-                  --
-                  -- Note furthermore that this should be sound in the face of async exceptions
-                  -- (where this finalizer could get called from a different thread) because LMDB
-                  -- with MDB_NOTLS allows for read-only transactions being used from multiple
-                  -- threads; see
-                  -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
-                  finishTxnCursReader
+                (txn_begin penv nullPtr mdb_rdonly)
+                decrReaders
 
-          return (pcurs, pk, pv, ref)
-        return (firstOp, subsequentOp, cursor_get, kmap, vmap, pcurs, pk, pv, ref)
-    )
+            pcurs <-
+              onException
+                (cursor_open ptxn dbi)
+                (txn_abort ptxn >> decrReaders)
+
+            txnCursRef <-
+              onException
+                ( do
+                    newIOFinalizer . mask_ $ do
+                      -- With LMDB, there is ordinarily no need to commit read-only transactions.
+                      -- (The exception is when we want to make databases that were opened during
+                      -- the transaction available later, but that’s not applicable here.) We can
+                      -- therefore abort ptxn, both for failure (exceptions) and success.
+                      --
+                      -- Note furthermore that this should be sound in the face of asynchronous
+                      -- exceptions (where this finalizer could get called from a different thread)
+                      -- because LMDB with MDB_NOTLS allows for read-only transactions being used
+                      -- from multiple threads; see
+                      -- https://github.com/LMDB/lmdb/blob/8d0cbbc936091eb85972501a9b31a8f86d4c51a7/libraries/liblmdb/lmdb.h#L984
+                      cursor_close pcurs >> txn_abort ptxn >> decrReaders
+                )
+                (cursor_close pcurs >> txn_abort ptxn >> decrReaders)
+
+            return (pcurs, txnCursRef)
+
+      {-# INLINE positionCurs #-}
+      positionCurs ::
+        (Ptr MDB_cursor -> Ptr MDB_val -> Ptr MDB_val -> MDB_cursor_op_t -> IO CInt) ->
+        ReadStart ->
+        Ptr MDB_cursor ->
+        Ptr MDB_val ->
+        Ptr MDB_val ->
+        -- Three possibilities (cursor_get return value): 0 (found), mdb_notfound (not found), other
+        -- non-zero (error).
+        IO CInt
+      positionCurs cursor_get readStart pcurs pk pv =
+        case readStart of
+          ReadBeg -> cursor_get pcurs pk pv mdb_first
+          ReadEnd -> cursor_get pcurs pk pv mdb_last
+          ReadGE k -> B.unsafeUseAsCStringLen k $ \(kp, kl) -> do
+            poke pk (MDB_val (fromIntegral kl) kp)
+            cursor_get pcurs pk pv mdb_set_range
+          -- For the other cases, LMDB has no built-in operators; so we simulate them ourselves.
+          ReadGT k -> B.unsafeUseAsCStringLen k $ \(kp, kl) -> do
+            poke pk (MDB_val (fromIntegral kl) kp)
+            rc <- cursor_get pcurs pk pv mdb_set_range
+            if rc == 0
+              then do
+                k' <- peek pk >>= \x -> B.unsafePackCStringLen (x.mv_data, fromIntegral x.mv_size)
+                if k' == k
+                  then cursor_get pcurs pk pv mdb_next
+                  else return rc
+              else
+                -- Error; or not found (if GE is not found, GT doesn’t exist either).
+                return rc
+          ReadLE k -> B.unsafeUseAsCStringLen k $ \(kp, kl) -> do
+            poke pk (MDB_val (fromIntegral kl) kp)
+            rc <- cursor_get pcurs pk pv mdb_set_range
+            if rc == 0
+              then do
+                k' <- peek pk >>= \x -> B.unsafePackCStringLen (x.mv_data, fromIntegral x.mv_size)
+                if k' == k
+                  then return rc
+                  else cursor_get pcurs pk pv mdb_prev
+              else do
+                if rc == mdb_notfound
+                  then cursor_get pcurs pk pv mdb_last
+                  else return rc
+          ReadLT k -> B.unsafeUseAsCStringLen k $ \(kp, kl) -> do
+            poke pk (MDB_val (fromIntegral kl) kp)
+            rc <- cursor_get pcurs pk pv mdb_set_range
+            if rc == 0
+              then
+                -- In both GE and GT cases, find the previous one (to reach LT).
+                cursor_get pcurs pk pv mdb_prev
+              else do
+                if rc == mdb_notfound
+                  then cursor_get pcurs pk pv mdb_last
+                  else return rc
+   in U.Unfold
+        ( \( (rc, chunkSz, pcurs, txnCursRef),
+             rf@ReadLMDBFixed_ {r_db = Database (Environment !penv !mvars) !dbi}
+             ) ->
+              liftIO $ do
+                let (numReadersT, _, _, _) = mvars
+
+                if rc == 0
+                  then do
+                    -- + pk and pv now contain the data we want to yield; prepare p and v for
+                    --   yielding.
+                    -- + Note: pk will remain important below in the case where the desired maximum
+                    --   ChunkSize is exceeded.
+                    -- + (Avoiding the extra byte size things in the non-ChunkBytes cases seemed to
+                    --   improve performance by around 10 ns/pair.)
+                    -- + (These bang patterns and/or the below bang pattern seemed to improve
+                    --   performance by around 20 ns/pair.)
+                    (!k, !v, !chunkSz') <-
+                      if rf.r_chunkSzInc > 1
+                        then do
+                          (kSz, k) <-
+                            peek rf.r_pk >>= \x ->
+                              let sz = fromIntegral x.mv_size in (sz,) <$> rf.r_kmap (x.mv_data, sz)
+                          (vSz, v) <-
+                            peek rf.r_pv >>= \x ->
+                              let sz = fromIntegral x.mv_size in (sz,) <$> rf.r_vmap (x.mv_data, sz)
+                          return (k, v, chunkSz + kSz + vSz)
+                        else do
+                          k <- peek rf.r_pk >>= \x -> rf.r_kmap (x.mv_data, fromIntegral x.mv_size)
+                          v <- peek rf.r_pv >>= \x -> rf.r_vmap (x.mv_data, fromIntegral x.mv_size)
+                          return (k, v, chunkSz + rf.r_chunkSzInc)
+
+                    -- If the chunk size has exceeded a desired limit, dispose of the existing
+                    -- read-only transaction and cursor and create new ones.
+                    !x <-
+                      if chunkSz' < rf.r_chunkSzMax
+                        then do
+                          -- Staying on the same chunk.
+                          rc' <- rf.r_cursor_get pcurs rf.r_pk rf.r_pv rf.r_nextPrevOp
+                          return ((rc', chunkSz', pcurs, txnCursRef), rf)
+                        else do
+                          -- We make a copy of pk before aborting the current read-only transaction
+                          -- (which makes the data in pk unavailable).
+                          prevk <-
+                            peek rf.r_pk
+                              >>= \x -> B.packCStringLen (x.mv_data, fromIntegral x.mv_size)
+                          runIOFinalizer txnCursRef
+                          (pcurs', txnCursRef') <- rf.r_newtxncurs penv dbi numReadersT
+                          rc' <-
+                            positionCurs
+                              rf.r_cursor_get
+                              (rf.r_nextChunkOp prevk)
+                              pcurs'
+                              rf.r_pk
+                              rf.r_pv
+                          return ((rc', 0, pcurs', txnCursRef'), rf)
+
+                    return $ U.Yield (k, v) x
+                  else
+                    if rc == mdb_notfound
+                      then do
+                        runIOFinalizer txnCursRef >> runIOFinalizer rf.r_pref
+                        return U.Stop
+                      else do
+                        runIOFinalizer txnCursRef >> runIOFinalizer rf.r_pref
+                        throwLMDBErrNum "mdb_cursor_get" rc
+        )
+        ( \(ropts, us, db@(Database (Environment penv mvars) dbi), etxncurs, kmap, vmap) ->
+            liftIO $ do
+              let useInternalTxnCurs = case etxncurs of
+                    LeftTxn _ -> True
+                    RightTxn _ -> False
+
+              -- Type-level guarantee.
+              when (useInternalTxnCurs && not (isReadOnlyEnvironment @tmode)) $ error "unreachable"
+
+              case etxncurs of
+                LeftTxn Nothing -> return ()
+                RightTxn _ -> return ()
+                LeftTxn (Just (ChunkNumPairs maxPairs)) ->
+                  unless (maxPairs > 0) $
+                    throwError "readLMDB" "please specify positive ChunkNumPairs"
+                LeftTxn (Just (ChunkBytes maxBytes)) ->
+                  unless (maxBytes > 0) $
+                    throwError "readLMDB" "please specify positive ChunkBytes"
+
+              (pk, pv, pref) <- mask_ $ do
+                pk <- malloc
+                pv <- onException malloc (free pk)
+                pref <- onException (newIOFinalizer $ free pv >> free pk) (free pv >> free pk)
+                return (pk, pv, pref)
+
+              let (numReadersT, _, _, _) = mvars
+                  chunkSz :: Int = 0
+
+                  -- + Avoid case lookups in each iteration.
+                  -- + (This seemed to improve performance by over 200 ns/pair.)
+                  (nextPrevOp, nextChunkOp) = case ropts.readDirection of
+                    Forward -> (mdb_next, ReadGT)
+                    Backward -> (mdb_prev, ReadLT)
+                  (chunkSzInc, chunkSzMax) :: (Int, Int) = case etxncurs of
+                    -- chunkSz stays zero.
+                    LeftTxn Nothing -> (0, maxBound)
+                    RightTxn _ -> (0, maxBound)
+                    -- chunkSz increments by 1.
+                    LeftTxn (Just (ChunkNumPairs maxPairs)) -> (1, maxPairs)
+                    -- “chunkSzInc > 1” means we should increment by bytes. (2 is meaningless.)
+                    LeftTxn (Just (ChunkBytes maxBytes)) -> (2, maxBytes)
+
+                  (txn_begin, cursor_open, cursor_get, cursor_close, txn_abort) =
+                    case us of
+                      UseUnsafeFFI True ->
+                        ( mdb_txn_begin_unsafe,
+                          mdb_cursor_open_unsafe,
+                          c_mdb_cursor_get_unsafe,
+                          c_mdb_cursor_close_unsafe,
+                          c_mdb_txn_abort_unsafe
+                        )
+                      UseUnsafeFFI False ->
+                        ( mdb_txn_begin,
+                          mdb_cursor_open,
+                          c_mdb_cursor_get,
+                          c_mdb_cursor_close,
+                          c_mdb_txn_abort
+                        )
+
+                  newtxncurs = newTxnCurs txn_begin txn_abort cursor_open cursor_close
+
+              (pcurs, txnCursRef) <- case etxncurs of
+                LeftTxn _ -> do
+                  -- Create first transaction and cursor.
+                  newtxncurs penv dbi numReadersT
+                RightTxn (_, Cursor pcurs) -> do
+                  -- Transaction and cursor are provided by the user.
+                  f <- newIOFinalizer $ return ()
+                  return (pcurs, f)
+
+              rc <- positionCurs cursor_get ropts.readStart pcurs pk pv
+
+              return
+                ( -- State that can change in iterations.
+                  (rc, chunkSz, pcurs, txnCursRef),
+                  ReadLMDBFixed_
+                    { r_db = db,
+                      r_kmap = kmap,
+                      r_vmap = vmap,
+                      r_newtxncurs = newtxncurs,
+                      r_cursor_get = cursor_get,
+                      r_nextPrevOp = nextPrevOp,
+                      r_nextChunkOp = nextChunkOp,
+                      r_chunkSzInc = chunkSzInc,
+                      r_chunkSzMax = chunkSzMax,
+                      r_pk = pk,
+                      r_pv = pv,
+                      r_pref = pref
+                    }
+                )
+        )
+
+-- | State that stays fixed in 'readLMDB' iterations.
+--
+-- /Internal/.
+data ReadLMDBFixed_ emode k v = ReadLMDBFixed_
+  { -- (Keeping the records lazy seemed to improve performance by around 5-10 ns/pair.)
+    r_db :: Database emode,
+    r_kmap :: CStringLen -> IO k,
+    r_vmap :: CStringLen -> IO v,
+    r_newtxncurs ::
+      Ptr MDB_env ->
+      MDB_dbi_t ->
+      TMVar NumReaders ->
+      IO (Ptr MDB_cursor, IOFinalizer),
+    r_cursor_get ::
+      Ptr MDB_cursor ->
+      Ptr MDB_val ->
+      Ptr MDB_val ->
+      MDB_cursor_op_t ->
+      IO CInt,
+    r_nextPrevOp :: MDB_cursor_op_t,
+    r_nextChunkOp :: ByteString -> ReadStart,
+    r_chunkSzInc :: Int,
+    r_chunkSzMax :: Int,
+    r_pk :: Ptr MDB_val,
+    r_pv :: Ptr MDB_val,
+    r_pref :: IOFinalizer
+  }
 
 -- | Looks up the value for the given key in the given database.
 --
@@ -681,23 +864,41 @@ withCursor txn db =
     (liftIO . closeCursor)
 
 data ReadOptions = ReadOptions
-  { readDirection :: !ReadDirection,
-    -- | If 'Nothing', a forward [backward] iteration starts at the beginning [end] of the database.
-    -- Otherwise, it starts at the first key that is greater [less] than or equal to the 'Just' key.
-    readStart :: !(Maybe ByteString)
+  -- It might seem strange to allow, e.g., ReadBeg and Backward together. However, this simplifies
+  -- things in the sense that it separates the initial position concept from the iteration
+  -- (next/prev) concept.
+  { readStart :: !ReadStart,
+    readDirection :: !ReadDirection
   }
   deriving (Show)
 
--- | By default, we start reading from the beginning of the database (i.e., from the smallest key).
+-- | By default, we start reading from the beginning of the database (i.e., from the smallest key)
+-- and iterate in forward direction.
 defaultReadOptions :: ReadOptions
 defaultReadOptions =
   ReadOptions
-    { readDirection = Forward,
-      readStart = Nothing
+    { readStart = ReadBeg,
+      readDirection = Forward
     }
 
 -- | Direction of key iteration.
 data ReadDirection = Forward | Backward deriving (Show)
+
+-- | The key from which an iteration should start.
+data ReadStart
+  = -- | Start from the smallest key.
+    ReadBeg
+  | -- | Start from the largest key.
+    ReadEnd
+  | -- | Start from the smallest key that is greater than or equal to the given key.
+    ReadGE !ByteString
+  | -- | Start from the smallest key that is greater than the given key.
+    ReadGT !ByteString
+  | -- | Start from the largest key that is less than or equal to the given key.
+    ReadLE !ByteString
+  | -- | Start from the largest key that is less than the given key.
+    ReadLT !ByteString
+  deriving (Show)
 
 -- | Begins an LMDB read-write transaction on the given environment.
 --
@@ -868,7 +1069,7 @@ defaultWriteOptions =
     { writeOverwriteOptions = OverwriteAllow
     }
 
--- | A chunk size for use with 'chunkPairs'.
+-- | A chunk size.
 data ChunkSize
   = -- | Chunk up key-value pairs by number of pairs. The final chunk can have a fewer number of
     -- pairs.
@@ -878,6 +1079,7 @@ data ChunkSize
     -- pair and can end up with more than the desired number of bytes). The final chunk can have
     -- less than the desired number of bytes.
     ChunkBytes !Int
+  deriving (Show)
 
 -- | Chunks up the incoming stream of key-value pairs using the desired chunk size. One can try,
 -- e.g., @ChunkBytes mebibyte@ (1 MiB chunks) and benchmark from there.
