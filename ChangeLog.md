@@ -8,7 +8,7 @@
 * Added the ability to stream unexpected key-value pairs in `writeLMDB` into a separate fold.
 * Added `getLMDB` for getting a single key-value pair normally (without streaming).
 * Added `writeLMDBChunk` for writing key-value pairs normally (without streaming).
-* Added a `chunkPairs` convenience function that allows chunking a stream of key-value pairs by bytes or number of pairs.
+* Added `chunkPairs`/`chunkPairsFold` convenience functions that allow chunking a stream of key-value pairs (by bytes or number of pairs).
 * Made the unsafe FFI functionality internal.
 * Improved documentation, esp. regarding caveats for long-lived transactions and various lower-level LMDB requirements.
 

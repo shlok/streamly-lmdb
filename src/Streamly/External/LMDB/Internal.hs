@@ -528,6 +528,11 @@ unsafeReadLMDB' =
 --
 -- If an existing transaction is not provided, a read-only transaction is automatically created
 -- internally.
+--
+-- Runtime consideration: If you call 'getLMDB' very frequently without a precreated transaction,
+-- you might find upon profiling that a significant time is being spent at @mdb_txn_begin@, or find
+-- yourself having to increase 'maxReaders' in the environment’s limits because the transactions are
+-- not being garbage collected fast enough. In this case, please consider precreating a transaction.
 {-# INLINE getLMDB #-}
 getLMDB ::
   forall emode tmode.
