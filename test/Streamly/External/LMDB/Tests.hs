@@ -14,6 +14,7 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Exception hiding (assert)
 import Control.Monad
+import Control.Monad.IO.Class
 import Control.Monad.Identity
 import Control.Monad.Trans.Class
 import Data.Bifunctor
@@ -72,6 +73,7 @@ tests =
     testWriteInPlace WriteInPlaceBefore,
     testWriteInPlace WriteInPlaceAfter,
     testAsyncExceptionsConcurrent,
+    testDeleteClear,
     testBetween
   ]
 
@@ -651,6 +653,39 @@ testAsyncExceptionsConcurrent =
         <$> (run . S.toList $ S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing))
 
     assertMsg "assert failure" $ expectedSubset `Set.isSubsetOf` readPairs
+
+testDeleteClear :: TestTree
+testDeleteClear =
+  testCase "deleteLMDB/clearDatabase" $
+    runIdentityT $
+      withEnvDbs Nothing $ \(env, dbs) -> do
+        let db = V.head dbs
+        writeLMDBChunk defaultWriteOptions db $ Seq.fromList [("a", "0"), ("b", "0"), ("c", "0")]
+
+        e1 <- liftIO . try $ withReadWriteTransaction env $ \roTxn ->
+          deleteLMDB defaultDeleteOptions db roTxn "foo"
+        case e1 of
+          Left (_ :: SomeException) -> error "should not throw"
+          Right _ -> return ()
+
+        e2 <- liftIO . try $ withReadWriteTransaction env $ \roTxn ->
+          deleteLMDB defaultDeleteOptions {deleteAssumeExists = True} db roTxn "foo"
+        case e2 of
+          Left (_ :: SomeException) -> return ()
+          Right _ -> error "should throw"
+
+        liftIO $ withReadWriteTransaction env $ \roTxn ->
+          deleteLMDB defaultDeleteOptions db roTxn "a"
+        let readPairs =
+              liftIO $
+                S.unfold readLMDB (defaultReadOptions, db, LeftTxn Nothing)
+                  & S.fold F.toList
+        kvps1 <- readPairs
+        unless (kvps1 == [("b", "0"), ("c", "0")]) $ error "unexpected pairs"
+
+        liftIO $ clearDatabase db
+        kvps2 <- readPairs
+        unless (null kvps2) $ error "unexpected pairs"
 
 -- | A bytestring with a limited random length. (We don’t see much value in testing with longer
 -- bytestrings.)

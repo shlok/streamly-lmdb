@@ -31,7 +31,6 @@ module Streamly.External.LMDB
     -- | After creating an environment, one creates within it one or more databases.
     Database,
     getDatabase,
-    clearDatabase,
     closeDatabase,
 
     -- * Transactions #transactions#
@@ -109,6 +108,10 @@ module Streamly.External.LMDB
     chunkPairs,
     chunkPairsFold,
     writeLMDBChunk,
+
+    -- * Deleting
+    deleteLMDB,
+    clearDatabase,
 
     -- * Mode
     Mode,

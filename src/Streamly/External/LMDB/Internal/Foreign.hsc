@@ -120,6 +120,9 @@ foreign import ccall unsafe "streamly_lmdb_foreign.h mdb_put_"
 foreign import ccall safe "lmdb.h mdb_drop"
     c_mdb_drop :: Ptr MDB_txn -> MDB_dbi_t -> CInt -> IO CInt
 
+foreign import ccall safe "lmdb.h mdb_del"
+    c_mdb_del :: Ptr MDB_txn -> MDB_dbi_t -> Ptr MDB_val -> Ptr MDB_val -> IO CInt
+
 data LMDB_Error = LMDB_Error
     { e_context     :: String
     , e_description :: String

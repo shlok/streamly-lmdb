@@ -1360,6 +1360,33 @@ clearDatabase (Database (Environment penv mvars) dbi) = mask $ \restore -> do
     )
     disclaimWriteOwnership
 
+-- | Deletes the given key from the given database using the given transaction.
+{-# INLINE deleteLMDB #-}
+deleteLMDB ::
+  DeleteOptions ->
+  Database emode ->
+  Transaction ReadWrite emode ->
+  ByteString ->
+  IO ()
+deleteLMDB dopts (Database (Environment _ _) dbi) (Transaction _ ptxn) k =
+  B.unsafeUseAsCStringLen k $ \(kp, kl) ->
+    with (MDB_val (fromIntegral kl) kp) $ \pk ->
+      c_mdb_del ptxn dbi pk nullPtr >>= \rc ->
+        when (rc /= 0) $
+          unless (rc == mdb_notfound && not dopts.deleteAssumeExists) $
+            throwLMDBErrNum "mdb_del" rc
+
+newtype DeleteOptions = DeleteOptions
+  { -- | Assume that the key being deleted already exists in the database and throw if it doesn’t.
+    deleteAssumeExists :: Bool
+  }
+  deriving (Show)
+
+-- | By default, we do /not/ assume the key being deleted already exists in the database.
+defaultDeleteOptions :: DeleteOptions
+defaultDeleteOptions =
+  DeleteOptions {deleteAssumeExists = False}
+
 -- | A convenience constant for obtaining 1 KiB.
 kibibyte :: (Num a) => a
 kibibyte = 1_024
