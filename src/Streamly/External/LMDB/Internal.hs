@@ -156,7 +156,7 @@ openEnvironment path limits = mask_ $ do
 
   mvars <-
     (,,,)
-      <$> newTMVarIO 0
+      <$> newTMVarSIO 0
       <*> (WriteLock <$> newEmptyMVar)
       <*> (WriteThread <$> newEmptyMVar)
       <*> (CloseDbLock <$> newMVar ())
@@ -415,7 +415,7 @@ unsafeReadLMDB' =
         (Ptr MDB_cursor -> IO ()) ->
         Ptr MDB_env ->
         MDB_dbi_t ->
-        TMVar NumReaders ->
+        TMVarS NumReaders ->
         IO (Ptr MDB_cursor, IOFinalizer)
       newTxnCurs
         txn_begin
@@ -427,14 +427,14 @@ unsafeReadLMDB' =
         numReadersT =
           mask_ $ do
             atomically $ do
-              n <- takeTMVar numReadersT
-              putTMVar numReadersT $ n + 1
+              n <- takeTMVarS numReadersT
+              putTMVarS numReadersT $ n + 1
 
             let decrReaders = atomically $ do
                   -- This should, when this is called, never be interruptible because we are, of
                   -- course, finishing up a reader that is still known to exist.
-                  n <- takeTMVar numReadersT
-                  putTMVar numReadersT $ n - 1
+                  n <- takeTMVarS numReadersT
+                  putTMVarS numReadersT $ n - 1
 
             ptxn <-
               onException
@@ -690,7 +690,7 @@ data ReadLMDBFixed_ emode k v = ReadLMDBFixed_
     r_newtxncurs ::
       Ptr MDB_env ->
       MDB_dbi_t ->
-      TMVar NumReaders ->
+      TMVarS NumReaders ->
       IO (Ptr MDB_cursor, IOFinalizer),
     r_cursor_get ::
       Ptr MDB_cursor ->
@@ -771,14 +771,14 @@ beginReadOnlyTransaction env@(Environment penv mvars) = mask_ $ do
 
   -- Similar comments for NumReaders as in unsafeReadLMDB.
   atomically $ do
-    n <- takeTMVar numReadersT
-    putTMVar numReadersT $ n + 1
+    n <- takeTMVarS numReadersT
+    putTMVarS numReadersT $ n + 1
 
   onException
     (Transaction @ReadOnly env <$> mdb_txn_begin penv nullPtr mdb_rdonly)
     ( atomically $ do
-        n <- takeTMVar numReadersT
-        putTMVar numReadersT $ n - 1
+        n <- takeTMVarS numReadersT
+        putTMVarS numReadersT $ n - 1
     )
 
 -- | Disposes of a read-only transaction created with 'beginReadOnlyTransaction'.
@@ -791,8 +791,8 @@ abortReadOnlyTransaction (Transaction (Environment _ mvars) ptxn) = mask_ $ do
   c_mdb_txn_abort ptxn
   -- Similar comments for NumReaders as in unsafeReadLMDB.
   atomically $ do
-    n <- takeTMVar numReadersT
-    putTMVar numReadersT $ n - 1
+    n <- takeTMVarS numReadersT
+    putTMVarS numReadersT $ n - 1
 
 -- | Creates a temporary read-only transaction on which the provided action is performed, after
 -- which the transaction gets aborted. The transaction also gets aborted upon exceptions.
@@ -1332,7 +1332,7 @@ waitReaders (Environment _ mvars) = do
   performGC -- Complete active readers as soon as possible.
   numReaders <-
     atomically $ do
-      numReaders <- takeTMVar numReadersT
+      numReaders <- takeTMVarS numReadersT
       check $ numReaders <= 0 -- Sanity check: use <=0 to catch unexpected negative readers.
       return numReaders
   when (numReaders /= 0) $ throwError "waitReaders" "zero numReaders expected"
@@ -1427,7 +1427,26 @@ type family SubMode emode tmode where
 data Environment emode
   = Environment
       !(Ptr MDB_env)
-      !(TMVar NumReaders, WriteLock, WriteThread, CloseDbLock)
+      !(TMVarS NumReaders, WriteLock, WriteThread, CloseDbLock)
+
+newtype TMVarS a = TMVarS (TMVar a)
+
+{-# INLINE newTMVarSIO #-}
+newTMVarSIO :: a -> IO (TMVarS a)
+newTMVarSIO a =
+  TMVarS <$> newTMVarIO a
+
+{-# INLINE takeTMVarS #-}
+takeTMVarS :: TMVarS a -> STM a
+takeTMVarS (TMVarS tmVar) =
+  takeTMVar tmVar
+
+-- Same as putTMVar except it makes sure the value is evaluated to WHNF. (For now we only use this
+-- to prevent NumReaders thunks, for which WHNF is enough.)
+{-# INLINE putTMVarS #-}
+putTMVarS :: TMVarS a -> a -> STM ()
+putTMVarS (TMVarS tmVar) a =
+  putTMVar tmVar $! a
 
 -- The number of current readers. This needs to be kept track of due to MDB_NOLOCK; see comments in
 -- writeLMDB.
@@ -1435,13 +1454,6 @@ newtype NumReaders = NumReaders Int deriving (Eq, Num, Ord)
 
 -- An increasing counter for various write-related functions using the same environment.
 newtype WriteCounter = WriterCounter Int deriving (Bounded, Eq, Num, Ord)
-
--- The counter that currently owns the environment when it comes to writing.
-newtype WriteOwner = WriteOwner WriteCounter
-
--- Data that the current 'WriteOwner' keeps track of. (This needs to be separate from 'WriteOwner'
--- because 'modifyMVar' is not atomic when faced with other 'putMVar's.)
-newtype WriteOwnerData = WriteOwnerData {wPtxn :: Ptr MDB_txn}
 
 -- | Keeps track of the 'ThreadId' of the current read-write transaction.
 newtype WriteThread = WriteThread (MVar ThreadId)
