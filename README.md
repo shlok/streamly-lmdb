@@ -1,7 +1,8 @@
 # streamly-lmdb
 
 [![Hackage](https://img.shields.io/hackage/v/streamly-lmdb.svg?style=flat)](https://hackage.haskell.org/package/streamly-lmdb)
-![CI](https://github.com/shlok/streamly-lmdb/workflows/CI/badge.svg?branch=master)
+[![CI](https://github.com/shlok/streamly-lmdb/actions/workflows/ci.yaml/badge.svg?branch=master)](https://github.com/shlok/streamly-lmdb/actions/workflows/ci.yaml)
+[![built with garnix](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fgarnix.io%2Fapi%2Fbadges%2Fshlok%2Fstreamly-lmdb%3Fbranch%3Dmaster)](https://garnix.io/repo/shlok/streamly-lmdb)
 
 Stream data to or from LMDB databases using the Haskell [streamly](https://hackage.haskell.org/package/streamly) library.
 
