@@ -1,8 +1,3 @@
-# Based on https://markkarpov.com/post/github-actions-for-haskell-ci.html.
-
-# For now, we skip macOS builds on GitHub; too slow builders, and issues with finding Homebrew
-# libraries. (It builds successfully on macOS on Garnix anyway.)
-
 name: CI
 on:
   push:
@@ -20,70 +15,19 @@ on:
   schedule:
     - cron: '0 2 1 * *' # At 02:00 on day-of-month 1.
 jobs:
-  cabal:
-    runs-on: ${{ matrix.os }}
+  flake:
     strategy:
-      matrix:
-        os: ["ubuntu-latest"] # Skip macOS; see above.
-        cabal: ["3.10.3.0"]
-        ghc: ["9.6.5"]
       fail-fast: false
-    name: cabal ${{ matrix.cabal }} - ${{ matrix.os }}, ${{ matrix.ghc }}
-    env:
-      CONFIG: "--enable-tests --enable-benchmarks"
-    steps:
-      - uses: actions/checkout@v5.0.0
-      - uses: haskell/actions/setup@v2.4.7
-        id: setup-haskell-cabal
-        with:
-          ghc-version: ${{ matrix.ghc }}
-          cabal-version: ${{ matrix.cabal }}
-      - run: sudo apt-get update; sudo apt-get install liblmdb-dev
-        if: contains(matrix.os, 'ubuntu')
-      - run: brew install lmdb
-        if: contains(matrix.os, 'macos')
-      - run: cabal v2-update
-      - run: cabal v2-freeze $CONFIG
-      - uses: actions/cache@v4.3.0
-        with:
-          path: |
-            ~/.cabal/store
-            dist-newstyle
-          key: cabal-${{ matrix.cabal }}-${{ matrix.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.freeze') }}
-          restore-keys: |
-            cabal-${{ matrix.cabal }}-${{ matrix.os }}-${{ matrix.ghc }}-
-      - run: cabal v2-build $CONFIG
-      - run: cabal v2-test $CONFIG --test-show-details=streaming --test-options='--quickcheck-tests 250'
-      - run: cabal v2-haddock $CONFIG
-      - run: cabal v2-sdist
-  stack:
+      matrix:
+        os: ["ubuntu-latest", "macos-latest"]
     runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: ["ubuntu-latest"] # Skip macOS; see above.
-        stack: ["3.7.1"]
-      fail-fast: false
-    name: stack ${{ matrix.stack }} - ${{ matrix.os }}
+    permissions:
+      id-token: "write"
+      contents: "read"
     steps:
-      - uses: actions/checkout@v5.0.0
-      - uses: haskell/actions/setup@v2.4.7
-        id: setup-haskell-stack
-        with:
-          enable-stack: true
-          stack-version: ${{ matrix.stack }}
-      - run: sudo apt-get update; sudo apt-get install liblmdb-dev
-        if: contains(matrix.os, 'ubuntu')
-      - run: brew install lmdb
-        if: contains(matrix.os, 'macos')
-      - uses: actions/cache@v4.3.0
-        with:
-          path: |
-            ~/.stack
-            .stack-work
-          key: stack-${{ matrix.stack }}-${{ matrix.os }}-${{ hashFiles('stack.yaml') }}-${{ hashFiles('stack.yaml.lock') }}-${{ hashFiles('streamly-lmdb.cabal') }}
-          restore-keys: |
-            stack-${{ matrix.stack }}-${{ matrix.os }}-
-      - run: stack build
-      - run: stack test --test-arguments="--quickcheck-tests 250"
-      - run: stack haddock
-      - run: stack sdist
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/flake-checker-action@main
+      - name: Run `nix build`
+        run: nix build -L .#streamly-lmdb-ci
