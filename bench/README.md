@@ -10,9 +10,8 @@ These programs are currently undocumented, apart from the brief usage descriptio
 
 ## Running benchmarks
 
-* Note (July 2024): We have only tested this on NixOS 22.11. It should work fine on other systems (e.g., Debian Linux); feel free to try.
 * If you are on NixOS, please make sure you have enabled Nix Flakes.
 * If you are on a non-NixOS system, please make sure you have installed [Nix](https://nixos.org) and enabled Nix Flakes.
 * Within this directory (`bench`), enter the development shell with `nix develop -L`.
-* Run `cabal build -ffusion-plugin && cabal exec -- bench`.
+* Run `cabal build && cabal exec -- bench`.
 * View `stdout` and the `csv` files. We are currently not explaining the data in detail here, but our main conclusions are outlined in `../README.md`.

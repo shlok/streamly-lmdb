@@ -46,7 +46,7 @@ main = do
   shells "gcc -O2 -Wall bench-lmdb.c -llmdb -o bench-lmdb >> $logfile 2>&1" empty
 
   procs "echo" ["Compiling Haskell programs... "] empty
-  shells "cabal build -ffusion-plugin >> $logfile 2>&1" empty
+  shells "cabal build >> $logfile 2>&1" empty
 
   let c_executable = "./bench-lmdb"
 
